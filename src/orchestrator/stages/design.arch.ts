@@ -28,6 +28,10 @@ export async function designArchitecture(
   return {
     ok: true,
     cost: res.costUsd,
-    data: { path: ctx.paths.architecture, sessionId: res.sessionId },
+    data: {
+      path: ctx.paths.architecture,
+      sessionId: res.sessionId,
+      usage: res.usage,
+    },
   };
 }

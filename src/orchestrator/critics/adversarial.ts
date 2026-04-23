@@ -113,6 +113,7 @@ export async function adversarialCritic(
       findings: [],
       summary,
       cost: 0,
+      usage: { input: 0, cache_creation: 0, cache_read: 0, output: 0 },
       sessionId: "",
       reportPath,
     };
@@ -146,6 +147,7 @@ export async function adversarialCritic(
     findings,
     summary: payload.result.summary,
     cost: 0,
+    usage: { input: 0, cache_creation: 0, cache_read: 0, output: 0 },
     sessionId: payload.threadId ?? "",
     reportPath,
   };

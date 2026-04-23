@@ -2,6 +2,7 @@ import { readFile, writeFile } from "node:fs/promises";
 import { z } from "zod";
 import { zodToJsonSchema } from "zod-to-json-schema";
 import type { Clarifications, RunContext, StageResult } from "../../core/index.js";
+import { usageStagePatch } from "../../core/index.js";
 import { loadPrompt } from "../prompts.js";
 import { pickStructured, runClaude } from "../claude-cli.js";
 
@@ -54,6 +55,7 @@ export async function clarify(ctx: RunContext): Promise<StageResult> {
 
     ctx.store.transaction(() => {
       ctx.store.addRunCost(ctx.runId, res.costUsd);
+      ctx.store.addRunUsage(ctx.runId, res.usage);
       if (res.sessionId) {
         ctx.store.saveSession(ctx.runId, "clarify", res.sessionId, res.costUsd);
       }
@@ -62,6 +64,7 @@ export async function clarify(ctx: RunContext): Promise<StageResult> {
       ctx.store.finishStage(ctx.runId, "clarify", {
         status: "completed",
         cost_usd: res.costUsd,
+        ...usageStagePatch(res.usage),
         session_id: res.sessionId,
         artifact_path: ctx.paths.clarifications,
       });

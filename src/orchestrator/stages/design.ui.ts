@@ -44,7 +44,12 @@ export async function designUi(ctx: RunContext): Promise<StageResult> {
       "Read",
       "Write",
     ],
-    maxTurns: 8,
+    // Stitch generation is async: the model calls create_project,
+    // generate_screen_from_text, then polls list_screens until the
+    // screen materializes. Add the 2-3 ToolSearch turns Claude Code
+    // uses to resolve deferred MCP schemas, plus retries if generation
+    // stalls, and 8 is not enough — the first real UI run hit 9.
+    maxTurns: 20,
   });
 
   const parsed = UiDesignOutput.parse(pickStructured(res));
@@ -65,6 +70,7 @@ export async function designUi(ctx: RunContext): Promise<StageResult> {
       stitchUrl: parsed.stitch_url,
       screens: parsed.screens,
       sessionId: res.sessionId,
+      usage: res.usage,
     },
   };
 }

@@ -66,6 +66,24 @@ export const CRITIC_NAMES: CriticName[] = [
   "adversarial",
 ];
 
+// Raw token counts from a single `claude` invocation. Fields mirror the
+// `usage` object on a `result` stream event. All four are additive —
+// cache_read_input_tokens overlap conceptually with input_tokens
+// budget-wise but are cheap and billed separately, so we keep them apart.
+export interface TokenUsage {
+  input: number;
+  cache_creation: number;
+  cache_read: number;
+  output: number;
+}
+
+export const ZERO_USAGE: TokenUsage = {
+  input: 0,
+  cache_creation: 0,
+  cache_read: 0,
+  output: 0,
+};
+
 export interface RunRow {
   id: string;
   status: RunStatus;
@@ -74,6 +92,10 @@ export interface RunRow {
   requirement_path: string;
   spec_path: string | null;
   total_cost_usd: number;
+  total_input_tokens: number;
+  total_cache_creation_tokens: number;
+  total_cache_read_tokens: number;
+  total_output_tokens: number;
 }
 
 export interface StageRow {
@@ -83,6 +105,10 @@ export interface StageRow {
   started_at: number | null;
   finished_at: number | null;
   cost_usd: number;
+  input_tokens: number;
+  cache_creation_tokens: number;
+  cache_read_tokens: number;
+  output_tokens: number;
   session_id: string | null;
   artifact_path: string | null;
   error: string | null;
@@ -188,13 +214,24 @@ export interface StateStore {
   // between doesn't double-bill on resume.
   transaction<T>(fn: () => T): T;
 
-  createRun(row: Omit<RunRow, "total_cost_usd" | "spec_path"> & { spec_path?: string | null }): void;
+  createRun(
+    row: Omit<
+      RunRow,
+      | "total_cost_usd"
+      | "total_input_tokens"
+      | "total_cache_creation_tokens"
+      | "total_cache_read_tokens"
+      | "total_output_tokens"
+      | "spec_path"
+    > & { spec_path?: string | null },
+  ): void;
   getRun(id: string): RunRow | null;
   updateRun(
     id: string,
     patch: Partial<Pick<RunRow, "status" | "kind" | "spec_path" | "total_cost_usd">>,
   ): void;
   addRunCost(id: string, delta: number): void;
+  addRunUsage(id: string, usage: TokenUsage): void;
   listRuns(opts?: { status?: RunStatus; limit?: number }): RunRow[];
 
   startStage(runId: string, name: StageName): void;
@@ -230,10 +267,18 @@ export interface StateStore {
 
 export interface BudgetTracker {
   addCost(stage: StageName, cost: number): void;
+  addUsage(stage: StageName, usage: TokenUsage): void;
   runTotal(): number;
   stageTotal(stage: StageName): number;
+  runUsageTotal(): TokenUsage;
+  stageUsageTotal(stage: StageName): TokenUsage;
   checkRunBudget(): void;
-  snapshot(): { run: number; byStage: Partial<Record<StageName, number>> };
+  snapshot(): {
+    run: number;
+    byStage: Partial<Record<StageName, number>>;
+    runUsage: TokenUsage;
+    byStageUsage: Partial<Record<StageName, TokenUsage>>;
+  };
   limits: { runBudgetUsd: number; stageBudgetUsd: number };
 }
 

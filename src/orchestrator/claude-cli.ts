@@ -4,8 +4,13 @@
 // node_modules/@anthropic-ai/claude-agent-sdk/sdk.mjs during development).
 
 import { spawn } from "node:child_process";
-import type { PermissionMode, RunContext, StageName } from "../core/index.js";
-import { KilledError, killedSentinelExists } from "../core/index.js";
+import type {
+  PermissionMode,
+  RunContext,
+  StageName,
+  TokenUsage,
+} from "../core/index.js";
+import { KilledError, killedSentinelExists, ZERO_USAGE } from "../core/index.js";
 
 export interface McpServerConfig {
   type?: "stdio" | "sse" | "http";
@@ -49,6 +54,9 @@ export interface RunClaudeResult {
   structuredOutput: unknown;
   sessionId: string;
   costUsd: number;
+  // Token counts from the `result` message's `usage` object. Zeroed when
+  // absent (older claude versions or the `error_*` subtypes).
+  usage: TokenUsage;
   subtype: "success" | "error_max_turns" | "error_during_execution" | "error_budget";
   durationMs: number;
   numTurns: number;
@@ -201,12 +209,25 @@ export async function runClaude(args: RunClaudeArgs): Promise<RunClaudeResult> {
         total_cost_usd?: number;
         result?: string;
         structured_output?: unknown;
+        usage?: {
+          input_tokens?: number;
+          cache_creation_input_tokens?: number;
+          cache_read_input_tokens?: number;
+          output_tokens?: number;
+        };
       };
+      const u = rm.usage ?? {};
       resultBox.value = {
         text: typeof rm.result === "string" ? rm.result : "",
         structuredOutput: rm.structured_output ?? null,
         sessionId: rm.session_id ?? "",
         costUsd: rm.total_cost_usd ?? 0,
+        usage: {
+          input: safeInt(u.input_tokens),
+          cache_creation: safeInt(u.cache_creation_input_tokens),
+          cache_read: safeInt(u.cache_read_input_tokens),
+          output: safeInt(u.output_tokens),
+        },
         subtype: rm.subtype,
         durationMs: rm.duration_ms ?? 0,
         numTurns: rm.num_turns ?? 0,
@@ -249,14 +270,24 @@ export async function runClaude(args: RunClaudeArgs): Promise<RunClaudeResult> {
     );
   }
 
-  // In-memory budget tally only — DB writes (addRunCost, saveSession) are the
-  // caller's job so they can happen in the same transaction as finishStage.
-  // Budget check fires here so an over-budget stage doesn't falsely succeed.
+  // In-memory budget tally only — DB writes (addRunCost, addRunUsage,
+  // saveSession) are the caller's job so they can happen in the same
+  // transaction as finishStage. Budget check fires here so an over-budget
+  // stage doesn't falsely succeed.
   ctx.budget.addCost(stage, result.costUsd);
+  ctx.budget.addUsage(stage, result.usage);
   ctx.budget.checkRunBudget();
 
   return result;
 }
+
+function safeInt(n: number | undefined): number {
+  if (typeof n !== "number" || !Number.isFinite(n) || n < 0) return 0;
+  return Math.round(n);
+}
+
+// Fallback for call sites that need an empty usage (error paths, tests).
+export { ZERO_USAGE };
 
 // Preferred way to read JSON output from a stage that passed `jsonSchema`.
 // Claude Code puts the parsed payload in `structured_output`; older versions

@@ -1,6 +1,7 @@
 import { readFile, writeFile } from "node:fs/promises";
 import { z } from "zod";
 import type { RunContext, StageResult } from "../../core/index.js";
+import { usageStagePatch } from "../../core/index.js";
 import { loadPrompt } from "../prompts.js";
 import { zodToJsonSchema } from "zod-to-json-schema";
 import { pickStructured, runClaude } from "../claude-cli.js";
@@ -68,12 +69,14 @@ export async function verify(ctx: RunContext): Promise<StageResult> {
 
     ctx.store.transaction(() => {
       ctx.store.addRunCost(ctx.runId, res.costUsd);
+      ctx.store.addRunUsage(ctx.runId, res.usage);
       if (res.sessionId) {
         ctx.store.saveSession(ctx.runId, "verify", res.sessionId, res.costUsd);
       }
       ctx.store.finishStage(ctx.runId, "verify", {
         status: parsed.pass ? "completed" : "failed",
         cost_usd: res.costUsd,
+        ...usageStagePatch(res.usage),
         session_id: res.sessionId,
         artifact_path: `${ctx.paths.verifyDir}/report.md`,
         error: parsed.pass ? null : "one or more criteria failed",

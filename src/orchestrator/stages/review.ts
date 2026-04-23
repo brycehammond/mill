@@ -1,6 +1,12 @@
 import { readFile } from "node:fs/promises";
-import type { CriticName, Finding, RunContext, StageResult } from "../../core/index.js";
-import { atLeast } from "../../core/index.js";
+import type {
+  CriticName,
+  Finding,
+  RunContext,
+  StageResult,
+  TokenUsage,
+} from "../../core/index.js";
+import { atLeast, usageStagePatch, ZERO_USAGE } from "../../core/index.js";
 import { correctnessCritic } from "../critics/correctness.js";
 import { securityCritic } from "../critics/security.js";
 import { uxCritic } from "../critics/ux.js";
@@ -79,6 +85,7 @@ export async function review(args: ReviewArgs): Promise<StageResult & { data: Re
     const summaries: { critic: string; summary: string }[] = [];
     const reportPaths: string[] = [];
     let cost = 0;
+    let usage: TokenUsage = { ...ZERO_USAGE };
     let anyFailed = false;
 
     settled.forEach((r, i) => {
@@ -87,6 +94,7 @@ export async function review(args: ReviewArgs): Promise<StageResult & { data: Re
         summaries.push({ critic: names[i]!, summary: r.value.summary });
         reportPaths.push(r.value.reportPath);
         cost += r.value.cost;
+        usage = sumUsage(usage, r.value.usage);
       } else {
         anyFailed = true;
         ctx.logger.error("critic failed", {
@@ -103,11 +111,14 @@ export async function review(args: ReviewArgs): Promise<StageResult & { data: Re
     const highFindings = findings.filter((f) => atLeast(f.severity, "HIGH"));
 
     // Per-critic cost + findings are already committed inside runCritic()'s
-    // transaction. This transaction only finalizes the stage row itself.
+    // transaction. This transaction only finalizes the stage row itself —
+    // tokens here are the sum across all critics for the iteration, mirroring
+    // cost_usd.
     ctx.store.transaction(() => {
       ctx.store.finishStage(ctx.runId, "review", {
         status: anyFailed ? "failed" : "completed",
         cost_usd: cost,
+        ...usageStagePatch(usage),
         artifact_path: ctx.paths.reviewsDir,
         error: anyFailed ? "one or more critics failed" : null,
       });
@@ -177,6 +188,15 @@ export function shouldStopReviewLoop(args: {
 
 function fingerprint(f: Finding): string {
   return `${f.critic}|${f.severity}|${f.title.trim().toLowerCase()}`;
+}
+
+function sumUsage(a: TokenUsage, b: TokenUsage): TokenUsage {
+  return {
+    input: a.input + b.input,
+    cache_creation: a.cache_creation + b.cache_creation,
+    cache_read: a.cache_read + b.cache_read,
+    output: a.output + b.output,
+  };
 }
 
 type AdversarialMode = "auto" | "on" | "off";

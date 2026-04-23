@@ -4,7 +4,13 @@ import { writeFile, readFile } from "node:fs/promises";
 import { parseArgs } from "node:util";
 import { execFileSync } from "node:child_process";
 import { relative } from "node:path";
-import { openStore, runPaths, type Clarifications } from "./core/index.js";
+import {
+  openStore,
+  runPaths,
+  initProject,
+  readProjectInfo,
+  type Clarifications,
+} from "./core/index.js";
 import {
   buildContext,
   intake,
@@ -12,31 +18,51 @@ import {
   recordAnswers,
   runPipeline,
   loadConfig,
+  NoProjectError,
 } from "./orchestrator/index.js";
 
-type Cmd = "new" | "run" | "status" | "logs" | "tail" | "kill" | "help";
+type Cmd =
+  | "new"
+  | "run"
+  | "status"
+  | "logs"
+  | "tail"
+  | "kill"
+  | "init"
+  | "help";
 
 async function main() {
   const [, , cmdRaw, ...rest] = process.argv;
   const cmd = (cmdRaw ?? "help") as Cmd;
 
-  switch (cmd) {
-    case "new":
-      return await cmdNew(rest);
-    case "run":
-      return await cmdRun(rest);
-    case "status":
-      return await cmdStatus(rest);
-    case "logs":
-      return await cmdLogs(rest);
-    case "tail":
-      return await cmdTail(rest);
-    case "kill":
-      return await cmdKill(rest);
-    case "help":
-    default:
-      printHelp();
+  try {
+    switch (cmd) {
+      case "init":
+        return await cmdInit(rest);
+      case "new":
+        return await cmdNew(rest);
+      case "run":
+        return await cmdRun(rest);
+      case "status":
+        return await cmdStatus(rest);
+      case "logs":
+        return await cmdLogs(rest);
+      case "tail":
+        return await cmdTail(rest);
+      case "kill":
+        return await cmdKill(rest);
+      case "help":
+      default:
+        printHelp();
+        return;
+    }
+  } catch (err) {
+    if (err instanceof NoProjectError) {
+      console.error(`df: ${err.message}`);
+      process.exitCode = 1;
       return;
+    }
+    throw err;
   }
 }
 
@@ -58,6 +84,7 @@ function printHelp() {
       "df — dark factory: a harness around the claude CLI",
       "",
       "usage:",
+      "  df init [<name>]                  # create .df/ in the current git repo",
       "  df new (<requirement...> | --from <file>) [--detach] [--all-defaults]",
       "  df run <run-id>                   # resume a run, skipping completed stages",
       "  df status [<run-id>]",
@@ -69,6 +96,28 @@ function printHelp() {
   );
 }
 
+async function cmdInit(argv: string[]) {
+  const { values, positionals } = parseArgs({
+    args: argv,
+    allowPositionals: true,
+    options: {
+      name: { type: "string" },
+    },
+  });
+  const name = values.name ?? positionals[0];
+  const result = initProject({ name });
+  if (result.created) {
+    console.log(`initialized df project "${result.info.name}" at ${result.projectRoot}`);
+  } else {
+    console.log(
+      `df project "${result.info.name}" already initialized at ${result.projectRoot} (re-registered)`,
+    );
+  }
+  if (result.gitignoreUpdated) {
+    console.log("added /.df/ to .gitignore");
+  }
+}
+
 async function cmdNew(argv: string[]) {
   const { values, positionals } = parseArgs({
     args: argv,
@@ -76,7 +125,6 @@ async function cmdNew(argv: string[]) {
     options: {
       detach: { type: "boolean", default: false },
       "all-defaults": { type: "boolean", default: false },
-      root: { type: "string" },
       from: { type: "string" },
     },
   });
@@ -119,7 +167,6 @@ async function cmdNew(argv: string[]) {
   preflightClaude();
 
   const config = loadConfig();
-  if (values.root) config.root = values.root;
   const store = openStore(config.root);
 
   const { runId } = await intake({
@@ -261,6 +308,11 @@ async function cmdStatus(argv: string[]) {
   const store = openStore(config.root);
   const runId = argv[0];
   if (!runId) {
+    const info = readProjectInfo(config.root);
+    if (info) {
+      console.log(`project: ${info.name} (${config.root})`);
+      console.log();
+    }
     const rows = store.listRuns({ limit: 20 });
     if (rows.length === 0) {
       console.log("(no runs)");
@@ -287,20 +339,53 @@ async function cmdStatus(argv: string[]) {
     return;
   }
   const stages = store.listStages(runId);
+  const runTokens = totalTokens(run);
   console.log(`run ${runId}`);
-  console.log(`status: ${run.status}  kind: ${run.kind ?? "—"}  cost: $${run.total_cost_usd.toFixed(4)}`);
+  console.log(
+    `status: ${run.status}  kind: ${run.kind ?? "—"}  cost: $${run.total_cost_usd.toFixed(4)}  tokens: ${fmtTokens(run.total_input_tokens, run.total_cache_creation_tokens, run.total_cache_read_tokens, run.total_output_tokens)} (total ${runTokens.toLocaleString()})`,
+  );
   console.log();
-  console.log("stage        status       cost        started");
+  console.log("stage        status       cost        in     cc      cr       out    started");
   for (const s of stages) {
     console.log(
       [
         s.name.padEnd(12),
         s.status.padEnd(12),
         `$${s.cost_usd.toFixed(4)}`.padEnd(11),
+        compactTokens(s.input_tokens).padStart(6),
+        compactTokens(s.cache_creation_tokens).padStart(7),
+        compactTokens(s.cache_read_tokens).padStart(8),
+        compactTokens(s.output_tokens).padStart(6),
         s.started_at ? new Date(s.started_at).toISOString() : "—",
       ].join(" "),
     );
   }
+}
+
+// Format token counts for the compact per-stage column: 1.2k, 342, 4.8M, etc.
+function compactTokens(n: number): string {
+  if (!Number.isFinite(n) || n <= 0) return "0";
+  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
+  if (n >= 1_000) return `${(n / 1_000).toFixed(1)}k`;
+  return String(n);
+}
+
+function fmtTokens(input: number, cc: number, cr: number, out: number): string {
+  return `in=${compactTokens(input)} cc=${compactTokens(cc)} cr=${compactTokens(cr)} out=${compactTokens(out)}`;
+}
+
+function totalTokens(r: {
+  total_input_tokens: number;
+  total_cache_creation_tokens: number;
+  total_cache_read_tokens: number;
+  total_output_tokens: number;
+}): number {
+  return (
+    r.total_input_tokens +
+    r.total_cache_creation_tokens +
+    r.total_cache_read_tokens +
+    r.total_output_tokens
+  );
 }
 
 async function cmdLogs(argv: string[]) {

@@ -10,8 +10,7 @@ build/
 .env.local
 .env.*.local
 
-runs/
-!runs/.gitkeep
+/.df/
 
 # Local SQLite state store
 *.db

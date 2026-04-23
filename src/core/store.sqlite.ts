@@ -10,6 +10,7 @@ import type {
   StageName,
   StageRow,
   StateStore,
+  TokenUsage,
 } from "./types.js";
 
 // Single writer; orchestrator is the only process calling mutating methods.
@@ -23,7 +24,11 @@ CREATE TABLE IF NOT EXISTS runs (
   created_at INTEGER NOT NULL,
   requirement_path TEXT NOT NULL,
   spec_path TEXT,
-  total_cost_usd REAL NOT NULL DEFAULT 0
+  total_cost_usd REAL NOT NULL DEFAULT 0,
+  total_input_tokens INTEGER NOT NULL DEFAULT 0,
+  total_cache_creation_tokens INTEGER NOT NULL DEFAULT 0,
+  total_cache_read_tokens INTEGER NOT NULL DEFAULT 0,
+  total_output_tokens INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS stages (
@@ -33,6 +38,10 @@ CREATE TABLE IF NOT EXISTS stages (
   started_at INTEGER,
   finished_at INTEGER,
   cost_usd REAL NOT NULL DEFAULT 0,
+  input_tokens INTEGER NOT NULL DEFAULT 0,
+  cache_creation_tokens INTEGER NOT NULL DEFAULT 0,
+  cache_read_tokens INTEGER NOT NULL DEFAULT 0,
+  output_tokens INTEGER NOT NULL DEFAULT 0,
   session_id TEXT,
   artifact_path TEXT,
   error TEXT,
@@ -77,6 +86,11 @@ CREATE TABLE IF NOT EXISTS sessions (
 );
 `;
 
+function toTokenDelta(n: number | undefined): number {
+  if (typeof n !== "number" || !Number.isFinite(n) || n < 0) return 0;
+  return Math.round(n);
+}
+
 export class SqliteStateStore implements StateStore {
   private db: Database.Database;
 
@@ -90,6 +104,35 @@ export class SqliteStateStore implements StateStore {
 
   init(): void {
     this.db.exec(SCHEMA);
+    this.migrateTokenColumns();
+  }
+
+  // Idempotent backfill for databases created before token columns existed.
+  // `ADD COLUMN ... DEFAULT 0` on an existing table is non-destructive; the
+  // duplicate-column error is the signal that the migration already ran.
+  private migrateTokenColumns(): void {
+    const tokenCols: Array<[table: string, column: string]> = [
+      ["runs", "total_input_tokens"],
+      ["runs", "total_cache_creation_tokens"],
+      ["runs", "total_cache_read_tokens"],
+      ["runs", "total_output_tokens"],
+      ["stages", "input_tokens"],
+      ["stages", "cache_creation_tokens"],
+      ["stages", "cache_read_tokens"],
+      ["stages", "output_tokens"],
+    ];
+    for (const [table, column] of tokenCols) {
+      try {
+        this.db
+          .prepare(
+            `ALTER TABLE ${table} ADD COLUMN ${column} INTEGER NOT NULL DEFAULT 0`,
+          )
+          .run();
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        if (!msg.includes("duplicate column")) throw err;
+      }
+    }
   }
 
   close(): void {
@@ -146,6 +189,24 @@ export class SqliteStateStore implements StateStore {
     this.db
       .prepare(`UPDATE runs SET total_cost_usd = total_cost_usd + ? WHERE id = ?`)
       .run(delta, id);
+  }
+
+  addRunUsage(id: string, usage: TokenUsage): void {
+    const input = toTokenDelta(usage.input);
+    const cc = toTokenDelta(usage.cache_creation);
+    const cr = toTokenDelta(usage.cache_read);
+    const out = toTokenDelta(usage.output);
+    if (input === 0 && cc === 0 && cr === 0 && out === 0) return;
+    this.db
+      .prepare(
+        `UPDATE runs SET
+           total_input_tokens = total_input_tokens + ?,
+           total_cache_creation_tokens = total_cache_creation_tokens + ?,
+           total_cache_read_tokens = total_cache_read_tokens + ?,
+           total_output_tokens = total_output_tokens + ?
+         WHERE id = ?`,
+      )
+      .run(input, cc, cr, out, id);
   }
 
   listRuns(opts: { status?: RunStatus; limit?: number } = {}): RunRow[] {

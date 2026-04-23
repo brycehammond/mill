@@ -1,7 +1,14 @@
 import { mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { z } from "zod";
-import type { CriticName, Finding, RunContext, Severity } from "../../core/index.js";
+import type {
+  CriticName,
+  Finding,
+  RunContext,
+  Severity,
+  TokenUsage,
+} from "../../core/index.js";
+import { ZERO_USAGE } from "../../core/index.js";
 import { loadPrompt } from "../prompts.js";
 import { zodToJsonSchema } from "zod-to-json-schema";
 import { pickStructured, runClaude } from "../claude-cli.js";
@@ -23,9 +30,15 @@ export interface CriticResult {
   findings: Finding[];
   summary: string;
   cost: number;
+  // Token counts for the single claude call backing this critic. For the
+  // adversarial critic (codex-backed), usage is zero — codex billing is
+  // separate and not in the TokenUsage model.
+  usage: TokenUsage;
   sessionId: string;
   reportPath: string;
 }
+
+export { ZERO_USAGE };
 
 export interface RunCriticArgs {
   ctx: RunContext;
@@ -90,6 +103,7 @@ export async function runCritic(args: RunCriticArgs): Promise<CriticResult> {
   // finalizes the `review` stage row after all three critics settle.
   ctx.store.transaction(() => {
     ctx.store.addRunCost(ctx.runId, res.costUsd);
+    ctx.store.addRunUsage(ctx.runId, res.usage);
     if (res.sessionId) {
       ctx.store.saveSession(ctx.runId, slot, res.sessionId, res.costUsd);
     }
@@ -109,6 +123,7 @@ export async function runCritic(args: RunCriticArgs): Promise<CriticResult> {
     findings,
     summary: parsed.summary,
     cost: res.costUsd,
+    usage: res.usage,
     sessionId: res.sessionId,
     reportPath,
   };

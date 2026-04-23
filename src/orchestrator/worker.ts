@@ -1,5 +1,5 @@
 import { openStore } from "../core/index.js";
-import { loadConfig } from "./config.js";
+import { loadConfig, NoProjectError } from "./config.js";
 import { buildContext } from "./context.js";
 import { runPipeline } from "./pipeline.js";
 
@@ -72,6 +72,10 @@ function sleep(ms: number): Promise<void> {
 }
 
 main().catch((err) => {
+  if (err instanceof NoProjectError) {
+    console.error(`worker: ${err.message}`);
+    process.exit(1);
+  }
   console.error("worker fatal:", err);
   process.exit(1);
 });
