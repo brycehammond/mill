@@ -1,0 +1,27 @@
+{
+  "name": "dark-factory",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "bin": {
+    "df": "./dist/cli.js"
+  },
+  "scripts": {
+    "df": "tsx src/cli.ts",
+    "worker": "tsx src/orchestrator/worker.ts",
+    "build": "tsc -p . && cp -r src/prompts dist/prompts",
+    "typecheck": "tsc --noEmit",
+    "clean": "rm -rf dist"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.11",
+    "@types/node": "^22.10.2",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2"
+  },
+  "dependencies": {
+    "better-sqlite3": "^11.7.0",
+    "zod": "^3.24.1",
+    "zod-to-json-schema": "^3.24.1"
+  }
+}

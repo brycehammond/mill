@@ -1,0 +1,577 @@
+#!/usr/bin/env node
+import { createInterface } from "node:readline/promises";
+import { writeFile, readFile } from "node:fs/promises";
+import { parseArgs } from "node:util";
+import { execFileSync } from "node:child_process";
+import { relative } from "node:path";
+import { openStore, runPaths, type Clarifications } from "./core/index.js";
+import {
+  buildContext,
+  intake,
+  clarify,
+  recordAnswers,
+  runPipeline,
+  loadConfig,
+} from "./orchestrator/index.js";
+
+type Cmd = "new" | "run" | "status" | "logs" | "tail" | "kill" | "help";
+
+async function main() {
+  const [, , cmdRaw, ...rest] = process.argv;
+  const cmd = (cmdRaw ?? "help") as Cmd;
+
+  switch (cmd) {
+    case "new":
+      return await cmdNew(rest);
+    case "run":
+      return await cmdRun(rest);
+    case "status":
+      return await cmdStatus(rest);
+    case "logs":
+      return await cmdLogs(rest);
+    case "tail":
+      return await cmdTail(rest);
+    case "kill":
+      return await cmdKill(rest);
+    case "help":
+    default:
+      printHelp();
+      return;
+  }
+}
+
+function preflightClaude(): void {
+  try {
+    execFileSync("claude", ["--version"], { stdio: "ignore" });
+  } catch {
+    console.error(
+      "df: `claude` CLI not found on PATH.\n" +
+        "Install with: npm i -g @anthropic-ai/claude-code",
+    );
+    process.exit(1);
+  }
+}
+
+function printHelp() {
+  process.stdout.write(
+    [
+      "df — dark factory: a harness around the claude CLI",
+      "",
+      "usage:",
+      "  df new (<requirement...> | --from <file>) [--detach] [--all-defaults]",
+      "  df run <run-id>                   # resume a run, skipping completed stages",
+      "  df status [<run-id>]",
+      "  df tail <run-id> [--follow]      # human-readable activity stream",
+      "  df logs <run-id> [--follow] [--after <event-id>]  # raw events",
+      "  df kill <run-id>",
+      "",
+    ].join("\n"),
+  );
+}
+
+async function cmdNew(argv: string[]) {
+  const { values, positionals } = parseArgs({
+    args: argv,
+    allowPositionals: true,
+    options: {
+      detach: { type: "boolean", default: false },
+      "all-defaults": { type: "boolean", default: false },
+      root: { type: "string" },
+      from: { type: "string" },
+    },
+  });
+
+  const positionalText = positionals.join(" ").trim();
+  const fromPath = values.from;
+
+  if (fromPath && positionalText) {
+    console.error(
+      "df new: pass the requirement either positionally or via --from, not both",
+    );
+    process.exitCode = 2;
+    return;
+  }
+
+  let requirement: string;
+  if (fromPath) {
+    try {
+      requirement = (await readFile(fromPath, "utf8")).trim();
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.error(`df new: could not read --from ${fromPath}: ${msg}`);
+      process.exitCode = 2;
+      return;
+    }
+  } else {
+    requirement = positionalText;
+  }
+
+  if (!requirement) {
+    console.error(
+      fromPath
+        ? `df new: --from file ${fromPath} is empty`
+        : "df new: requirement is required",
+    );
+    process.exitCode = 2;
+    return;
+  }
+
+  preflightClaude();
+
+  const config = loadConfig();
+  if (values.root) config.root = values.root;
+  const store = openStore(config.root);
+
+  const { runId } = await intake({
+    requirement,
+    root: config.root,
+    store,
+  });
+  console.log(`run created: ${runId}`);
+
+  const ctx = await buildContext({ runId, config, store });
+  console.log("running clarify…");
+  const clarifyRes = await clarify(ctx);
+  if (!clarifyRes.ok) {
+    console.error(`clarify failed: ${clarifyRes.error}`);
+    process.exitCode = 1;
+    return;
+  }
+
+  const clar = store.getClarifications(runId);
+  if (!clar) throw new Error("clarifications not stored");
+
+  console.log(`\nkind: ${clar.kind}`);
+  const answers = await promptForAnswers(clar, Boolean(values["all-defaults"]));
+  await recordAnswers(ctx, answers);
+  console.log("\nanswers recorded. run is now dark.\n");
+
+  if (values.detach) {
+    console.log(
+      "detach: run is queued with status=running. launch `npm run worker` to execute it.",
+    );
+    return;
+  }
+
+  console.log("running pipeline inline (spec → design → implement ⇄ review → verify → deliver)");
+  installInlineAbortHandler(ctx);
+  const result = await runPipeline({ runId, config, ctx });
+  console.log("\n=== pipeline result ===");
+  console.log(JSON.stringify(result, null, 2));
+  const paths = runPaths(config.root, runId);
+  console.log(`\ndelivery: ${paths.delivery}`);
+  console.log(`workdir:  ${paths.workdir}`);
+}
+
+async function cmdRun(argv: string[]) {
+  const runId = argv[0];
+  if (!runId) {
+    console.error("df run: run-id required");
+    process.exitCode = 2;
+    return;
+  }
+  preflightClaude();
+  const config = loadConfig();
+  const store = openStore(config.root);
+  const run = store.getRun(runId);
+  if (!run) {
+    console.error(`no run: ${runId}`);
+    process.exitCode = 1;
+    return;
+  }
+  if (run.status === "completed") {
+    console.log(`run ${runId} already completed; nothing to do`);
+    return;
+  }
+  if (run.status === "killed") {
+    console.log(`run ${runId} killed; remove runs/<id>/KILLED to retry`);
+    return;
+  }
+  const ctx = await buildContext({ runId, config, store });
+  console.log(`resuming ${runId} (status=${run.status})`);
+  installInlineAbortHandler(ctx);
+  const result = await runPipeline({ runId, config, ctx });
+  console.log(JSON.stringify(result, null, 2));
+}
+
+// Hook SIGINT/SIGTERM during an inline pipeline run. First signal aborts the
+// context (propagates SIGTERM → SIGKILL to the claude subprocess via
+// runClaude.onAbort); pipeline.ts catches KilledError and records the run as
+// killed. Second signal gives up and exits immediately.
+function installInlineAbortHandler(ctx: {
+  abortController: AbortController;
+}): void {
+  let firstSignal = true;
+  const handler = (signal: NodeJS.Signals) => {
+    if (firstSignal) {
+      firstSignal = false;
+      process.stderr.write(
+        `\n${signal}: aborting run — send again to force exit\n`,
+      );
+      ctx.abortController.abort();
+      return;
+    }
+    process.stderr.write(`\n${signal} (again): forcing exit\n`);
+    process.exit(130);
+  };
+  process.on("SIGINT", handler);
+  process.on("SIGTERM", handler);
+}
+
+async function promptForAnswers(
+  clar: Clarifications,
+  allDefaults: boolean,
+): Promise<Record<string, string>> {
+  const answers: Record<string, string> = {};
+  if (clar.questions.length === 0) {
+    console.log("no clarifying questions needed.");
+    return answers;
+  }
+
+  if (allDefaults) {
+    for (const q of clar.questions) {
+      answers[q.id] = q.default ?? "";
+    }
+    return answers;
+  }
+
+  const rl = createInterface({
+    input: process.stdin,
+    output: process.stdout,
+  });
+  try {
+    for (const [i, q] of clar.questions.entries()) {
+      process.stdout.write(
+        `\nQ${i + 1}/${clar.questions.length}. ${q.question}\n  (why: ${q.why})\n`,
+      );
+      const promptLine = q.default
+        ? `  [default: ${q.default}] > `
+        : `  > `;
+      const raw = (await rl.question(promptLine)).trim();
+      answers[q.id] = raw || (q.default ?? "");
+    }
+  } finally {
+    rl.close();
+  }
+  return answers;
+}
+
+async function cmdStatus(argv: string[]) {
+  const config = loadConfig();
+  const store = openStore(config.root);
+  const runId = argv[0];
+  if (!runId) {
+    const rows = store.listRuns({ limit: 20 });
+    if (rows.length === 0) {
+      console.log("(no runs)");
+      return;
+    }
+    console.log("id                       status               kind     cost       created");
+    for (const r of rows) {
+      console.log(
+        [
+          r.id.padEnd(24),
+          r.status.padEnd(20),
+          (r.kind ?? "—").padEnd(8),
+          `$${r.total_cost_usd.toFixed(4)}`.padEnd(10),
+          new Date(r.created_at).toISOString(),
+        ].join(" "),
+      );
+    }
+    return;
+  }
+  const run = store.getRun(runId);
+  if (!run) {
+    console.error(`no run: ${runId}`);
+    process.exitCode = 1;
+    return;
+  }
+  const stages = store.listStages(runId);
+  console.log(`run ${runId}`);
+  console.log(`status: ${run.status}  kind: ${run.kind ?? "—"}  cost: $${run.total_cost_usd.toFixed(4)}`);
+  console.log();
+  console.log("stage        status       cost        started");
+  for (const s of stages) {
+    console.log(
+      [
+        s.name.padEnd(12),
+        s.status.padEnd(12),
+        `$${s.cost_usd.toFixed(4)}`.padEnd(11),
+        s.started_at ? new Date(s.started_at).toISOString() : "—",
+      ].join(" "),
+    );
+  }
+}
+
+async function cmdLogs(argv: string[]) {
+  const { values, positionals } = parseArgs({
+    args: argv,
+    allowPositionals: true,
+    options: {
+      follow: { type: "boolean", short: "f", default: false },
+      after: { type: "string" },
+      limit: { type: "string", default: "200" },
+    },
+  });
+  const runId = positionals[0];
+  if (!runId) {
+    console.error("df logs: run-id required");
+    process.exitCode = 2;
+    return;
+  }
+  const config = loadConfig();
+  const store = openStore(config.root);
+  let after = values.after ? Number(values.after) : 0;
+  const limit = Number(values.limit ?? "200");
+
+  const dump = () => {
+    const events = store.tailEvents(runId, after, limit);
+    for (const e of events) {
+      const payload = safeParse(e.payload_json);
+      const line = compactEvent(e.ts, e.stage, e.kind, payload);
+      console.log(line);
+      after = e.id;
+    }
+  };
+
+  dump();
+  if (!values.follow) return;
+
+  // Poll every second until the process is interrupted.
+  // eslint-disable-next-line no-constant-condition
+  while (true) {
+    await sleep(1000);
+    const run = store.getRun(runId);
+    dump();
+    if (run && (run.status === "completed" || run.status === "failed" || run.status === "killed")) {
+      break;
+    }
+  }
+}
+
+async function cmdTail(argv: string[]) {
+  const { values, positionals } = parseArgs({
+    args: argv,
+    allowPositionals: true,
+    options: {
+      follow: { type: "boolean", short: "f", default: false },
+      after: { type: "string" },
+    },
+  });
+  const runId = positionals[0];
+  if (!runId) {
+    console.error("df tail: run-id required");
+    process.exitCode = 2;
+    return;
+  }
+  const config = loadConfig();
+  const store = openStore(config.root);
+  const run = store.getRun(runId);
+  if (!run) {
+    console.error(`no run: ${runId}`);
+    process.exitCode = 1;
+    return;
+  }
+  const paths = runPaths(config.root, runId);
+  let after = values.after ? Number(values.after) : 0;
+  let lastStage = "";
+
+  const dump = () => {
+    const events = store.tailEvents(runId, after, 500);
+    for (const e of events) {
+      if (e.stage !== lastStage) {
+        process.stdout.write(`══ ${e.stage} ══\n`);
+        lastStage = e.stage;
+      }
+      const payload = safeParse(e.payload_json);
+      const line = renderTailLine(e.kind, payload, paths.workdir);
+      if (line !== null) process.stdout.write(line + "\n");
+      after = e.id;
+    }
+  };
+
+  dump();
+  if (!values.follow) return;
+
+  // eslint-disable-next-line no-constant-condition
+  while (true) {
+    await sleep(1000);
+    const r = store.getRun(runId);
+    dump();
+    if (r && (r.status === "completed" || r.status === "failed" || r.status === "killed")) {
+      process.stdout.write(`── run ${r.status} · total $${r.total_cost_usd.toFixed(4)}\n`);
+      break;
+    }
+  }
+}
+
+// Translate one SDK message (already JSON-parsed) into a human-readable line.
+// Returns null to suppress (e.g. rate-limit heartbeats).
+function renderTailLine(
+  kind: string,
+  payload: unknown,
+  workdir: string,
+): string | null {
+  if (!payload || typeof payload !== "object") return null;
+  const p = payload as Record<string, unknown>;
+
+  if (kind === "system") {
+    const subtype = typeof p.subtype === "string" ? p.subtype : "";
+    if (subtype === "init") {
+      const sid = typeof p.session_id === "string" ? p.session_id.slice(0, 8) : "?";
+      const model = typeof p.model === "string" ? p.model : "?";
+      return `∙ session ${sid} · ${model}`;
+    }
+    return null;
+  }
+
+  if (kind === "rate_limit_event") return null;
+
+  if (kind === "assistant") {
+    const msg = (p.message ?? {}) as { content?: unknown[] };
+    const lines: string[] = [];
+    for (const c of msg.content ?? []) {
+      if (!c || typeof c !== "object") continue;
+      const cc = c as Record<string, unknown>;
+      if (cc.type === "tool_use") {
+        const name = typeof cc.name === "string" ? cc.name : "?";
+        const summary = summarizeToolInput(name, cc.input, workdir);
+        lines.push(`→ ${name}${summary ? " " + summary : ""}`);
+      } else if (cc.type === "text") {
+        const text = typeof cc.text === "string" ? cc.text.trim() : "";
+        if (text) lines.push(`  │ ${text.length > 140 ? text.slice(0, 137) + "…" : text}`);
+      }
+    }
+    return lines.length > 0 ? lines.join("\n") : null;
+  }
+
+  if (kind === "user") {
+    const msg = (p.message ?? {}) as { content?: unknown };
+    const content = msg.content;
+    if (!Array.isArray(content)) return null;
+    const lines: string[] = [];
+    for (const c of content) {
+      if (!c || typeof c !== "object") continue;
+      const cc = c as Record<string, unknown>;
+      if (cc.type === "tool_result") {
+        const isError = Boolean(cc.is_error);
+        if (isError) {
+          const text = extractToolResultText(cc.content);
+          lines.push(`  ✗ ${text.length > 100 ? text.slice(0, 97) + "…" : text}`);
+        } else {
+          lines.push(`  ✓`);
+        }
+      }
+    }
+    return lines.length > 0 ? lines.join("\n") : null;
+  }
+
+  if (kind === "result") {
+    const cost = typeof p.total_cost_usd === "number" ? p.total_cost_usd.toFixed(4) : "?";
+    const ms = typeof p.duration_ms === "number" ? p.duration_ms : 0;
+    const turns = typeof p.num_turns === "number" ? p.num_turns : 0;
+    const subtype = typeof p.subtype === "string" ? p.subtype : "?";
+    const marker = subtype === "success" ? "──" : "✗✗";
+    return `${marker} ${subtype} · $${cost} · ${(ms / 1000).toFixed(1)}s · ${turns} turns`;
+  }
+
+  return null;
+}
+
+function summarizeToolInput(
+  toolName: string,
+  input: unknown,
+  workdir: string,
+): string {
+  if (!input || typeof input !== "object") return "";
+  const i = input as Record<string, unknown>;
+  const path =
+    typeof i.file_path === "string"
+      ? i.file_path
+      : typeof i.path === "string"
+        ? i.path
+        : typeof i.notebook_path === "string"
+          ? i.notebook_path
+          : null;
+  if (path) {
+    const rel = path.startsWith(workdir) ? relative(workdir, path) || "." : path;
+    return rel;
+  }
+  if (toolName === "Bash" && typeof i.command === "string") {
+    const cmd = i.command.replace(/\s+/g, " ").trim();
+    return cmd.length > 80 ? cmd.slice(0, 77) + "…" : cmd;
+  }
+  if (toolName === "Glob" && typeof i.pattern === "string") return i.pattern;
+  if (toolName === "Grep" && typeof i.pattern === "string") return i.pattern;
+  return "";
+}
+
+function extractToolResultText(content: unknown): string {
+  if (typeof content === "string") return content.replace(/\s+/g, " ").trim();
+  if (Array.isArray(content)) {
+    const parts: string[] = [];
+    for (const c of content) {
+      if (c && typeof c === "object" && (c as Record<string, unknown>).type === "text") {
+        const t = (c as Record<string, unknown>).text;
+        if (typeof t === "string") parts.push(t);
+      }
+    }
+    return parts.join(" ").replace(/\s+/g, " ").trim();
+  }
+  return "";
+}
+
+async function cmdKill(argv: string[]) {
+  const runId = argv[0];
+  if (!runId) {
+    console.error("df kill: run-id required");
+    process.exitCode = 2;
+    return;
+  }
+  const config = loadConfig();
+  const store = openStore(config.root);
+  const run = store.getRun(runId);
+  if (!run) {
+    console.error(`no run: ${runId}`);
+    process.exitCode = 1;
+    return;
+  }
+  const paths = runPaths(config.root, runId);
+  await writeFile(paths.killed, `killed at ${new Date().toISOString()}\n`, "utf8");
+  store.updateRun(runId, { status: "killed" });
+  console.log(`kill sentinel written: ${paths.killed}`);
+  console.log("worker will stop the run on its next tool call.");
+}
+
+function compactEvent(ts: number, stage: string, kind: string, payload: unknown): string {
+  const t = new Date(ts).toISOString();
+  const head = `[${t}] ${stage.padEnd(10)} ${kind}`;
+  if (!payload) return head;
+  if (typeof payload === "object" && payload !== null) {
+    const p = payload as Record<string, unknown>;
+    if (p.subtype || p.total_cost_usd || p.num_turns) {
+      const cost = typeof p.total_cost_usd === "number" ? ` $${p.total_cost_usd.toFixed(4)}` : "";
+      return `${head} ${p.subtype ?? ""}${cost}`;
+    }
+    if (typeof p.message === "string") return `${head} ${p.message.slice(0, 120)}`;
+  }
+  return head;
+}
+
+function safeParse(raw: string): unknown {
+  try {
+    return JSON.parse(raw);
+  } catch {
+    return raw;
+  }
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+main().catch((err) => {
+  console.error("df error:", err instanceof Error ? err.message : err);
+  process.exit(1);
+});
+

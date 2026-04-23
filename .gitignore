@@ -4,6 +4,7 @@ build/
 .next/
 .turbo/
 .cache/
+*.tsbuildinfo
 
 .env
 .env.local
@@ -11,6 +12,12 @@ build/
 
 runs/
 !runs/.gitkeep
+
+# Local SQLite state store
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
 
 *.log
 .DS_Store
