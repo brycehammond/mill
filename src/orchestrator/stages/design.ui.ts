@@ -1,6 +1,7 @@
 import { readFile, writeFile } from "node:fs/promises";
 import { z } from "zod";
 import type { RunContext, StageResult } from "../../core/index.js";
+import { readJournalTail } from "../../core/index.js";
 import { loadPrompt } from "../prompts.js";
 import { zodToJsonSchema } from "zod-to-json-schema";
 import { pickStructured, runClaude } from "../claude-cli.js";
@@ -21,13 +22,18 @@ const UiDesignSchema = zodToJsonSchema(UiDesignOutput);
 export async function designUi(ctx: RunContext): Promise<StageResult> {
   const systemPrompt = await loadPrompt("design-ui");
   const specBody = await readFile(ctx.paths.spec, "utf8");
+  const journal = await readJournalTail(ctx.root, 20);
+
+  const prompt = [journal, `## Spec`, specBody]
+    .filter((s) => s !== "")
+    .join("\n\n");
 
   // Stitch MCP is expected to be configured in the user's global Claude
   // settings — settingSources: ['user'] pulls it in automatically.
   const res = await runClaude({
     ctx,
     stage: "design",
-    prompt: `Spec:\n\n${specBody}`,
+    prompt,
     systemPrompt,
     // Inherit the user's global Claude Code config so the Stitch MCP
     // (defined in ~/.claude/settings.json) is available. `project` picks

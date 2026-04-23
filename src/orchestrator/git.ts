@@ -15,14 +15,29 @@ export async function gitInit(cwd: string): Promise<void> {
     await git(cwd, ["init"]);
     await git(cwd, ["checkout", "-b", "main"]).catch(() => {});
   });
+  await configureGitIdentity(cwd);
+}
+
+// Shared between gitInit (new-mode workdir) and the edit-mode worktree
+// bootstrap in intake. Safe to run repeatedly — `git config` is local
+// to the (work)tree and appendFile on info/exclude is idempotent
+// modulo duplicate lines, which git tolerates.
+export async function configureGitIdentity(cwd: string): Promise<void> {
   await git(cwd, ["config", "user.email", "df@dark-factory.local"]);
   await git(cwd, ["config", "user.name", "dark-factory"]);
   await git(cwd, ["config", "commit.gpgsign", "false"]);
   // Never commit the harness's per-run .claude/ sandbox config — it's
   // injected at run time, not part of the delivered artifact.
+  // For a worktree, `rev-parse --git-path info/exclude` returns the
+  // worktree-local exclude file; falls back to .git/info/exclude for a
+  // plain repo.
+  const excludeRel = (
+    await git(cwd, ["rev-parse", "--git-path", "info/exclude"])
+  ).trim();
+  const excludeAbs = excludeRel.startsWith("/") ? excludeRel : join(cwd, excludeRel);
   await appendFile(
-    join(cwd, ".git", "info", "exclude"),
-    "\n# dark-factory harness sandbox — do not commit\n.claude/\n",
+    excludeAbs,
+    "\n# dark-factory harness sandbox — do not commit\n.claude/\n.df/\n",
     "utf8",
   );
 }
@@ -62,5 +77,24 @@ export async function gitCheckoutBranch(cwd: string, branch: string): Promise<vo
     await git(cwd, ["checkout", branch]);
   } catch {
     await git(cwd, ["checkout", "-b", branch]);
+  }
+}
+
+// Create a fresh branch from <startPoint> and check it out into <path>
+// as a linked worktree. <path> must not exist yet — git enforces this.
+export async function gitWorktreeAdd(
+  root: string,
+  branch: string,
+  path: string,
+  startPoint: string = "HEAD",
+): Promise<void> {
+  await git(root, ["worktree", "add", "-b", branch, path, startPoint]);
+}
+
+export async function gitDiffStat(cwd: string, range: string): Promise<string> {
+  try {
+    return (await git(cwd, ["diff", "--stat", range])).trimEnd();
+  } catch {
+    return "";
   }
 }

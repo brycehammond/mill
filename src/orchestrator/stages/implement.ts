@@ -16,14 +16,22 @@ export async function implement(args: ImplementArgs): Promise<StageResult> {
   const { ctx, iteration, priorFindings } = args;
   ctx.store.startStage(ctx.runId, "implement");
   try {
+    // In edit mode the worktree was materialized at intake — `.git`
+    // exists as a *file* (gitdir pointer), not a directory; `pathExists`
+    // via fs.stat resolves both, so `firstRun` is correctly false. The
+    // impl/iter-0 tag was placed at intake on the base HEAD.
     const firstRun = !(await pathExists(`${ctx.paths.workdir}/.git`));
-    if (firstRun) {
+    if (firstRun && ctx.mode === "new") {
       await gitInit(ctx.paths.workdir);
       // Empty initial commit anchors impl/iter-0 so the adversarial
       // critic always has a stable base ref to diff against, even on
       // iteration 1 when the other tags don't exist yet.
       await gitCommitEmpty(ctx.paths.workdir, "chore: initial empty workdir");
       await gitTag(ctx.paths.workdir, "impl/iter-0");
+    } else if (firstRun) {
+      throw new Error(
+        `implement: edit-mode run has no .git at workdir ${ctx.paths.workdir} — intake worktree creation must have failed`,
+      );
     }
 
     const systemPrompt = await loadPrompt("implement");

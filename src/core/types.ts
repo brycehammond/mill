@@ -2,6 +2,8 @@
 
 export type Kind = "ui" | "backend" | "cli";
 
+export type RunMode = "new" | "edit";
+
 export type PermissionMode =
   | "default"
   | "acceptEdits"
@@ -88,6 +90,7 @@ export interface RunRow {
   id: string;
   status: RunStatus;
   kind: Kind | null;
+  mode: RunMode;
   created_at: number;
   requirement_path: string;
   spec_path: string | null;
@@ -193,6 +196,7 @@ export interface Logger {
 export interface RunContext {
   runId: string;
   kind: Kind | null;
+  mode: RunMode;
   paths: RunPaths;
   store: StateStore;
   abortController: AbortController;
@@ -223,7 +227,8 @@ export interface StateStore {
       | "total_cache_read_tokens"
       | "total_output_tokens"
       | "spec_path"
-    > & { spec_path?: string | null },
+      | "mode"
+    > & { spec_path?: string | null; mode?: RunMode },
   ): void;
   getRun(id: string): RunRow | null;
   updateRun(

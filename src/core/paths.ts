@@ -31,11 +31,25 @@ export function runPaths(root: string, runId: string): RunPaths {
   };
 }
 
-export async function ensureRunDirs(paths: RunPaths): Promise<void> {
+export interface EnsureRunDirsOpts {
+  // In edit mode the workdir is materialized by `git worktree add`,
+  // which refuses to create into an existing directory. Callers pass
+  // `createWorkdir: false` to skip that mkdir; every other dir is
+  // still created unconditionally.
+  createWorkdir?: boolean;
+}
+
+export async function ensureRunDirs(
+  paths: RunPaths,
+  opts: EnsureRunDirsOpts = {},
+): Promise<void> {
+  const createWorkdir = opts.createWorkdir ?? true;
   await mkdir(paths.runDir, { recursive: true });
   await mkdir(paths.designDir, { recursive: true });
   await mkdir(paths.designScreens, { recursive: true });
-  await mkdir(paths.workdir, { recursive: true });
+  if (createWorkdir) {
+    await mkdir(paths.workdir, { recursive: true });
+  }
   await mkdir(paths.reviewsDir, { recursive: true });
   await mkdir(paths.verifyDir, { recursive: true });
 }

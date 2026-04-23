@@ -20,11 +20,16 @@ export async function buildContext(args: BuildContextArgs): Promise<RunContext> 
   const { runId, config } = args;
   const store = args.store ?? openStore(config.root);
   const paths = runPaths(config.root, runId);
-  await ensureRunDirs(paths);
+  const existingRun = store.getRun(runId);
+  const mode = existingRun?.mode ?? "new";
+  // In edit mode the workdir is owned by `git worktree add` (done at
+  // intake). A stray `mkdir` would win the race only on pre-intake
+  // context builds — never actually happens today — but skipping keeps
+  // the invariant clean.
+  await ensureRunDirs(paths, { createWorkdir: mode !== "edit" });
   // Drop the per-run sandbox settings.json so Claude Code's cwd-walk picks it
   // up. Safe to rewrite on resume — the config is deterministic.
   writeRunSettings({ paths });
-  const existingRun = store.getRun(runId);
   const budget = new BudgetTrackerImpl(
     config.budgetUsdPerRun,
     config.budgetUsdPerStage,
@@ -35,6 +40,7 @@ export async function buildContext(args: BuildContextArgs): Promise<RunContext> 
   const ctx: RunContext = {
     runId,
     kind: existingRun?.kind ?? null,
+    mode,
     paths,
     store,
     abortController,

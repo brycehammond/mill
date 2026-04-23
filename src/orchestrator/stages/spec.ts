@@ -1,13 +1,14 @@
 import { readFile, writeFile } from "node:fs/promises";
 import type { RunContext, StageResult } from "../../core/index.js";
-import { usageStagePatch } from "../../core/index.js";
+import { readJournalTail, usageStagePatch } from "../../core/index.js";
 import { loadPrompt } from "../prompts.js";
 import { extractMarkdownBlock, runClaude } from "../claude-cli.js";
 
 export async function spec(ctx: RunContext): Promise<StageResult> {
   ctx.store.startStage(ctx.runId, "spec");
   try {
-    const systemPrompt = await loadPrompt("spec");
+    const promptName = ctx.mode === "edit" ? "spec-edit" : "spec";
+    const systemPrompt = await loadPrompt(promptName);
     const requirement = await readFile(ctx.paths.requirement, "utf8");
     const clarifications = ctx.store.getClarifications(ctx.runId);
     if (!clarifications) {
@@ -17,7 +18,20 @@ export async function spec(ctx: RunContext): Promise<StageResult> {
       throw new Error("clarifications missing user answers");
     }
 
+    const journal = await readJournalTail(ctx.root, 20);
+    const workdirBlock =
+      ctx.mode === "edit"
+        ? [
+            `## Existing codebase`,
+            `Workdir: ${ctx.paths.workdir}`,
+            `Read relevant files with Read/Glob/Grep before writing the spec.`,
+            ``,
+          ].join("\n")
+        : "";
+
     const body = [
+      journal,
+      workdirBlock,
       `KIND: ${clarifications.kind}`,
       ``,
       `## Requirement`,
@@ -32,16 +46,21 @@ export async function spec(ctx: RunContext): Promise<StageResult> {
         null,
         2,
       ),
-    ].join("\n");
+    ]
+      .filter((s) => s !== "")
+      .join("\n");
 
     const res = await runClaude({
       ctx,
       stage: "spec",
       prompt: body,
       systemPrompt,
-      maxTurns: 4,
+      // Edit mode: read codebase with Read/Glob/Grep before specifying.
+      // runClaude defaults cwd to ctx.paths.workdir, which is the git
+      // worktree checkout in edit mode.
+      maxTurns: ctx.mode === "edit" ? 12 : 4,
       permissionMode: "default",
-      allowedTools: [],
+      allowedTools: ctx.mode === "edit" ? ["Read", "Glob", "Grep"] : [],
     });
 
     const md = extractMarkdownBlock(res.text);

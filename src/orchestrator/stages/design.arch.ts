@@ -1,22 +1,39 @@
 import { readFile, writeFile } from "node:fs/promises";
 import type { RunContext, StageResult } from "../../core/index.js";
+import { readJournalTail } from "../../core/index.js";
 import { loadPrompt } from "../prompts.js";
 import { extractMarkdownBlock, runClaude } from "../claude-cli.js";
 
 export async function designArchitecture(
   ctx: RunContext,
 ): Promise<StageResult> {
-  const systemPrompt = await loadPrompt("design-arch");
+  const promptName = ctx.mode === "edit" ? "design-arch-edit" : "design-arch";
+  const systemPrompt = await loadPrompt(promptName);
   const specBody = await readFile(ctx.paths.spec, "utf8");
+  const journal = await readJournalTail(ctx.root, 20);
+
+  const workdirBlock =
+    ctx.mode === "edit"
+      ? [
+          `## Existing codebase`,
+          `Workdir: ${ctx.paths.workdir}`,
+          `Read relevant files with Read/Glob/Grep before writing architecture.md.`,
+          ``,
+        ].join("\n")
+      : "";
+
+  const prompt = [journal, workdirBlock, `## Spec`, specBody]
+    .filter((s) => s !== "")
+    .join("\n");
 
   const res = await runClaude({
     ctx,
     stage: "design",
-    prompt: `Spec:\n\n${specBody}`,
+    prompt,
     systemPrompt,
-    maxTurns: 4,
+    maxTurns: ctx.mode === "edit" ? 12 : 4,
     permissionMode: "default",
-    allowedTools: [],
+    allowedTools: ctx.mode === "edit" ? ["Read", "Glob", "Grep"] : [],
   });
 
   const md = extractMarkdownBlock(res.text);

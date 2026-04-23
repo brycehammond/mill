@@ -6,7 +6,7 @@
 // from everything else in the tree. There is no global index; every
 // command resolves the current project by walking up from cwd.
 
-import { execFileSync } from "node:child_process";
+import { execFile, execFileSync } from "node:child_process";
 import {
   existsSync,
   mkdirSync,
@@ -16,6 +16,10 @@ import {
   statSync,
 } from "node:fs";
 import { basename, dirname, join, resolve, sep } from "node:path";
+import { promisify } from "node:util";
+import type { RunMode } from "./types.js";
+
+const execFileP = promisify(execFile);
 
 export interface ProjectInfo {
   name: string;
@@ -178,4 +182,97 @@ export function projectDbExists(projectRoot: string): boolean {
   } catch {
     return false;
   }
+}
+
+// ---------- repo state + run-mode detection ----------
+
+export interface RepoState {
+  hasCommits: boolean;
+  trackedSourceCount: number;
+  currentBranch: string | null; // "detached@<sha>" if detached
+  inProgressOp: "merge" | "rebase" | "cherry-pick" | null;
+}
+
+// Files that count as "repo metadata", not user source. Tracked files
+// outside this allowlist push auto-detection toward edit mode.
+const META_FILES = new Set([
+  ".gitignore",
+  ".gitattributes",
+  "README.md",
+  "README",
+  "README.rst",
+  "LICENSE",
+  "LICENSE.md",
+  "LICENSE.txt",
+  ".env.example",
+]);
+
+async function gitOut(cwd: string, args: string[]): Promise<string> {
+  const { stdout } = await execFileP("git", args, {
+    cwd,
+    maxBuffer: 10 * 1024 * 1024,
+  });
+  return stdout;
+}
+
+export async function inspectRepoState(root: string): Promise<RepoState> {
+  let hasCommits = false;
+  try {
+    await gitOut(root, ["rev-parse", "--verify", "HEAD"]);
+    hasCommits = true;
+  } catch {
+    hasCommits = false;
+  }
+
+  let trackedSourceCount = 0;
+  try {
+    const out = await gitOut(root, ["ls-files"]);
+    const files = out.split("\n").map((l) => l.trim()).filter(Boolean);
+    trackedSourceCount = files.filter(
+      (f) => !META_FILES.has(f) && !f.startsWith(".df/"),
+    ).length;
+  } catch {
+    trackedSourceCount = 0;
+  }
+
+  let currentBranch: string | null = null;
+  if (hasCommits) {
+    try {
+      const out = (
+        await gitOut(root, ["rev-parse", "--abbrev-ref", "HEAD"])
+      ).trim();
+      if (out === "HEAD") {
+        const sha = (await gitOut(root, ["rev-parse", "--short", "HEAD"])).trim();
+        currentBranch = `detached@${sha}`;
+      } else if (out) {
+        currentBranch = out;
+      }
+    } catch {
+      currentBranch = null;
+    }
+  }
+
+  let inProgressOp: RepoState["inProgressOp"] = null;
+  const gitDir = join(root, ".git");
+  if (existsSync(join(gitDir, "MERGE_HEAD"))) inProgressOp = "merge";
+  else if (
+    existsSync(join(gitDir, "rebase-apply")) ||
+    existsSync(join(gitDir, "rebase-merge"))
+  )
+    inProgressOp = "rebase";
+  else if (existsSync(join(gitDir, "CHERRY_PICK_HEAD")))
+    inProgressOp = "cherry-pick";
+
+  return { hasCommits, trackedSourceCount, currentBranch, inProgressOp };
+}
+
+// Heuristic: no commits OR no non-meta tracked files → scaffold into an
+// isolated workdir under `.df/runs/<id>/workdir/`. Otherwise the repo
+// already has code the user will want df to edit — route through edit
+// mode with a git worktree.
+export async function detectRunMode(root: string): Promise<RunMode> {
+  const state = await inspectRepoState(root);
+  if (!state.hasCommits) return "new";
+  if (state.trackedSourceCount === 0) return "new";
+  return "edit";
 }

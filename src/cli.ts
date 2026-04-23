@@ -9,7 +9,11 @@ import {
   runPaths,
   initProject,
   readProjectInfo,
+  detectRunMode,
+  readJournal,
+  journalPath,
   type Clarifications,
+  type RunMode,
 } from "./core/index.js";
 import {
   buildContext,
@@ -29,6 +33,7 @@ type Cmd =
   | "tail"
   | "kill"
   | "init"
+  | "history"
   | "help";
 
 async function main() {
@@ -51,6 +56,8 @@ async function main() {
         return await cmdTail(rest);
       case "kill":
         return await cmdKill(rest);
+      case "history":
+        return await cmdHistory();
       case "help":
       default:
         printHelp();
@@ -85,12 +92,18 @@ function printHelp() {
       "",
       "usage:",
       "  df init [<name>]                  # create .df/ in the current git repo",
-      "  df new (<requirement...> | --from <file>) [--detach] [--all-defaults]",
+      "  df new (<requirement...> | --from <file>) [--mode new|edit|auto]",
+      "         [--pr] [--detach] [--all-defaults]",
+      "    --mode auto (default) detects edit when the repo has committed",
+      "    source; otherwise scaffolds into .df/runs/<id>/workdir/. Edit",
+      "    runs create a df/run-<id> branch via git worktree.",
+      "    --pr pushes the branch and opens a GitHub PR via gh (edit only).",
       "  df run <run-id>                   # resume a run, skipping completed stages",
       "  df status [<run-id>]",
       "  df tail <run-id> [--follow]      # human-readable activity stream",
       "  df logs <run-id> [--follow] [--after <event-id>]  # raw events",
       "  df kill <run-id>",
+      "  df history                        # print .df/journal.md",
       "",
     ].join("\n"),
   );
@@ -126,6 +139,8 @@ async function cmdNew(argv: string[]) {
       detach: { type: "boolean", default: false },
       "all-defaults": { type: "boolean", default: false },
       from: { type: "string" },
+      mode: { type: "string", default: "auto" },
+      pr: { type: "boolean", default: false },
     },
   });
 
@@ -136,6 +151,13 @@ async function cmdNew(argv: string[]) {
     console.error(
       "df new: pass the requirement either positionally or via --from, not both",
     );
+    process.exitCode = 2;
+    return;
+  }
+
+  const rawMode = (values.mode ?? "auto").toLowerCase();
+  if (rawMode !== "auto" && rawMode !== "new" && rawMode !== "edit") {
+    console.error(`df new: --mode must be auto|new|edit, got "${values.mode}"`);
     process.exitCode = 2;
     return;
   }
@@ -169,12 +191,43 @@ async function cmdNew(argv: string[]) {
   const config = loadConfig();
   const store = openStore(config.root);
 
-  const { runId } = await intake({
-    requirement,
-    root: config.root,
-    store,
-  });
+  const effectiveMode: RunMode =
+    rawMode === "auto" ? await detectRunMode(config.root) : (rawMode as RunMode);
+  const prFlag = Boolean(values.pr);
+  if (prFlag && effectiveMode === "new") {
+    console.error("df new: --pr requires edit mode");
+    process.exitCode = 2;
+    return;
+  }
+
+  if (rawMode === "auto") {
+    console.log(
+      `df: auto-detected mode=${effectiveMode}. Override with --mode new|edit.`,
+    );
+  } else {
+    console.log(`df: mode=${effectiveMode}`);
+  }
+
+  let intakeResult;
+  try {
+    intakeResult = await intake({
+      requirement,
+      root: config.root,
+      store,
+      mode: effectiveMode,
+      pr: prFlag,
+    });
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error(`df new: intake failed: ${msg}`);
+    process.exitCode = 1;
+    return;
+  }
+  const { runId, branch, baseBranch } = intakeResult;
   console.log(`run created: ${runId}`);
+  if (effectiveMode === "edit" && branch) {
+    console.log(`branch: ${branch}${baseBranch ? ` (off ${baseBranch})` : ""}`);
+  }
 
   const ctx = await buildContext({ runId, config, store });
   console.log("running clarify…");
@@ -303,6 +356,17 @@ async function promptForAnswers(
   return answers;
 }
 
+async function cmdHistory() {
+  const config = loadConfig();
+  const body = await readJournal(config.root);
+  if (!body.trim()) {
+    console.log("(no journal yet)");
+    console.log(`will be written to: ${journalPath(config.root)}`);
+    return;
+  }
+  process.stdout.write(body.endsWith("\n") ? body : body + "\n");
+}
+
 async function cmdStatus(argv: string[]) {
   const config = loadConfig();
   const store = openStore(config.root);
@@ -318,12 +382,13 @@ async function cmdStatus(argv: string[]) {
       console.log("(no runs)");
       return;
     }
-    console.log("id                       status               kind     cost       created");
+    console.log("id                       status               mode  kind     cost       created");
     for (const r of rows) {
       console.log(
         [
           r.id.padEnd(24),
           r.status.padEnd(20),
+          (r.mode ?? "new").padEnd(5),
           (r.kind ?? "—").padEnd(8),
           `$${r.total_cost_usd.toFixed(4)}`.padEnd(10),
           new Date(r.created_at).toISOString(),
@@ -342,7 +407,7 @@ async function cmdStatus(argv: string[]) {
   const runTokens = totalTokens(run);
   console.log(`run ${runId}`);
   console.log(
-    `status: ${run.status}  kind: ${run.kind ?? "—"}  cost: $${run.total_cost_usd.toFixed(4)}  tokens: ${fmtTokens(run.total_input_tokens, run.total_cache_creation_tokens, run.total_cache_read_tokens, run.total_output_tokens)} (total ${runTokens.toLocaleString()})`,
+    `status: ${run.status}  mode: ${run.mode ?? "new"}  kind: ${run.kind ?? "—"}  cost: $${run.total_cost_usd.toFixed(4)}  tokens: ${fmtTokens(run.total_input_tokens, run.total_cache_creation_tokens, run.total_cache_read_tokens, run.total_output_tokens)} (total ${runTokens.toLocaleString()})`,
   );
   console.log();
   console.log("stage        status       cost        in     cc      cr       out    started");

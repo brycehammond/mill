@@ -1,11 +1,20 @@
-import { writeFile } from "node:fs/promises";
+import { execFile } from "node:child_process";
+import { readFile, writeFile } from "node:fs/promises";
+import { promisify } from "node:util";
 import type {
   RunContext,
   StageResult,
   Finding,
   TokenUsage,
 } from "../../core/index.js";
-import { atLeast } from "../../core/index.js";
+import {
+  appendJournalEntry,
+  atLeast,
+  type RunMode,
+} from "../../core/index.js";
+import { gitDiffStat } from "../git.js";
+
+const execFileP = promisify(execFile);
 
 export interface DeliverArgs {
   ctx: RunContext;
@@ -17,12 +26,42 @@ export interface DeliverArgs {
   startedAt: number;
 }
 
+interface WorktreeInfo {
+  branch: string;
+  baseBranch: string | null;
+  pr: boolean;
+}
+
 export async function deliver(args: DeliverArgs): Promise<StageResult> {
   const { ctx } = args;
   ctx.store.startStage(ctx.runId, "deliver");
   try {
     const run = ctx.store.getRun(ctx.runId);
     const stages = ctx.store.listStages(ctx.runId);
+
+    const worktree = findWorktreeInfo(ctx);
+    let diffStat = "";
+    let prUrl: string | null = null;
+
+    if (ctx.mode === "edit" && worktree && worktree.baseBranch) {
+      diffStat = await gitDiffStat(
+        ctx.paths.workdir,
+        `${worktree.baseBranch}..HEAD`,
+      );
+    }
+
+    const passed =
+      args.verifyPass &&
+      args.unresolvedHighFindings.filter((f) => atLeast(f.severity, "HIGH"))
+        .length === 0;
+
+    if (ctx.mode === "edit" && worktree && worktree.pr && passed) {
+      prUrl = await tryOpenPullRequest({
+        ctx,
+        branch: worktree.branch,
+        baseBranch: worktree.baseBranch,
+      });
+    }
 
     const durationMs = args.endedAt - args.startedAt;
     const runUsage = run
@@ -33,9 +72,11 @@ export async function deliver(args: DeliverArgs): Promise<StageResult> {
           output: run.total_output_tokens,
         }
       : ctx.budget.runUsageTotal();
+
     const md = renderDelivery({
       runId: ctx.runId,
       kind: ctx.kind,
+      mode: ctx.mode,
       totalCostUsd: run?.total_cost_usd ?? ctx.budget.runTotal(),
       totalUsage: runUsage,
       durationMs,
@@ -44,6 +85,9 @@ export async function deliver(args: DeliverArgs): Promise<StageResult> {
       verifyPass: args.verifyPass,
       verifyReportPath: args.verifyReportPath,
       workdir: ctx.paths.workdir,
+      worktree,
+      diffStat,
+      prUrl,
       // `deliver` is still marked `running` in the store here — finishStage
       // runs below so the updateRun + finishStage pair can share one
       // transaction. Patch the rendered row to reflect the terminal state
@@ -62,10 +106,24 @@ export async function deliver(args: DeliverArgs): Promise<StageResult> {
 
     await writeFile(ctx.paths.delivery, md, "utf8");
 
-    const passed =
-      args.verifyPass &&
-      args.unresolvedHighFindings.filter((f) => atLeast(f.severity, "HIGH"))
-        .length === 0;
+    // Journal is human-readable + prompt-ingestible by future runs. A
+    // write failure must not fail the run, so it's its own try/catch.
+    try {
+      const requirement = await readFirstLine(ctx.paths.requirement);
+      await appendJournalEntry(ctx.root, {
+        runId: ctx.runId,
+        mode: ctx.mode,
+        isoDate: new Date(args.endedAt).toISOString(),
+        requirementFirstLine: requirement,
+        branch: worktree?.branch ?? null,
+        verify: passed ? "pass" : "fail",
+        costUsd: run?.total_cost_usd ?? ctx.budget.runTotal(),
+      });
+    } catch (err) {
+      ctx.logger.warn("journal append failed", {
+        err: err instanceof Error ? err.message : String(err),
+      });
+    }
 
     ctx.store.transaction(() => {
       ctx.store.updateRun(ctx.runId, { status: passed ? "completed" : "failed" });
@@ -74,7 +132,7 @@ export async function deliver(args: DeliverArgs): Promise<StageResult> {
         artifact_path: ctx.paths.delivery,
       });
     });
-    return { ok: passed, data: { delivery: ctx.paths.delivery, passed } };
+    return { ok: passed, data: { delivery: ctx.paths.delivery, passed, prUrl } };
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     ctx.store.finishStage(ctx.runId, "deliver", {
@@ -85,9 +143,104 @@ export async function deliver(args: DeliverArgs): Promise<StageResult> {
   }
 }
 
+// Scan the event log for the `worktree_created` intake event written
+// in edit-mode runs. Bounded by the number of events in a run (small).
+function findWorktreeInfo(ctx: RunContext): WorktreeInfo | null {
+  if (ctx.mode !== "edit") return null;
+  const events = ctx.store.tailEvents(ctx.runId, 0, 1000);
+  for (const e of events) {
+    if (e.kind === "worktree_created") {
+      try {
+        const p = JSON.parse(e.payload_json) as {
+          branch?: unknown;
+          baseBranch?: unknown;
+          pr?: unknown;
+        };
+        if (typeof p.branch === "string") {
+          return {
+            branch: p.branch,
+            baseBranch: typeof p.baseBranch === "string" ? p.baseBranch : null,
+            pr: Boolean(p.pr),
+          };
+        }
+      } catch {
+        // ignore
+      }
+    }
+  }
+  return null;
+}
+
+async function readFirstLine(path: string): Promise<string> {
+  try {
+    const body = await readFile(path, "utf8");
+    const first = body.split("\n").find((l) => l.trim().length > 0) ?? "";
+    return first.slice(0, 200).trim();
+  } catch {
+    return "";
+  }
+}
+
+async function tryOpenPullRequest(args: {
+  ctx: RunContext;
+  branch: string;
+  baseBranch: string | null;
+}): Promise<string | null> {
+  const { ctx, branch, baseBranch } = args;
+  try {
+    await execFileP("gh", ["--version"]);
+  } catch {
+    ctx.store.appendEvent(ctx.runId, "deliver", "pr_skipped", {
+      reason: "gh not on PATH",
+    });
+    return null;
+  }
+  try {
+    await execFileP("git", ["remote", "get-url", "origin"], {
+      cwd: ctx.paths.workdir,
+    });
+  } catch {
+    ctx.store.appendEvent(ctx.runId, "deliver", "pr_skipped", {
+      reason: "no origin remote",
+    });
+    return null;
+  }
+  try {
+    await execFileP("git", ["push", "-u", "origin", branch], {
+      cwd: ctx.paths.workdir,
+    });
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    ctx.store.appendEvent(ctx.runId, "deliver", "pr_push_failed", {
+      branch,
+      error: msg,
+    });
+    return null;
+  }
+  try {
+    const title = `df: run ${ctx.runId}`;
+    const prArgs = ["pr", "create", "--title", title, "--body-file", ctx.paths.delivery];
+    if (baseBranch) prArgs.push("--base", baseBranch);
+    prArgs.push("--head", branch);
+    const { stdout } = await execFileP("gh", prArgs, {
+      cwd: ctx.paths.workdir,
+    });
+    const url = stdout.trim().split("\n").pop() ?? "";
+    ctx.store.appendEvent(ctx.runId, "deliver", "pr_opened", { url, branch });
+    return url || null;
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    ctx.store.appendEvent(ctx.runId, "deliver", "pr_create_failed", {
+      error: msg,
+    });
+    return null;
+  }
+}
+
 function renderDelivery(d: {
   runId: string;
   kind: string | null;
+  mode: RunMode;
   totalCostUsd: number;
   totalUsage: TokenUsage;
   durationMs: number;
@@ -96,6 +249,9 @@ function renderDelivery(d: {
   verifyPass: boolean;
   verifyReportPath: string | null;
   workdir: string;
+  worktree: WorktreeInfo | null;
+  diffStat: string;
+  prUrl: string | null;
   stages: {
     name: string;
     status: string;
@@ -133,10 +289,22 @@ function renderDelivery(d: {
     d.totalUsage.cache_read +
     d.totalUsage.output;
 
-  return [
+  const changesSection =
+    d.mode === "edit" && d.worktree
+      ? renderChangesSection({
+          worktree: d.worktree,
+          workdir: d.workdir,
+          runId: d.runId,
+          diffStat: d.diffStat,
+          prUrl: d.prUrl,
+        })
+      : "";
+
+  const sections: string[] = [
     `# Delivery — ${d.runId}`,
     ``,
     `- **Kind**: ${d.kind ?? "unknown"}`,
+    `- **Mode**: ${d.mode}`,
     `- **Status**: ${d.verifyPass && d.unresolvedHighFindings.length === 0 ? "✅ shipped" : "⚠️  delivered with open issues"}`,
     `- **Total cost**: $${d.totalCostUsd.toFixed(4)}`,
     `- **Total tokens**: ${totalTokens.toLocaleString()} (input ${d.totalUsage.input.toLocaleString()}, cache-creation ${d.totalUsage.cache_creation.toLocaleString()}, cache-read ${d.totalUsage.cache_read.toLocaleString()}, output ${d.totalUsage.output.toLocaleString()})`,
@@ -145,6 +313,13 @@ function renderDelivery(d: {
     `- **Verify result**: ${d.verifyPass ? "PASS" : "FAIL"}${d.verifyReportPath ? ` — see ${d.verifyReportPath}` : ""}`,
     `- **Workdir**: ${d.workdir}`,
     ``,
+  ];
+
+  if (changesSection) {
+    sections.push(changesSection, ``);
+  }
+
+  sections.push(
     `## Unresolved HIGH/CRITICAL findings`,
     ``,
     findingsBlock,
@@ -155,7 +330,54 @@ function renderDelivery(d: {
     `|-------|--------|------|----|--------------|------------|-----|----------|`,
     stageTable,
     ``,
-  ].join("\n");
+  );
+
+  return sections.join("\n");
+}
+
+function renderChangesSection(args: {
+  worktree: WorktreeInfo;
+  workdir: string;
+  runId: string;
+  diffStat: string;
+  prUrl: string | null;
+}): string {
+  const { worktree, workdir, runId, diffStat, prUrl } = args;
+  const base = worktree.baseBranch ?? "HEAD";
+  const review = `git diff ${base}..${worktree.branch}`;
+  const merge = `git merge ${worktree.branch}`;
+  const cleanup = `git worktree remove ${workdir} && git branch -D ${worktree.branch}`;
+  const lines: string[] = [
+    `## Changes`,
+    ``,
+    `- **Branch**: \`${worktree.branch}\` (off \`${base}\`)`,
+    `- **Worktree**: \`${workdir}\``,
+  ];
+  if (prUrl) {
+    lines.push(`- **Pull request**: ${prUrl}`);
+  }
+  lines.push(``);
+  lines.push(`### Diff summary`, ``, "```", diffStat || "(no diff)", "```", ``);
+  lines.push(
+    `### Review`,
+    "```sh",
+    review,
+    "```",
+    ``,
+    `### Merge`,
+    "```sh",
+    merge,
+    "```",
+    ``,
+    `### Cleanup`,
+    "```sh",
+    cleanup,
+    "```",
+  );
+  // runId is surfaced in the heading already; keep this function
+  // self-contained so it can grow without re-threading ctx.
+  void runId;
+  return lines.join("\n");
 }
 
 function fmtCompact(n: number): string {

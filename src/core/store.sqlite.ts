@@ -5,6 +5,7 @@ import type {
   Clarifications,
   EventRow,
   FindingRow,
+  RunMode,
   RunRow,
   RunStatus,
   StageName,
@@ -21,6 +22,7 @@ CREATE TABLE IF NOT EXISTS runs (
   id TEXT PRIMARY KEY,
   status TEXT NOT NULL,
   kind TEXT,
+  mode TEXT NOT NULL DEFAULT 'new',
   created_at INTEGER NOT NULL,
   requirement_path TEXT NOT NULL,
   spec_path TEXT,
@@ -104,29 +106,28 @@ export class SqliteStateStore implements StateStore {
 
   init(): void {
     this.db.exec(SCHEMA);
-    this.migrateTokenColumns();
+    this.migrateColumns();
   }
 
-  // Idempotent backfill for databases created before token columns existed.
-  // `ADD COLUMN ... DEFAULT 0` on an existing table is non-destructive; the
-  // duplicate-column error is the signal that the migration already ran.
-  private migrateTokenColumns(): void {
-    const tokenCols: Array<[table: string, column: string]> = [
-      ["runs", "total_input_tokens"],
-      ["runs", "total_cache_creation_tokens"],
-      ["runs", "total_cache_read_tokens"],
-      ["runs", "total_output_tokens"],
-      ["stages", "input_tokens"],
-      ["stages", "cache_creation_tokens"],
-      ["stages", "cache_read_tokens"],
-      ["stages", "output_tokens"],
+  // Idempotent ADD COLUMN backfills for databases that predate later
+  // columns. `ADD COLUMN ... DEFAULT <x>` is non-destructive; the
+  // duplicate-column error signals the migration already ran.
+  private migrateColumns(): void {
+    const cols: Array<[table: string, column: string, spec: string]> = [
+      ["runs", "total_input_tokens", "INTEGER NOT NULL DEFAULT 0"],
+      ["runs", "total_cache_creation_tokens", "INTEGER NOT NULL DEFAULT 0"],
+      ["runs", "total_cache_read_tokens", "INTEGER NOT NULL DEFAULT 0"],
+      ["runs", "total_output_tokens", "INTEGER NOT NULL DEFAULT 0"],
+      ["runs", "mode", "TEXT NOT NULL DEFAULT 'new'"],
+      ["stages", "input_tokens", "INTEGER NOT NULL DEFAULT 0"],
+      ["stages", "cache_creation_tokens", "INTEGER NOT NULL DEFAULT 0"],
+      ["stages", "cache_read_tokens", "INTEGER NOT NULL DEFAULT 0"],
+      ["stages", "output_tokens", "INTEGER NOT NULL DEFAULT 0"],
     ];
-    for (const [table, column] of tokenCols) {
+    for (const [table, column, spec] of cols) {
       try {
         this.db
-          .prepare(
-            `ALTER TABLE ${table} ADD COLUMN ${column} INTEGER NOT NULL DEFAULT 0`,
-          )
+          .prepare(`ALTER TABLE ${table} ADD COLUMN ${column} ${spec}`)
           .run();
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
@@ -150,16 +151,18 @@ export class SqliteStateStore implements StateStore {
     created_at: number;
     requirement_path: string;
     spec_path?: string | null;
+    mode?: RunMode;
   }): void {
     this.db
       .prepare(
-        `INSERT INTO runs (id, status, kind, created_at, requirement_path, spec_path, total_cost_usd)
-         VALUES (?, ?, ?, ?, ?, ?, 0)`,
+        `INSERT INTO runs (id, status, kind, mode, created_at, requirement_path, spec_path, total_cost_usd)
+         VALUES (?, ?, ?, ?, ?, ?, ?, 0)`,
       )
       .run(
         row.id,
         row.status,
         row.kind,
+        row.mode ?? "new",
         row.created_at,
         row.requirement_path,
         row.spec_path ?? null,
