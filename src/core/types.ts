@@ -28,6 +28,7 @@ export type StageName =
   | "clarify"
   | "spec"
   | "design"
+  | "spec2tests"
   | "implement"
   | "review"
   | "verify"
@@ -38,6 +39,7 @@ export const STAGE_ORDER: StageName[] = [
   "clarify",
   "spec",
   "design",
+  "spec2tests",
   "implement",
   "review",
   "verify",

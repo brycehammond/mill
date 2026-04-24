@@ -97,10 +97,12 @@ function printHelp() {
       "usage:",
       "  df init [<name>]                  # create .df/ in the current git repo",
       "  df new (<requirement...> | --from <file>) [--mode new|edit|auto]",
-      "         [--pr] [--detach] [--all-defaults]",
+      "         [--plan] [--pr] [--detach] [--all-defaults]",
       "    --mode auto (default) detects edit when the repo has committed",
       "    source; otherwise scaffolds into .df/runs/<id>/workdir/. Edit",
       "    runs create a df/run-<id> branch via git worktree.",
+      "    --plan runs intake→clarify→spec→design then stops. Resume with",
+      "    `df run <id>` to continue into implement/review/verify/deliver.",
       "    --pr pushes the branch and opens a GitHub PR via gh (edit only).",
       "  df run <run-id>                   # resume a run, skipping completed stages",
       "  df status [<run-id>]",
@@ -147,6 +149,7 @@ async function cmdNew(argv: string[]) {
       from: { type: "string" },
       mode: { type: "string", default: "auto" },
       pr: { type: "boolean", default: false },
+      plan: { type: "boolean", default: false },
     },
   });
 
@@ -259,14 +262,31 @@ async function cmdNew(argv: string[]) {
     return;
   }
 
-  console.log("running pipeline inline (spec → design → implement ⇄ review → verify → deliver)");
+  const planMode = Boolean(values.plan);
+  if (planMode) {
+    console.log("running pipeline inline (plan mode: spec → design; will stop)");
+  } else {
+    console.log("running pipeline inline (spec → design → implement ⇄ review → verify → deliver)");
+  }
   installInlineAbortHandler(ctx);
-  const result = await runPipeline({ runId, config, ctx });
+  const result = await runPipeline({
+    runId,
+    config,
+    ctx,
+    ...(planMode ? { stopAfter: "design" as const } : {}),
+  });
   console.log("\n=== pipeline result ===");
   console.log(JSON.stringify(result, null, 2));
   const paths = runPaths(config.root, runId);
-  console.log(`\ndelivery: ${paths.delivery}`);
-  console.log(`workdir:  ${paths.workdir}`);
+  if (planMode) {
+    console.log(`\nspec:         ${paths.spec}`);
+    console.log(`architecture: ${paths.architecture}`);
+    console.log(`\nreview those files, then continue with:`);
+    console.log(`  df run ${runId}`);
+  } else {
+    console.log(`\ndelivery: ${paths.delivery}`);
+    console.log(`workdir:  ${paths.workdir}`);
+  }
 }
 
 async function cmdRun(argv: string[]) {

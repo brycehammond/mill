@@ -1,10 +1,16 @@
-import type { Finding, RunContext, StageResult } from "../core/index.js";
-import { BudgetExceededError, KilledError, killedSentinelExists } from "../core/index.js";
+import type { Finding, RunContext, StageName, StageResult } from "../core/index.js";
+import {
+  BudgetExceededError,
+  KilledError,
+  killedSentinelExists,
+  readProfile,
+} from "../core/index.js";
 import { buildContext } from "./context.js";
 import { loadConfig, type DfConfig } from "./config.js";
 import { clarify } from "./stages/clarify.js";
 import { spec } from "./stages/spec.js";
 import { design } from "./stages/design.js";
+import { spec2tests } from "./stages/spec2tests.js";
 import { implement } from "./stages/implement.js";
 import { review, shouldStopReviewLoop } from "./stages/review.js";
 import { verify } from "./stages/verify.js";
@@ -14,11 +20,16 @@ export interface RunPipelineArgs {
   runId: string;
   config?: DfConfig;
   ctx?: RunContext;
+  // If set, return after the named stage completes successfully.
+  // Used by `df new --plan` to stop after design so the user can
+  // review spec+design before paying for implement. Resume via
+  // `df run <id>` (no stopAfter) finishes the pipeline.
+  stopAfter?: StageName;
 }
 
 export interface PipelineResult {
   runId: string;
-  status: "completed" | "failed" | "killed";
+  status: "completed" | "failed" | "killed" | "planned";
   reason?: string;
   costUsd: number;
   durationMs: number;
@@ -35,11 +46,30 @@ export async function runPipeline(args: RunPipelineArgs): Promise<PipelineResult
 
   ctx.logger.info("pipeline start", { stages: "spec→design→implement⇄review→verify→deliver" });
 
+  const stopAfter = args.stopAfter;
+  const plannedStop = (stage: StageName): PipelineResult | null => {
+    if (stopAfter !== stage) return null;
+    const costUsd = ctx.budget.runTotal();
+    const durationMs = Date.now() - startedAt;
+    ctx.logger.info("pipeline stopped after stage (plan mode)", { stage });
+    return {
+      runId: ctx.runId,
+      status: "planned",
+      reason: `stopped after ${stage} (plan mode — resume with \`df run ${ctx.runId}\`)`,
+      costUsd,
+      durationMs,
+    };
+  };
+
   try {
     // 1. spec
     if (needsStage(ctx, "spec")) {
       const r = await spec(ctx);
       throwIfKilledOrBroken(ctx, r, "spec");
+    }
+    {
+      const planned = plannedStop("spec");
+      if (planned) return planned;
     }
 
     // 2. design
@@ -50,8 +80,29 @@ export async function runPipeline(args: RunPipelineArgs): Promise<PipelineResult
       const r = await design(ctx);
       throwIfKilledOrBroken(ctx, r, "design");
     }
+    {
+      const planned = plannedStop("design");
+      if (planned) return planned;
+    }
 
-    // 3. implement ⇄ review loop
+    // 3. spec2tests (optional; gated on profile + DF_SPEC2TESTS)
+    if (needsStage(ctx, "spec2tests")) {
+      if (await shouldRunSpec2Tests(ctx)) {
+        const r = await spec2tests(ctx);
+        throwIfKilledOrBroken(ctx, r, "spec2tests");
+      } else {
+        ctx.store.finishStage(ctx.runId, "spec2tests", {
+          status: "skipped",
+          artifact_path: null,
+        });
+      }
+    }
+    {
+      const planned = plannedStop("spec2tests");
+      if (planned) return planned;
+    }
+
+    // 4. implement ⇄ review loop
     let iteration = 0;
     let previousHigh: Finding[] = [];
     let currentHigh: Finding[] = [];
@@ -178,7 +229,29 @@ function throwIfKilledOrBroken(
 
 function needsStage(ctx: RunContext, name: Parameters<typeof ctx.store.getStage>[1]): boolean {
   const row = ctx.store.getStage(ctx.runId, name);
-  return !row || row.status !== "completed";
+  // `skipped` counts as terminal — no rerun on resume. Only `completed`
+  // and `skipped` short-circuit.
+  if (!row) return true;
+  return row.status !== "completed" && row.status !== "skipped";
+}
+
+// Gate spec2tests: requires a profile with a test command, and
+// DF_SPEC2TESTS not set to "off". Default is auto (enable when
+// available). Explicit "on" forces an error if unavailable.
+async function shouldRunSpec2Tests(ctx: RunContext): Promise<boolean> {
+  const mode = (process.env.DF_SPEC2TESTS ?? "auto").trim().toLowerCase();
+  if (mode === "off" || mode === "false" || mode === "0") return false;
+  const profile = await readProfile(ctx.root);
+  const hasTestCmd = Boolean(profile?.commands.test);
+  if (!hasTestCmd) {
+    if (mode === "on" || mode === "true" || mode === "1") {
+      throw new Error(
+        "DF_SPEC2TESTS=on but no profile test command — run `df onboard` first",
+      );
+    }
+    return false;
+  }
+  return true;
 }
 
 // Re-run entrypoint for the clarify stage: exposed separately so the CLI
