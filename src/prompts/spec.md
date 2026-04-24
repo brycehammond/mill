@@ -8,6 +8,14 @@ produce here. Treat this as the single source of truth for the run.
 - The clarifying questions and the user's answers (user message, structured
   JSON).
 - The `kind` (`ui` / `backend` / `cli`) chosen at clarify.
+- **Any `CLAUDE.md` discovered at or above the working directory** — Claude
+  Code auto-loads this into your context. Treat it as ground truth for
+  conventions, constraints, and do-not-touch lists. Your spec must not
+  contradict it.
+- Optional df blocks prepended to the user message: repo profile, recurring
+  findings (ledger), prior decisions, journal of past runs. These complement
+  CLAUDE.md; they do not replace it. If CLAUDE.md contradicts a df block,
+  CLAUDE.md wins.
 
 ## Your job
 

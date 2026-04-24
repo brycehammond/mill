@@ -4,6 +4,9 @@
 // node_modules/@anthropic-ai/claude-agent-sdk/sdk.mjs during development).
 
 import { spawn } from "node:child_process";
+import { existsSync } from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
 import type {
   PermissionMode,
   RunContext,
@@ -11,6 +14,24 @@ import type {
   TokenUsage,
 } from "../core/index.js";
 import { KilledError, killedSentinelExists, ZERO_USAGE } from "../core/index.js";
+
+// Resolve the path to a JSON file containing user-level MCP servers.
+// `--mcp-config <path>` loads only the `mcpServers` key from the file —
+// hooks in the same file are ignored. That's how we get access to user
+// MCPs (Stitch, Playwright, etc.) without triggering user-level hooks.
+// Override with DF_USER_MCP_CONFIG to point at a custom file.
+function resolveUserMcpConfigPath(): string | null {
+  const override = process.env.DF_USER_MCP_CONFIG?.trim();
+  if (override) return existsSync(override) ? override : null;
+  const candidates = [
+    join(homedir(), ".claude", "settings.json"),
+    join(homedir(), ".claude.json"),
+  ];
+  for (const p of candidates) {
+    if (existsSync(p)) return p;
+  }
+  return null;
+}
 
 export interface McpServerConfig {
   type?: "stdio" | "sse" | "http";
@@ -26,11 +47,24 @@ export interface RunClaudeArgs {
   prompt: string;
   appendSystemPrompt?: string;
   systemPrompt?: string;
+  // How `systemPrompt` is delivered. "append" (default) adds to Claude
+  // Code's default system prompt — safest for stages that rely on the
+  // default tool-use guidance (implement, verify). "replace" uses the
+  // stage prompt verbatim — correct for critics and other narrowly
+  // scoped stages where the default coder framing would leak in.
+  systemPromptMode?: "append" | "replace";
   cwd?: string;
   permissionMode?: PermissionMode;
   allowedTools?: string[];
   disallowedTools?: string[];
   mcpServers?: Record<string, McpServerConfig>;
+  // When true, also load MCP servers from the user's global Claude Code
+  // config (~/.claude/settings.json) via --mcp-config. This is the
+  // MCPs-without-hooks path — unlike settingSources: ["user"], it does
+  // NOT pull in user-level hooks (Stop, PostToolUse, etc.). Use this
+  // for stages that need MCPs like Stitch or Playwright but shouldn't
+  // trigger the user's Slack/webhook integrations.
+  inheritUserMcps?: boolean;
   settingSources?: Array<"user" | "project" | "local">;
   addDir?: string[];
   // Paths outside the workdir where the stage is allowed to Write/Edit.
@@ -78,11 +112,13 @@ export async function runClaude(args: RunClaudeArgs): Promise<RunClaudeResult> {
     prompt,
     appendSystemPrompt,
     systemPrompt,
+    systemPromptMode = "append",
     cwd,
     permissionMode,
     allowedTools,
     disallowedTools,
     mcpServers,
+    inheritUserMcps,
     settingSources,
     addDir = [],
     extraWriteDirs = [],
@@ -121,17 +157,44 @@ export async function runClaude(args: RunClaudeArgs): Promise<RunClaudeResult> {
   if (permissionMode) argv.push("--permission-mode", permissionMode);
   if (allowedTools && allowedTools.length > 0) argv.push("--allowedTools", allowedTools.join(","));
   if (disallowedTools && disallowedTools.length > 0) argv.push("--disallowedTools", disallowedTools.join(","));
-  if (mcpServers && Object.keys(mcpServers).length > 0) argv.push("--mcp-config", JSON.stringify({ mcpServers }));
+  // MCP wiring. Two sources can contribute:
+  //   - inline `mcpServers` arg (stage-specific injection)
+  //   - `inheritUserMcps` flag, which loads `~/.claude/settings.json` as
+  //     a second --mcp-config. Only the `mcpServers` field is consumed;
+  //     hooks in that file do NOT fire. That's the point — this is the
+  //     "MCPs without user hooks" path.
+  // If either is present, `--strict-mcp-config` makes claude ignore every
+  // other MCP source so we can't accidentally pull in user hooks via
+  // settings MCPs or similar.
+  const mcpConfigs: string[] = [];
+  if (mcpServers && Object.keys(mcpServers).length > 0) {
+    mcpConfigs.push(JSON.stringify({ mcpServers }));
+  }
+  if (inheritUserMcps) {
+    const userMcpPath = resolveUserMcpConfigPath();
+    if (userMcpPath) mcpConfigs.push(userMcpPath);
+  }
+  if (mcpConfigs.length > 0) {
+    argv.push("--mcp-config", ...mcpConfigs);
+    argv.push("--strict-mcp-config");
+  }
   if (settingSources && settingSources.length > 0) argv.push("--setting-sources", settingSources.join(","));
   if (jsonSchema) argv.push("--json-schema", JSON.stringify(jsonSchema));
+  // `appendSystemPrompt` always appends (legacy contract). `systemPrompt`
+  // now respects `systemPromptMode`: "append" (default) tacks onto
+  // Claude Code's default prompt; "replace" supplies the only system
+  // prompt the model sees. Critics want "replace"; everything else
+  // wants "append" so the default tool-use guidance is preserved.
   if (appendSystemPrompt) argv.push("--append-system-prompt", appendSystemPrompt);
-  else if (systemPrompt) argv.push("--append-system-prompt", systemPrompt);
+  else if (systemPrompt) {
+    const flag = systemPromptMode === "replace" ? "--system-prompt" : "--append-system-prompt";
+    argv.push(flag, systemPrompt);
+  }
   for (const dir of addDir) argv.push("--add-dir", dir);
 
   const env = {
     ...process.env,
     ...extraEnv,
-    CLAUDE_CODE_ENTRYPOINT: "df-harness",
     DF_RUN_ID: ctx.runId,
     DF_RUN_KILLED: ctx.paths.killed,
     DF_WORKDIR: ctx.paths.workdir,

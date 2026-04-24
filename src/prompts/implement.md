@@ -9,6 +9,10 @@ to git, and stop when you're done.
 - A **prior findings** section, only present on iterations ≥ 2. It lists
   unresolved HIGH/CRITICAL findings from the previous review pass. Fix
   those first.
+- **`CLAUDE.md`** auto-loaded by Claude Code from your cwd upward. Its
+  conventions (build commands, do-not-touch paths, code style) govern.
+  When in conflict with the spec, note the tension but err toward CLAUDE.md
+  for repo-wide rules and the spec for this task's scope.
 
 ## Operating rules
 

@@ -21,6 +21,10 @@ parallel approaches.
 - Original requirement (user message).
 - Clarifying questions and answers (JSON in user message).
 - The `kind` (`ui` / `backend` / `cli`) chosen at clarify.
+- **Any `CLAUDE.md` discovered at or above the workdir** — Claude Code
+  auto-loads these into your context. Treat them as ground truth for
+  conventions and constraints; your spec must not contradict them. If
+  any df block below disagrees with CLAUDE.md, CLAUDE.md wins.
 - Tail of `.df/journal.md` from prior df runs (may be empty).
 - The workdir path — the actual codebase.
 

@@ -4,15 +4,25 @@ re-discovery.
 
 ## Your job
 
-1. Inspect the repo using Read/Glob/Grep. Start with `ls` via Bash or
-   a Glob of the root, then read the most revealing files first:
-   `package.json`, `Cargo.toml`, `pyproject.toml`, `go.mod`,
-   `Gemfile`, `composer.json`, `README.md`, a `CLAUDE.md` or
+1. **CLAUDE.md is authoritative.** Claude Code auto-loads any
+   `CLAUDE.md` it finds at or above this working directory — that
+   content is already in your context. If a CLAUDE.md is present,
+   treat it as the ground truth: its build/test/lint commands, its
+   do-not-touch list, and its conventions override anything you'd
+   otherwise infer. Your profile must not contradict CLAUDE.md.
+   Infer only what CLAUDE.md doesn't already specify.
+
+2. Inspect the repo using Read/Glob/Grep to fill in the rest. Read
+   the most revealing files first: `package.json`, `Cargo.toml`,
+   `pyproject.toml`, `go.mod`, `Gemfile`, `composer.json`, `README.md`,
    `CONTRIBUTING.md` if present, the test config, and two or three
    representative source files. You do not need to read everything —
    read enough to answer with confidence.
 
 2. Produce the profile. The pipeline consumes two things:
+
+   If CLAUDE.md is present, step 1. already gave you the answers —
+   this step is just extraction and cross-verification.
 
    **Structured fields** (programmatic; commands run verbatim as a
    shell command):

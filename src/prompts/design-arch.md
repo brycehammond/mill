@@ -4,6 +4,11 @@ You are the **design** stage for a backend/CLI build. You are not coding yet.
 
 - `spec.md` (user message).
 - `kind` is `backend` or `cli`.
+- **Any `CLAUDE.md`** Claude Code auto-loaded from at-or-above the workdir.
+  If present, its architectural conventions (file layout, module boundaries,
+  dependency choices) are ground truth. Your design must respect them.
+- Optional df blocks (profile, ledger, decisions, journal) prepended to the
+  message. These complement CLAUDE.md; if they disagree, CLAUDE.md wins.
 
 ## Your job
 

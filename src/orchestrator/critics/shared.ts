@@ -68,6 +68,12 @@ export async function runCritic(args: RunCriticArgs): Promise<CriticResult> {
     stage: "review",
     prompt,
     systemPrompt,
+    // Critics fully own the system prompt — using "replace" drops
+    // Claude Code's default coder framing (which nudges toward writing
+    // tests, tracking todos, fixing code) so the critic stays on its
+    // narrow job of judging what's there. Tool use still works because
+    // tool-use formatting is model-intrinsic, not prompt-derived.
+    systemPromptMode: "replace",
     cwd: ctx.paths.workdir,
     permissionMode: "bypassPermissions",
     settingSources: ["project"],

@@ -100,12 +100,16 @@ function printHelp() {
       "usage:",
       "  df init [<name>]                  # create .df/ in the current git repo",
       "  df new (<requirement...> | --from <file>) [--mode new|edit|auto]",
-      "         [--plan] [--pr] [--detach] [--all-defaults]",
+      "         [--stop-after spec|design|spec2tests] [--plan] [--pr]",
+      "         [--detach] [--all-defaults]",
       "    --mode auto (default) detects edit when the repo has committed",
       "    source; otherwise scaffolds into .df/runs/<id>/workdir/. Edit",
       "    runs create a df/run-<id> branch via git worktree.",
-      "    --plan runs intake→clarify→spec→design then stops. Resume with",
-      "    `df run <id>` to continue into implement/review/verify/deliver.",
+      "    --stop-after halts the pipeline after the named stage so you can",
+      "    review before paying for the rest. Resume with `df run <id>`.",
+      "    (This is df's concept of 'plan'; unrelated to Claude Code's",
+      "    permissionMode: plan.) --plan is a legacy alias for",
+      "    --stop-after design.",
       "    --pr pushes the branch and opens a GitHub PR via gh (edit only).",
       "  df run <run-id>                   # resume a run, skipping completed stages",
       "  df status [<run-id>]",
@@ -157,6 +161,7 @@ async function cmdNew(argv: string[]) {
       mode: { type: "string", default: "auto" },
       pr: { type: "boolean", default: false },
       plan: { type: "boolean", default: false },
+      "stop-after": { type: "string" },
     },
   });
 
@@ -269,9 +274,21 @@ async function cmdNew(argv: string[]) {
     return;
   }
 
-  const planMode = Boolean(values.plan);
-  if (planMode) {
-    console.log("running pipeline inline (plan mode: spec → design; will stop)");
+  // --stop-after <stage> halts the pipeline after a named stage so the
+  // user can review before paying for the rest. --plan is the legacy
+  // alias for --stop-after design; retained so older scripts work.
+  // Note: this is unrelated to Claude Code's `permissionMode: plan`
+  // (in-process planning); different concept, same word.
+  const stopAfter = resolveStopAfter({
+    plan: Boolean(values.plan),
+    stopAfter: values["stop-after"],
+  });
+  if (stopAfter === "error") {
+    process.exitCode = 2;
+    return;
+  }
+  if (stopAfter) {
+    console.log(`running pipeline inline (will stop after ${stopAfter})`);
   } else {
     console.log("running pipeline inline (spec → design → implement ⇄ review → verify → deliver)");
   }
@@ -280,20 +297,52 @@ async function cmdNew(argv: string[]) {
     runId,
     config,
     ctx,
-    ...(planMode ? { stopAfter: "design" as const } : {}),
+    ...(stopAfter ? { stopAfter } : {}),
   });
   console.log("\n=== pipeline result ===");
   console.log(JSON.stringify(result, null, 2));
   const paths = runPaths(config.root, runId);
-  if (planMode) {
-    console.log(`\nspec:         ${paths.spec}`);
-    console.log(`architecture: ${paths.architecture}`);
+  if (stopAfter) {
+    if (stopAfter === "spec") {
+      console.log(`\nspec: ${paths.spec}`);
+    } else if (stopAfter === "design" || stopAfter === "spec2tests") {
+      console.log(`\nspec:         ${paths.spec}`);
+      console.log(`architecture: ${paths.architecture}`);
+    }
     console.log(`\nreview those files, then continue with:`);
     console.log(`  df run ${runId}`);
   } else {
     console.log(`\ndelivery: ${paths.delivery}`);
     console.log(`workdir:  ${paths.workdir}`);
   }
+}
+
+type StopStage = "spec" | "design" | "spec2tests";
+const STOP_STAGES: StopStage[] = ["spec", "design", "spec2tests"];
+
+function resolveStopAfter(args: {
+  plan: boolean;
+  stopAfter: string | undefined;
+}): StopStage | undefined | "error" {
+  const raw = args.stopAfter?.trim();
+  const hasFlag = raw !== undefined && raw !== "";
+  if (args.plan && hasFlag && raw !== "design") {
+    console.error(
+      `df new: --plan is an alias for --stop-after design; got --stop-after ${raw}`,
+    );
+    return "error";
+  }
+  if (hasFlag) {
+    if (!STOP_STAGES.includes(raw as StopStage)) {
+      console.error(
+        `df new: --stop-after must be one of ${STOP_STAGES.join("|")}, got "${raw}"`,
+      );
+      return "error";
+    }
+    return raw as StopStage;
+  }
+  if (args.plan) return "design";
+  return undefined;
 }
 
 async function cmdRun(argv: string[]) {

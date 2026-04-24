@@ -32,7 +32,8 @@ export type StageName =
   | "implement"
   | "review"
   | "verify"
-  | "deliver";
+  | "deliver"
+  | "decisions";
 
 export const STAGE_ORDER: StageName[] = [
   "intake",
@@ -44,6 +45,7 @@ export const STAGE_ORDER: StageName[] = [
   "review",
   "verify",
   "deliver",
+  "decisions",
 ];
 
 export type RunStatus =

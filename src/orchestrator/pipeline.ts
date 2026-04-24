@@ -15,6 +15,7 @@ import { implement } from "./stages/implement.js";
 import { review, shouldStopReviewLoop } from "./stages/review.js";
 import { verify } from "./stages/verify.js";
 import { deliver } from "./stages/deliver.js";
+import { decisions } from "./stages/decisions.js";
 
 export interface RunPipelineArgs {
   runId: string;
@@ -157,6 +158,13 @@ export async function runPipeline(args: RunPipelineArgs): Promise<PipelineResult
       endedAt: Date.now(),
       startedAt,
     });
+
+    // 6. decisions — best-effort ADR extraction. The `decisions` stage
+    // catches its own errors and never fails the run; a stage row is
+    // still written so crash recovery doesn't rerun it.
+    if (needsStage(ctx, "decisions")) {
+      await decisions({ ctx });
+    }
 
     const finalRun = ctx.store.getRun(ctx.runId);
     const costUsd = finalRun?.total_cost_usd ?? ctx.budget.runTotal();

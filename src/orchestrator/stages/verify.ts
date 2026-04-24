@@ -55,7 +55,10 @@ export async function verify(ctx: RunContext): Promise<StageResult> {
       addDir: [ctx.paths.verifyDir],
       extraWriteDirs: [ctx.paths.verifyDir],
       allowedTools: ["Read", "Write", "Glob", "Grep", "Bash"],
-      settingSources: ctx.kind === "ui" ? ["user", "project"] : ["project"],
+      settingSources: ["project"],
+      // UI verify needs Playwright etc. from the user's MCP config;
+      // pull MCPs without user hooks via inheritUserMcps.
+      inheritUserMcps: ctx.kind === "ui",
       jsonSchema: VerifyJsonSchema,
       maxTurns: 40,
     });

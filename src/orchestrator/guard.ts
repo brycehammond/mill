@@ -104,17 +104,10 @@ async function main(): Promise<void> {
     }
   }
 
-  if (toolName === "Bash") {
-    const cmd = asString(toolInput.command) ?? "";
-    if (/\brm\s+-rf?\s+\/(?:\s|$)/.test(cmd)) {
-      reply({ decision: "block", reason: "blocked: rm -rf /" });
-      return;
-    }
-    if (/\bsudo\b/.test(cmd)) {
-      reply({ decision: "block", reason: "blocked: sudo" });
-      return;
-    }
-  }
+  // Bash patterns (sudo, rm -rf /, fork bomb) are enforced via
+  // settings.json `permissions.deny` — see run-settings.ts. The guard
+  // focuses on state that can't be expressed as a static permission:
+  // the KILLED sentinel and the dynamic write-dir allow-list.
 
   reply({});
 }

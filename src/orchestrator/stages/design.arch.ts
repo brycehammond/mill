@@ -1,6 +1,7 @@
 import { readFile, writeFile } from "node:fs/promises";
 import type { RunContext, StageResult } from "../../core/index.js";
 import {
+  readDecisionsTail,
   readJournalTail,
   readProfileSummary,
   renderLedgerHint,
@@ -15,6 +16,7 @@ export async function designArchitecture(
   const systemPrompt = await loadPrompt(promptName);
   const specBody = await readFile(ctx.paths.spec, "utf8");
   const journal = await readJournalTail(ctx.root, 20);
+  const decisionsBlock = await readDecisionsTail(ctx.root, 10);
   const profile = await readProfileSummary(ctx.root);
   const profileBlock = profile ? `## Repo profile\n\n${profile}\n` : "";
   const ledgerBlock =
@@ -30,7 +32,15 @@ export async function designArchitecture(
         ].join("\n")
       : "";
 
-  const prompt = [profileBlock, ledgerBlock, journal, workdirBlock, `## Spec`, specBody]
+  const prompt = [
+    profileBlock,
+    ledgerBlock,
+    decisionsBlock,
+    journal,
+    workdirBlock,
+    `## Spec`,
+    specBody,
+  ]
     .filter((s) => s !== "")
     .join("\n");
 
