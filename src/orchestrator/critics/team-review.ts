@@ -1,13 +1,27 @@
-// Team-mode review: one `claude` subprocess plays the role of "review lead"
-// and spawns the three LLM critics (security/correctness/ux) as teammates via
-// TeamCreate + Agent(team_name=...). Critics can cross-reference each other's
-// findings mid-work via SendMessage — the subprocess-per-critic path can't do
-// that. The tests + adversarial critics stay on the subprocess path and are
-// merged in by review.ts after this call returns.
+// Team-mode review: one `claude` subprocess ("review lead") spawns the three
+// LLM critics (security/correctness/ux) as *parallel subagents* via the
+// Agent tool in a single session. The critics are regular subagents, not
+// team members — no TeamCreate, no SendMessage, no team_name. Each Agent
+// call is synchronous from the lead: the subagent runs to completion, the
+// Agent tool returns the subagent's final text (a fenced JSON findings
+// block), and the lead parses those returns before emitting aggregated
+// structured output.
 //
-// On failure (tools unavailable, parse error, subprocess hang, etc.) the
-// caller decides whether to hard-fail (MILL_AGENT_TEAMS=on) or fall back to
-// the subprocess-per-critic path (MILL_AGENT_TEAMS=auto).
+// Why not use actual Claude Code agent teams? Teams route teammate replies
+// as new conversation turns on the lead. Combined with --json-schema, the
+// lead is forced to satisfy the output schema at the end of every turn —
+// including its first turn, which ends right after spawning the team,
+// before any teammate has had a chance to reply. That produces premature
+// finalization with empty ERROR stubs. Parallel Agent calls sidestep this:
+// one turn, all critics run, lead emits aggregated output once.
+//
+// tests + adversarial critics stay on the subprocess-per-critic path (tests
+// is mechanical, adversarial is codex-backed) and are merged in by review.ts
+// after this call returns.
+//
+// On failure (parse error, subprocess hang, etc.) the caller decides whether
+// to hard-fail (MILL_AGENT_TEAMS=on) or fall back to the subprocess-per-
+// critic path (MILL_AGENT_TEAMS=auto).
 
 import { mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
@@ -52,28 +66,13 @@ const TEAM_CRITICS: readonly TeamCritic[] = ["security", "correctness", "ux"];
 // etc. are omitted deliberately. Bash sub-command restrictions (cat/rg only)
 // are enforced by the per-run settings.json deny list, which applies to all
 // agents in the session regardless of this whitelist.
-const CRITIC_TOOLS = [
-  "Read",
-  "Glob",
-  "Grep",
-  "Bash",
-  "SendMessage",
-  "TaskList",
-  "TaskUpdate",
-];
+const CRITIC_TOOLS = ["Read", "Glob", "Grep", "Bash"];
 
-// Tools the lead needs: spawn team, spawn critics, message them, coordinate
-// via tasks, and Read the spec/design files the harness handed it. No
-// Edit/Write — the lead stays at the orchestration layer.
-const LEAD_TOOLS = [
-  "Agent",
-  "TeamCreate",
-  "SendMessage",
-  "TaskCreate",
-  "TaskList",
-  "TaskUpdate",
-  "Read",
-];
+// Tools the lead needs: Agent to spawn critics in parallel, Read to look at
+// the spec/design files the harness handed it. No Edit/Write — the lead
+// stays at the orchestration layer. Team/SendMessage intentionally omitted
+// (see the file header comment for why).
+const LEAD_TOOLS = ["Agent", "Read"];
 
 const LEAD_DISALLOWED = [
   "Edit",
@@ -174,6 +173,22 @@ export async function runTeamReview(args: TeamReviewArgs): Promise<TeamReviewOut
 
   const parsed = TeamReviewOutputSchema.parse(pickStructured(res));
 
+  // Detect an all-empty/all-error output: every critic returned an empty
+  // findings array AND a summary starting with "ERROR". That signals the
+  // lead failed to parse every critic's reply, i.e. team-mode is broken.
+  // MILL_AGENT_TEAMS=auto falls back to subprocesses, =on throws. Real "no
+  // findings" reviews (clean code) have non-ERROR summaries and don't trip.
+  const allEmpty =
+    parsed.critics.length > 0 &&
+    parsed.critics.every(
+      (c) => c.findings.length === 0 && /^\s*error\b/i.test(c.summary),
+    );
+  if (allEmpty) {
+    throw new Error(
+      "team review produced zero findings from every critic (lead failed to parse critic replies)",
+    );
+  }
+
   // Make sure every expected critic is represented, even if the lead dropped
   // one (the zod schema only constrains types, not completeness). Missing
   // critics become an empty-findings entry flagged as failed.
@@ -256,15 +271,10 @@ function buildLeadPrompt(args: {
   const lead = resumed
     ? `Review iteration ${iteration}. The workdir has been updated since the last pass. Re-run all three critics in full — don't assume prior findings carry forward.`
     : `Review iteration ${iteration}. First pass on this workdir.`;
-  // Give the lead a stable team name rooted in runId+iteration so repeated
-  // iterations don't collide. TeamCreate requires a name and the lead will
-  // pick one if we don't specify, but pinning it makes debugging easier.
-  const teamName = `mill-${ctx.runId.slice(0, 8)}-iter${iteration}`;
   return [
     lead,
     ``,
     `Workdir: ${ctx.paths.workdir}`,
-    `Team name to create: ${teamName}`,
     ``,
     `## spec.md`,
     specBody.trim(),
@@ -272,7 +282,7 @@ function buildLeadPrompt(args: {
     `## design`,
     designBody.trim() || "(no design doc)",
     ``,
-    `Create the team, spawn the three critics in parallel, let them finish, then return the aggregated JSON. Each critic must return its own findings verbatim in your final output.`,
+    `Spawn the three critics in parallel via three Agent tool calls in a single message (subagent_type = "security", "correctness", "ux"). Each critic's final output is a fenced JSON block with {findings, summary}. After all three Agent calls return, parse their outputs and emit the aggregated structured JSON.`,
   ].join("\n");
 }
 

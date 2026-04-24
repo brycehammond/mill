@@ -9,6 +9,7 @@ import {
 } from "../../core/index.js";
 import { loadPrompt } from "../prompts.js";
 import { extractMarkdownBlock, runClaude } from "../claude-cli.js";
+import { runWithRetry } from "../retry.js";
 
 export async function spec(ctx: RunContext): Promise<StageResult> {
   ctx.store.startStage(ctx.runId, "spec");
@@ -64,23 +65,33 @@ export async function spec(ctx: RunContext): Promise<StageResult> {
       .filter((s) => s !== "")
       .join("\n");
 
-    const res = await runClaude({
+    const res = await runWithRetry({
       ctx,
       stage: "spec",
-      prompt: body,
-      systemPrompt,
-      // Edit mode: read codebase with Read/Glob/Grep before specifying.
-      // runClaude defaults cwd to ctx.paths.workdir, which is the git
-      // worktree checkout in edit mode.
-      maxTurns: ctx.mode === "edit" ? 12 : 4,
-      permissionMode: "default",
-      allowedTools: ctx.mode === "edit" ? ["Read", "Glob", "Grep"] : [],
+      label: "output-too-short",
+      attempt: (hint) =>
+        runClaude({
+          ctx,
+          stage: "spec",
+          prompt: hint ? `${body}\n\n## Retry hint\n${hint}` : body,
+          systemPrompt,
+          // Edit mode: read codebase with Read/Glob/Grep before specifying.
+          // runClaude defaults cwd to ctx.paths.workdir, which is the git
+          // worktree checkout in edit mode.
+          maxTurns: ctx.mode === "edit" ? 12 : 4,
+          permissionMode: "default",
+          allowedTools: ctx.mode === "edit" ? ["Read", "Glob", "Grep"] : [],
+        }),
+      validate: (r) => {
+        const md = extractMarkdownBlock(r.text);
+        if (!md || md.length < 50) {
+          return `Your previous response's markdown block was only ${md.length} characters — far too short to be a usable spec. Emit a substantial spec document with sections for goals, non-goals, assumptions, user-facing behavior, acceptance criteria, and open questions. Wrap the whole spec in a single fenced \`\`\`markdown block.`;
+        }
+        return null;
+      },
     });
 
     const md = extractMarkdownBlock(res.text);
-    if (!md || md.length < 50) {
-      throw new Error("spec output too short");
-    }
     await writeFile(ctx.paths.spec, md.trim() + "\n", "utf8");
 
     ctx.store.transaction(() => {

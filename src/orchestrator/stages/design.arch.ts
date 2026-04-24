@@ -8,6 +8,7 @@ import {
 } from "../../core/index.js";
 import { loadPrompt } from "../prompts.js";
 import { extractMarkdownBlock, runClaude } from "../claude-cli.js";
+import { runWithRetry } from "../retry.js";
 
 export async function designArchitecture(
   ctx: RunContext,
@@ -44,20 +45,30 @@ export async function designArchitecture(
     .filter((s) => s !== "")
     .join("\n");
 
-  const res = await runClaude({
+  const res = await runWithRetry({
     ctx,
     stage: "design",
-    prompt,
-    systemPrompt,
-    maxTurns: ctx.mode === "edit" ? 12 : 4,
-    permissionMode: "default",
-    allowedTools: ctx.mode === "edit" ? ["Read", "Glob", "Grep"] : [],
+    label: "output-too-short",
+    attempt: (hint) =>
+      runClaude({
+        ctx,
+        stage: "design",
+        prompt: hint ? `${prompt}\n\n## Retry hint\n${hint}` : prompt,
+        systemPrompt,
+        maxTurns: ctx.mode === "edit" ? 12 : 4,
+        permissionMode: "default",
+        allowedTools: ctx.mode === "edit" ? ["Read", "Glob", "Grep"] : [],
+      }),
+    validate: (r) => {
+      const md = extractMarkdownBlock(r.text);
+      if (!md || md.length < 50) {
+        return `Your previous response's markdown block was only ${md.length} characters — far too short to be a usable architecture doc. Emit a substantial architecture.md with sections for components, data flow, interfaces, and key decisions. Wrap the whole doc in a single fenced \`\`\`markdown block.`;
+      }
+      return null;
+    },
   });
 
   const md = extractMarkdownBlock(res.text);
-  if (!md || md.length < 50) {
-    throw new Error("architecture output too short");
-  }
   await writeFile(ctx.paths.architecture, md.trim() + "\n", "utf8");
 
   return {

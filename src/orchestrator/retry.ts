@@ -1,0 +1,109 @@
+// Stage-level retry-with-hint. Many stages validate the shape of claude's
+// output (length minimums, JSON parseability, markdown fencing) and today
+// they hard-throw on validation failure — halting the pipeline for the
+// user to manually resume. That's too eager. When the failure is
+// recoverable via a clarifying hint ("your output was too short — emit a
+// full document with these sections"), we want one more attempt with the
+// hint before giving up. This helper encapsulates that pattern.
+//
+// Scope and deliberate non-goals:
+// - One retry, not N. More than one means the model isn't understanding
+//   the hint and additional attempts waste budget.
+// - Only for recoverable classes (output-too-short, output-not-parseable).
+//   Kill sentinels, budget exceeded, subprocess crashes are fatal.
+// - Attempts accumulate cost and usage; the returned result reflects the
+//   sum, so existing stage code (addRunCost, addRunUsage) stays correct.
+// - Emits events via `store.appendEvent(..., "remediation", ...)` so
+//   `mill tail` and `mill logs` surface the retry. Not written to
+//   `.mill/journal.md` — that file is one-stanza-per-completed-run and
+//   its tail gets injected into future prompts; we don't want retry
+//   noise there.
+
+import type { RunContext, StageName, TokenUsage } from "../core/index.js";
+import type { RunClaudeResult } from "./claude-cli.js";
+
+export interface RetrySpec {
+  ctx: RunContext;
+  stage: StageName;
+  // Short label for eventing/logging, e.g. "output-too-short".
+  label: string;
+  // Runs the claude call. `hint` is undefined on the first try and a
+  // diagnosis string on the retry attempt — callers should append it to
+  // the user prompt so the model sees the specific guidance.
+  attempt: (hint: string | undefined) => Promise<RunClaudeResult>;
+  // Returns null if the result is acceptable; a hint string if we
+  // should retry with that hint appended.
+  validate: (res: RunClaudeResult) => string | null;
+}
+
+export async function runWithRetry(args: RetrySpec): Promise<RunClaudeResult> {
+  const { ctx, stage, label, attempt, validate } = args;
+  const first = await attempt(undefined);
+  const firstHint = validate(first);
+  if (firstHint === null) return first;
+
+  ctx.logger.warn("stage validation failed — retrying with hint", {
+    runId: ctx.runId,
+    stage,
+    label,
+    hint: firstHint,
+  });
+  try {
+    ctx.store.appendEvent(ctx.runId, stage, "remediation", {
+      attempt: 1,
+      label,
+      status: "retrying",
+      hint: firstHint,
+    });
+  } catch {
+    // Event logging is best-effort — never let it sink the retry.
+  }
+
+  const second = await attempt(firstHint);
+  const secondHint = validate(second);
+
+  // Roll first+second cost and usage into the returned result so the
+  // stage's existing addRunCost/addRunUsage calls capture the total.
+  // Session id, text, structured_output come from the *second* attempt
+  // since that's the one whose output the caller is about to act on.
+  const combined: RunClaudeResult = {
+    ...second,
+    costUsd: first.costUsd + second.costUsd,
+    usage: sumUsage(first.usage, second.usage),
+  };
+
+  if (secondHint === null) {
+    ctx.logger.info("stage retry recovered", { runId: ctx.runId, stage, label });
+    try {
+      ctx.store.appendEvent(ctx.runId, stage, "remediation", {
+        attempt: 2,
+        label,
+        status: "recovered",
+      });
+    } catch {
+      // ignore
+    }
+    return combined;
+  }
+
+  try {
+    ctx.store.appendEvent(ctx.runId, stage, "remediation", {
+      attempt: 2,
+      label,
+      status: "exhausted",
+      hint: secondHint,
+    });
+  } catch {
+    // ignore
+  }
+  throw new Error(`${label}: validation failed after retry (${secondHint})`);
+}
+
+function sumUsage(a: TokenUsage, b: TokenUsage): TokenUsage {
+  return {
+    input: a.input + b.input,
+    cache_creation: a.cache_creation + b.cache_creation,
+    cache_read: a.cache_read + b.cache_read,
+    output: a.output + b.output,
+  };
+}

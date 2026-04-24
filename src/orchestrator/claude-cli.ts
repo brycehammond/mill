@@ -259,6 +259,18 @@ export async function runClaude(args: RunClaudeArgs): Promise<RunClaudeResult> {
   // past async callbacks).
   const resultBox: { value: RunClaudeResult | null } = { value: null };
 
+  // Post-final-result grace timer. Armed only when claude emits a result
+  // that carries `structured_output` (i.e., the schema-validated payload
+  // this call was waiting for). In team mode the lead sometimes lingers
+  // for minutes after that — processing idle/shutdown messages from
+  // torn-down teammates — and the OS process can even outlive
+  // `child.on("close")`, leaving a zombie. Once we see the final payload
+  // we have everything we need; after this grace we force-kill.
+  // Intermediate results (team-mode per-turn, non-schema stages) don't
+  // arm the timer, so long-thinking turns are not at risk of being cut off.
+  const POST_RESULT_GRACE_MS = 20_000;
+  let postResultTimer: NodeJS.Timeout | null = null;
+
   const handleLine = (line: string) => {
     if (!line.trim()) return;
     let msg: Record<string, unknown>;
@@ -308,6 +320,25 @@ export async function runClaude(args: RunClaudeArgs): Promise<RunClaudeResult> {
         numTurns: rm.num_turns ?? 0,
         isError: Boolean(rm.is_error),
       };
+      // Arm the force-kill only once we have the final structured payload
+      // a schema-using caller was waiting on. Intermediate per-turn results
+      // (team mode) or non-schema results don't trip this.
+      const isFinalSchemaResult =
+        Boolean(jsonSchema) &&
+        rm.structured_output !== undefined &&
+        rm.structured_output !== null;
+      if (isFinalSchemaResult && postResultTimer === null) {
+        postResultTimer = setTimeout(() => {
+          if (!child.killed) {
+            ctx.logger.debug(
+              "claude lingered past post-result grace; forcing exit",
+              { stage, runId: ctx.runId, graceMs: POST_RESULT_GRACE_MS },
+            );
+            onAbort();
+          }
+        }, POST_RESULT_GRACE_MS);
+        postResultTimer.unref();
+      }
     }
   };
 
@@ -329,6 +360,7 @@ export async function runClaude(args: RunClaudeArgs): Promise<RunClaudeResult> {
 
   ctx.abortController.signal.removeEventListener("abort", onAbort);
   if (timer) clearTimeout(timer);
+  if (postResultTimer) clearTimeout(postResultTimer);
 
   if (stdoutBuf.trim()) handleLine(stdoutBuf);
 

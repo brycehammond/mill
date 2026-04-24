@@ -229,3 +229,7 @@ See `.env.example`. Relevant knobs:
 | `MILL_TESTS_CRITIC` | auto | `auto` \| `on` \| `off` — mechanical test critic |
 | `MILL_SPEC2TESTS` | auto | `auto` \| `on` \| `off` — generate test scaffolds from spec |
 | `MILL_CODEX_COMPANION` | (auto-discover) | Absolute path to `codex-companion.mjs` |
+
+## License
+
+MIT — see [LICENSE](./LICENSE).
