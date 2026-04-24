@@ -1,6 +1,10 @@
 import { readFile, writeFile } from "node:fs/promises";
 import type { RunContext, StageResult } from "../../core/index.js";
-import { readJournalTail, readProfileSummary } from "../../core/index.js";
+import {
+  readJournalTail,
+  readProfileSummary,
+  renderLedgerHint,
+} from "../../core/index.js";
 import { loadPrompt } from "../prompts.js";
 import { extractMarkdownBlock, runClaude } from "../claude-cli.js";
 
@@ -13,6 +17,8 @@ export async function designArchitecture(
   const journal = await readJournalTail(ctx.root, 20);
   const profile = await readProfileSummary(ctx.root);
   const profileBlock = profile ? `## Repo profile\n\n${profile}\n` : "";
+  const ledgerBlock =
+    ctx.mode === "edit" ? renderLedgerHint(ctx.store, { limit: 5 }) : "";
 
   const workdirBlock =
     ctx.mode === "edit"
@@ -24,7 +30,7 @@ export async function designArchitecture(
         ].join("\n")
       : "";
 
-  const prompt = [profileBlock, journal, workdirBlock, `## Spec`, specBody]
+  const prompt = [profileBlock, ledgerBlock, journal, workdirBlock, `## Spec`, specBody]
     .filter((s) => s !== "")
     .join("\n");
 

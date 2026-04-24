@@ -8,6 +8,7 @@ import type {
 } from "../../core/index.js";
 import {
   atLeast,
+  findingFingerprint,
   readProfile,
   usageStagePatch,
   ZERO_USAGE,
@@ -195,8 +196,8 @@ export function shouldStopReviewLoop(args: {
   if (args.currentHigh.length === 0) {
     return { stop: true, reason: "no HIGH+ findings" };
   }
-  const prevSet = new Set(args.previousHigh.map(fingerprint));
-  const curSet = new Set(args.currentHigh.map(fingerprint));
+  const prevSet = new Set(args.previousHigh.map(findingFingerprint));
+  const curSet = new Set(args.currentHigh.map(findingFingerprint));
   if (prevSet.size > 0) {
     let allSubset = true;
     for (const f of curSet) {
@@ -210,10 +211,6 @@ export function shouldStopReviewLoop(args: {
     }
   }
   return { stop: false, reason: "" };
-}
-
-function fingerprint(f: Finding): string {
-  return `${f.critic}|${f.severity}|${f.title.trim().toLowerCase()}`;
 }
 
 function sumUsage(a: TokenUsage, b: TokenUsage): TokenUsage {

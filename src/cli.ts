@@ -36,6 +36,7 @@ type Cmd =
   | "init"
   | "onboard"
   | "history"
+  | "findings"
   | "help";
 
 async function main() {
@@ -62,6 +63,8 @@ async function main() {
         return await cmdHistory();
       case "onboard":
         return await cmdOnboard(rest);
+      case "findings":
+        return await cmdFindings(rest);
       case "help":
       default:
         printHelp();
@@ -112,6 +115,10 @@ function printHelp() {
       "  df onboard [--refresh]           # profile the repo once; auto-injected",
       "                                    into future spec/design/implement prompts",
       "  df history                        # print .df/journal.md",
+      "  df findings [--all] [--limit N]  # recurring findings across runs",
+      "  df findings suppress <fingerprint> [--note <text>]",
+      "  df findings unsuppress <fingerprint>",
+      "  df findings suppressed           # list suppressed fingerprints",
       "",
     ].join("\n"),
   );
@@ -415,6 +422,90 @@ async function cmdOnboard(argv: string[]) {
   console.log(present("build", cmds.build));
   console.log(present("lint", cmds.lint));
   console.log(present("typecheck", cmds.typecheck));
+}
+
+async function cmdFindings(argv: string[]) {
+  const sub = argv[0];
+  if (sub === "suppress" || sub === "unsuppress") {
+    const fp = argv[1];
+    if (!fp) {
+      console.error(`df findings ${sub}: fingerprint required`);
+      process.exitCode = 2;
+      return;
+    }
+    const { values } = parseArgs({
+      args: argv.slice(2),
+      allowPositionals: false,
+      options: { note: { type: "string" } },
+    });
+    const config = loadConfig();
+    const store = openStore(config.root);
+    if (sub === "suppress") {
+      store.suppressFingerprint(fp, values.note);
+      console.log(`suppressed: ${fp}`);
+    } else {
+      store.unsuppressFingerprint(fp);
+      console.log(`unsuppressed: ${fp}`);
+    }
+    return;
+  }
+  if (sub === "suppressed") {
+    const config = loadConfig();
+    const store = openStore(config.root);
+    const rows = store.listSuppressedFingerprints();
+    if (rows.length === 0) {
+      console.log("(none)");
+      return;
+    }
+    for (const r of rows) {
+      const when = new Date(r.added_at).toISOString();
+      console.log(`${when}  ${r.fingerprint}${r.note ? `  — ${r.note}` : ""}`);
+    }
+    return;
+  }
+
+  const { values } = parseArgs({
+    args: argv,
+    allowPositionals: false,
+    options: {
+      all: { type: "boolean", default: false },
+      limit: { type: "string", default: "50" },
+      "include-suppressed": { type: "boolean", default: false },
+    },
+  });
+  const config = loadConfig();
+  const store = openStore(config.root);
+  // Default view = recurring (seen in ≥2 runs). --all lowers the gate
+  // to ≥1 so the user can see every distinct fingerprint.
+  const minRuns = values.all ? 1 : 2;
+  const limit = Number(values.limit ?? "50");
+  const entries = store.listLedgerEntries({
+    minRuns,
+    includeSuppressed: Boolean(values["include-suppressed"]),
+    limit,
+  });
+  if (entries.length === 0) {
+    console.log(values.all ? "(no findings on record)" : "(no recurring findings — use --all to see singletons)");
+    return;
+  }
+  console.log(
+    `runs  sev       critic         last-seen              title`,
+  );
+  for (const e of entries) {
+    const last = new Date(e.lastSeen).toISOString();
+    const flag = e.suppressed ? " (suppressed)" : "";
+    console.log(
+      [
+        String(e.runCount).padStart(4),
+        e.severity.padEnd(9),
+        e.critic.padEnd(14),
+        last,
+        e.title + flag,
+      ].join("  "),
+    );
+    console.log(`      fp: ${e.fingerprint}`);
+    if (e.exampleDetailPath) console.log(`      ↳ ${e.exampleDetailPath}`);
+  }
 }
 
 async function cmdHistory() {

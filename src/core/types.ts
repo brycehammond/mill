@@ -142,6 +142,21 @@ export interface FindingRow {
   severity: Severity;
   title: string;
   detail_path: string;
+  fingerprint: string;
+}
+
+// Aggregated view across runs. One row per fingerprint.
+export interface LedgerEntry {
+  fingerprint: string;
+  critic: CriticName;
+  severity: Severity;
+  title: string;
+  runCount: number;       // distinct runs that flagged this fingerprint
+  occurrenceCount: number; // total finding rows (includes re-reviews within a run)
+  firstSeen: number;       // ts of earliest run that flagged it
+  lastSeen: number;        // ts of latest run that flagged it
+  suppressed: boolean;
+  exampleDetailPath: string | null; // path to the most-recent detail report
 }
 
 export interface Finding {
@@ -150,6 +165,19 @@ export interface Finding {
   title: string;
   evidence: string;
   suggested_fix: string;
+}
+
+// Canonical fingerprint for a finding. Same format is used by:
+// - the review loop's "stuck" detection (findings from iter N are a
+//   subset of iter N-1's)
+// - the cross-run ledger (recurring issues across runs)
+// - the suppression list (noise / known false positives)
+// Must remain stable: older rows in the `findings` table are
+// fingerprinted with this exact function via migration.
+export function findingFingerprint(
+  f: Pick<Finding, "critic" | "severity" | "title">,
+): string {
+  return `${f.critic}|${f.severity}|${f.title.trim().toLowerCase()}`;
 }
 
 export interface ClarificationQuestion {
@@ -259,8 +287,19 @@ export interface StateStore {
   appendEvent(runId: string, stage: StageName, kind: string, payload: unknown): void;
   tailEvents(runId: string, afterId?: number, limit?: number): EventRow[];
 
-  insertFinding(row: Omit<FindingRow, "id">): void;
+  insertFinding(row: Omit<FindingRow, "id" | "fingerprint">): void;
   listFindings(runId: string, opts?: { iteration?: number }): FindingRow[];
+
+  // Cross-run aggregation. `minRuns` filters out singletons when
+  // >1 — used by `df findings` and by the edit-mode prompt injection.
+  listLedgerEntries(opts?: {
+    minRuns?: number;
+    includeSuppressed?: boolean;
+    limit?: number;
+  }): LedgerEntry[];
+  suppressFingerprint(fingerprint: string, note?: string): void;
+  unsuppressFingerprint(fingerprint: string): void;
+  listSuppressedFingerprints(): { fingerprint: string; added_at: number; note: string | null }[];
 
   saveClarifications(runId: string, c: Clarifications): void;
   getClarifications(runId: string): Clarifications | null;

@@ -3,16 +3,19 @@ import { dirname } from "node:path";
 import { mkdirSync } from "node:fs";
 import type {
   Clarifications,
+  CriticName,
   EventRow,
   FindingRow,
   RunMode,
   RunRow,
   RunStatus,
+  Severity,
   StageName,
   StageRow,
   StateStore,
   TokenUsage,
 } from "./types.js";
+import { findingFingerprint } from "./types.js";
 
 // Single writer; orchestrator is the only process calling mutating methods.
 // WAL mode so the (future) web UI can read concurrently without blocking.
@@ -67,9 +70,16 @@ CREATE TABLE IF NOT EXISTS findings (
   critic TEXT NOT NULL,
   severity TEXT NOT NULL,
   title TEXT NOT NULL,
-  detail_path TEXT NOT NULL
+  detail_path TEXT NOT NULL,
+  fingerprint TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS findings_run_iter ON findings (run_id, iteration);
+
+CREATE TABLE IF NOT EXISTS suppressed_findings (
+  fingerprint TEXT PRIMARY KEY,
+  added_at INTEGER NOT NULL,
+  note TEXT
+);
 
 CREATE TABLE IF NOT EXISTS clarifications (
   run_id TEXT PRIMARY KEY,
@@ -107,6 +117,13 @@ export class SqliteStateStore implements StateStore {
   init(): void {
     this.db.exec(SCHEMA);
     this.migrateColumns();
+    this.backfillFingerprints();
+    // Post-migration indexes: the fingerprint column may have just
+    // been added; creating the index here (not in SCHEMA) avoids a
+    // "no such column" error on pre-migration databases.
+    this.db.exec(
+      `CREATE INDEX IF NOT EXISTS findings_fp ON findings (fingerprint);`,
+    );
   }
 
   // Idempotent ADD COLUMN backfills for databases that predate later
@@ -123,6 +140,7 @@ export class SqliteStateStore implements StateStore {
       ["stages", "cache_creation_tokens", "INTEGER NOT NULL DEFAULT 0"],
       ["stages", "cache_read_tokens", "INTEGER NOT NULL DEFAULT 0"],
       ["stages", "output_tokens", "INTEGER NOT NULL DEFAULT 0"],
+      ["findings", "fingerprint", "TEXT NOT NULL DEFAULT ''"],
     ];
     for (const [table, column, spec] of cols) {
       try {
@@ -134,6 +152,33 @@ export class SqliteStateStore implements StateStore {
         if (!msg.includes("duplicate column")) throw err;
       }
     }
+  }
+
+  // Populate fingerprint for any finding rows that were written before
+  // the column existed (default was '' after the migration). Uses the
+  // same canonical formula as findingFingerprint. Cheap: one UPDATE
+  // gated on empty fingerprints.
+  private backfillFingerprints(): void {
+    const rows = this.db
+      .prepare(
+        `SELECT id, critic, severity, title FROM findings WHERE fingerprint = ''`,
+      )
+      .all() as { id: number; critic: string; severity: string; title: string }[];
+    if (rows.length === 0) return;
+    const update = this.db.prepare(
+      `UPDATE findings SET fingerprint = ? WHERE id = ?`,
+    );
+    const txn = this.db.transaction((items: typeof rows) => {
+      for (const r of items) {
+        const fp = findingFingerprint({
+          critic: r.critic as CriticName,
+          severity: r.severity as Severity,
+          title: r.title,
+        });
+        update.run(fp, r.id);
+      }
+    });
+    txn(rows);
   }
 
   close(): void {
@@ -296,13 +341,26 @@ export class SqliteStateStore implements StateStore {
       .all(runId, afterId, limit) as EventRow[];
   }
 
-  insertFinding(row: Omit<FindingRow, "id">): void {
+  insertFinding(row: Omit<FindingRow, "id" | "fingerprint">): void {
+    const fp = findingFingerprint({
+      critic: row.critic,
+      severity: row.severity,
+      title: row.title,
+    });
     this.db
       .prepare(
-        `INSERT INTO findings (run_id, iteration, critic, severity, title, detail_path)
-         VALUES (?, ?, ?, ?, ?, ?)`,
+        `INSERT INTO findings (run_id, iteration, critic, severity, title, detail_path, fingerprint)
+         VALUES (?, ?, ?, ?, ?, ?, ?)`,
       )
-      .run(row.run_id, row.iteration, row.critic, row.severity, row.title, row.detail_path);
+      .run(
+        row.run_id,
+        row.iteration,
+        row.critic,
+        row.severity,
+        row.title,
+        row.detail_path,
+        fp,
+      );
   }
 
   listFindings(runId: string, opts: { iteration?: number } = {}): FindingRow[] {
@@ -316,6 +374,105 @@ export class SqliteStateStore implements StateStore {
     return this.db
       .prepare(`SELECT * FROM findings WHERE run_id = ? ORDER BY id`)
       .all(runId) as FindingRow[];
+  }
+
+  listLedgerEntries(
+    opts: {
+      minRuns?: number;
+      includeSuppressed?: boolean;
+      limit?: number;
+    } = {},
+  ): import("./types.js").LedgerEntry[] {
+    const limit = opts.limit ?? 200;
+    const minRuns = opts.minRuns ?? 1;
+    // GROUP BY fingerprint; pull max severity (by ordinal) and latest
+    // detail_path via a correlated pick. SQLite doesn't have a native
+    // "pick one" aggregate, so we MAX(id) per group and join back.
+    const rows = this.db
+      .prepare(
+        `SELECT
+           f.fingerprint as fingerprint,
+           f.critic as critic,
+           f.severity as severity,
+           f.title as title,
+           COUNT(DISTINCT f.run_id) as run_count,
+           COUNT(f.id) as occurrence_count,
+           MIN(r.created_at) as first_seen,
+           MAX(r.created_at) as last_seen,
+           (SELECT detail_path FROM findings f2
+              WHERE f2.fingerprint = f.fingerprint
+              ORDER BY f2.id DESC LIMIT 1) as example_path,
+           CASE WHEN sf.fingerprint IS NULL THEN 0 ELSE 1 END as suppressed
+         FROM findings f
+         JOIN runs r ON r.id = f.run_id
+         LEFT JOIN suppressed_findings sf ON sf.fingerprint = f.fingerprint
+         WHERE f.fingerprint <> ''
+         GROUP BY f.fingerprint
+         HAVING run_count >= ?
+         ORDER BY run_count DESC, last_seen DESC
+         LIMIT ?`,
+      )
+      .all(minRuns, limit) as Array<{
+      fingerprint: string;
+      critic: string;
+      severity: string;
+      title: string;
+      run_count: number;
+      occurrence_count: number;
+      first_seen: number;
+      last_seen: number;
+      example_path: string | null;
+      suppressed: number;
+    }>;
+    const filtered = opts.includeSuppressed
+      ? rows
+      : rows.filter((r) => r.suppressed === 0);
+    return filtered.map((r) => ({
+      fingerprint: r.fingerprint,
+      critic: r.critic as CriticName,
+      severity: r.severity as Severity,
+      title: r.title,
+      runCount: r.run_count,
+      occurrenceCount: r.occurrence_count,
+      firstSeen: r.first_seen,
+      lastSeen: r.last_seen,
+      suppressed: Boolean(r.suppressed),
+      exampleDetailPath: r.example_path,
+    }));
+  }
+
+  suppressFingerprint(fingerprint: string, note?: string): void {
+    this.db
+      .prepare(
+        `INSERT INTO suppressed_findings (fingerprint, added_at, note)
+         VALUES (?, ?, ?)
+         ON CONFLICT(fingerprint) DO UPDATE SET
+           added_at = excluded.added_at,
+           note = excluded.note`,
+      )
+      .run(fingerprint, Date.now(), note ?? null);
+  }
+
+  unsuppressFingerprint(fingerprint: string): void {
+    this.db
+      .prepare(`DELETE FROM suppressed_findings WHERE fingerprint = ?`)
+      .run(fingerprint);
+  }
+
+  listSuppressedFingerprints(): {
+    fingerprint: string;
+    added_at: number;
+    note: string | null;
+  }[] {
+    return this.db
+      .prepare(
+        `SELECT fingerprint, added_at, note FROM suppressed_findings ORDER BY added_at DESC`,
+      )
+      .all() as {
+      fingerprint: string;
+      added_at: number;
+      note: string | null;
+    }[];
   }
 
   saveClarifications(runId: string, c: Clarifications): void {

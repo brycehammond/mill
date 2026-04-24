@@ -3,6 +3,7 @@ import type { RunContext, StageResult, Finding } from "../../core/index.js";
 import {
   SEVERITY_ORDER,
   readProfileSummary,
+  renderLedgerHint,
   usageStagePatch,
 } from "../../core/index.js";
 import { loadPrompt } from "../prompts.js";
@@ -51,6 +52,10 @@ export async function implement(args: ImplementArgs): Promise<StageResult> {
     // session already has it in history. Cheap either way, since
     // cache-read dominates.
     const profile = iteration === 1 ? await readProfileSummary(ctx.root) : "";
+    const ledger =
+      iteration === 1 && ctx.mode === "edit"
+        ? renderLedgerHint(ctx.store, { limit: 5 })
+        : "";
 
     const prompt = buildPrompt({
       iteration,
@@ -59,6 +64,7 @@ export async function implement(args: ImplementArgs): Promise<StageResult> {
       priorFindings,
       resume,
       profile,
+      ledger,
     });
 
     const res = await runClaude({
@@ -134,13 +140,16 @@ function buildPrompt(args: {
   priorFindings: Finding[];
   resume: string | undefined;
   profile: string;
+  ledger: string;
 }): string {
   if (args.iteration === 1 || !args.resume) {
     const profileBlock = args.profile
       ? [`# Repo profile`, args.profile.trim(), ``].join("\n")
       : "";
+    const ledgerBlock = args.ledger ? args.ledger.trim() + "\n" : "";
     return [
       profileBlock,
+      ledgerBlock,
       `# spec.md`,
       args.specBody.trim(),
       ``,

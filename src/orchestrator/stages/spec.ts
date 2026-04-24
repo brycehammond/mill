@@ -3,6 +3,7 @@ import type { RunContext, StageResult } from "../../core/index.js";
 import {
   readJournalTail,
   readProfileSummary,
+  renderLedgerHint,
   usageStagePatch,
 } from "../../core/index.js";
 import { loadPrompt } from "../prompts.js";
@@ -25,6 +26,8 @@ export async function spec(ctx: RunContext): Promise<StageResult> {
     const journal = await readJournalTail(ctx.root, 20);
     const profile = await readProfileSummary(ctx.root);
     const profileBlock = profile ? `## Repo profile\n\n${profile}\n` : "";
+    const ledgerBlock =
+      ctx.mode === "edit" ? renderLedgerHint(ctx.store, { limit: 5 }) : "";
     const workdirBlock =
       ctx.mode === "edit"
         ? [
@@ -37,6 +40,7 @@ export async function spec(ctx: RunContext): Promise<StageResult> {
 
     const body = [
       profileBlock,
+      ledgerBlock,
       journal,
       workdirBlock,
       `KIND: ${clarifications.kind}`,
