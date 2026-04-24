@@ -59,13 +59,19 @@ export type StageStatus =
   | "failed"
   | "skipped";
 
-export type CriticName = "security" | "correctness" | "ux" | "adversarial";
+export type CriticName =
+  | "security"
+  | "correctness"
+  | "ux"
+  | "adversarial"
+  | "tests";
 
 export const CRITIC_NAMES: CriticName[] = [
   "security",
   "correctness",
   "ux",
   "adversarial",
+  "tests",
 ];
 
 // Raw token counts from a single `claude` invocation. Fields mirror the

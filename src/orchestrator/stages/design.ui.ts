@@ -1,7 +1,7 @@
 import { readFile, writeFile } from "node:fs/promises";
 import { z } from "zod";
 import type { RunContext, StageResult } from "../../core/index.js";
-import { readJournalTail } from "../../core/index.js";
+import { readJournalTail, readProfileSummary } from "../../core/index.js";
 import { loadPrompt } from "../prompts.js";
 import { zodToJsonSchema } from "zod-to-json-schema";
 import { pickStructured, runClaude } from "../claude-cli.js";
@@ -23,8 +23,10 @@ export async function designUi(ctx: RunContext): Promise<StageResult> {
   const systemPrompt = await loadPrompt("design-ui");
   const specBody = await readFile(ctx.paths.spec, "utf8");
   const journal = await readJournalTail(ctx.root, 20);
+  const profile = await readProfileSummary(ctx.root);
+  const profileBlock = profile ? `## Repo profile\n\n${profile}\n` : "";
 
-  const prompt = [journal, `## Spec`, specBody]
+  const prompt = [profileBlock, journal, `## Spec`, specBody]
     .filter((s) => s !== "")
     .join("\n\n");
 

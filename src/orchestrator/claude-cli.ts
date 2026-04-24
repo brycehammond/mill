@@ -286,6 +286,170 @@ function safeInt(n: number | undefined): number {
   return Math.round(n);
 }
 
+export interface RunClaudeOneShotArgs {
+  prompt: string;
+  systemPrompt?: string;
+  cwd: string;
+  permissionMode?: PermissionMode;
+  allowedTools?: string[];
+  disallowedTools?: string[];
+  settingSources?: Array<"user" | "project" | "local">;
+  jsonSchema?: unknown;
+  maxTurns?: number;
+  maxBudgetUsd?: number;
+  timeoutMs?: number;
+  model?: string;
+  addDir?: string[];
+  onStderr?: (text: string) => void;
+}
+
+// Project-scoped / utility invocation of `claude` with no RunContext.
+// Used for operations that are not per-run (e.g. `df onboard`). No
+// session persistence, no event log, no budget tally — the caller
+// handles anything beyond "send prompt, get result".
+export async function runClaudeOneShot(
+  args: RunClaudeOneShotArgs,
+): Promise<RunClaudeResult> {
+  const argv: string[] = [
+    "--output-format",
+    "stream-json",
+    "--input-format",
+    "stream-json",
+    "--verbose",
+  ];
+
+  if (args.model) argv.push("--model", args.model);
+  if (args.maxTurns) argv.push("--max-turns", String(args.maxTurns));
+  if (args.maxBudgetUsd && args.maxBudgetUsd > 0) {
+    argv.push("--max-budget-usd", String(args.maxBudgetUsd));
+  }
+  if (args.permissionMode) argv.push("--permission-mode", args.permissionMode);
+  if (args.allowedTools && args.allowedTools.length > 0) {
+    argv.push("--allowedTools", args.allowedTools.join(","));
+  }
+  if (args.disallowedTools && args.disallowedTools.length > 0) {
+    argv.push("--disallowedTools", args.disallowedTools.join(","));
+  }
+  if (args.settingSources && args.settingSources.length > 0) {
+    argv.push("--setting-sources", args.settingSources.join(","));
+  }
+  if (args.jsonSchema) argv.push("--json-schema", JSON.stringify(args.jsonSchema));
+  if (args.systemPrompt) argv.push("--append-system-prompt", args.systemPrompt);
+  for (const dir of args.addDir ?? []) argv.push("--add-dir", dir);
+
+  const child = spawn("claude", argv, {
+    cwd: args.cwd,
+    env: { ...process.env, CLAUDE_CODE_ENTRYPOINT: "df-harness" },
+    stdio: ["pipe", "pipe", "pipe"],
+  });
+
+  let spawnError: Error | null = null;
+  child.on("error", (err) => {
+    const code = (err as NodeJS.ErrnoException).code;
+    spawnError = code === "ENOENT" ? new ClaudeNotFoundError() : (err as Error);
+  });
+
+  const userMessage = JSON.stringify({
+    type: "user",
+    message: { role: "user", content: args.prompt },
+  });
+  child.stdin.write(userMessage + "\n");
+  child.stdin.end();
+
+  const onAbort = () => {
+    if (!child.killed) {
+      child.kill("SIGTERM");
+      setTimeout(() => {
+        if (!child.killed) child.kill("SIGKILL");
+      }, 2000).unref();
+    }
+  };
+
+  const timer =
+    args.timeoutMs && args.timeoutMs > 0 ? setTimeout(onAbort, args.timeoutMs) : undefined;
+  if (timer) timer.unref();
+
+  let stdoutBuf = "";
+  const resultBox: { value: RunClaudeResult | null } = { value: null };
+
+  const handleLine = (line: string) => {
+    if (!line.trim()) return;
+    let msg: Record<string, unknown>;
+    try {
+      msg = JSON.parse(line);
+    } catch {
+      return;
+    }
+    const msgType = typeof msg.type === "string" ? msg.type : "unknown";
+    if (msgType === "result") {
+      const rm = msg as {
+        type: "result";
+        subtype: RunClaudeResult["subtype"];
+        duration_ms?: number;
+        num_turns?: number;
+        is_error?: boolean;
+        session_id?: string;
+        total_cost_usd?: number;
+        result?: string;
+        structured_output?: unknown;
+        usage?: {
+          input_tokens?: number;
+          cache_creation_input_tokens?: number;
+          cache_read_input_tokens?: number;
+          output_tokens?: number;
+        };
+      };
+      const u = rm.usage ?? {};
+      resultBox.value = {
+        text: typeof rm.result === "string" ? rm.result : "",
+        structuredOutput: rm.structured_output ?? null,
+        sessionId: rm.session_id ?? "",
+        costUsd: rm.total_cost_usd ?? 0,
+        usage: {
+          input: safeInt(u.input_tokens),
+          cache_creation: safeInt(u.cache_creation_input_tokens),
+          cache_read: safeInt(u.cache_read_input_tokens),
+          output: safeInt(u.output_tokens),
+        },
+        subtype: rm.subtype,
+        durationMs: rm.duration_ms ?? 0,
+        numTurns: rm.num_turns ?? 0,
+        isError: Boolean(rm.is_error),
+      };
+    }
+  };
+
+  child.stdout.on("data", (chunk: Buffer) => {
+    stdoutBuf += chunk.toString("utf8");
+    const lines = stdoutBuf.split("\n");
+    stdoutBuf = lines.pop() ?? "";
+    for (const line of lines) handleLine(line);
+  });
+
+  child.stderr.on("data", (chunk: Buffer) => {
+    const text = chunk.toString("utf8").trim();
+    if (text && args.onStderr) args.onStderr(text);
+  });
+
+  const exitCode: number = await new Promise((resolve) => {
+    child.on("close", (code) => resolve(code ?? -1));
+  });
+
+  if (timer) clearTimeout(timer);
+
+  if (stdoutBuf.trim()) handleLine(stdoutBuf);
+
+  if (spawnError) throw spawnError;
+
+  const result = resultBox.value;
+  if (!result) {
+    throw new Error(
+      `claude exited ${exitCode} without producing a result message`,
+    );
+  }
+  return result;
+}
+
 // Fallback for call sites that need an empty usage (error paths, tests).
 export { ZERO_USAGE };
 

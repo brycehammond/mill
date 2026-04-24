@@ -23,6 +23,7 @@ import {
   runPipeline,
   loadConfig,
   NoProjectError,
+  onboard,
 } from "./orchestrator/index.js";
 
 type Cmd =
@@ -33,6 +34,7 @@ type Cmd =
   | "tail"
   | "kill"
   | "init"
+  | "onboard"
   | "history"
   | "help";
 
@@ -58,6 +60,8 @@ async function main() {
         return await cmdKill(rest);
       case "history":
         return await cmdHistory();
+      case "onboard":
+        return await cmdOnboard(rest);
       case "help":
       default:
         printHelp();
@@ -103,6 +107,8 @@ function printHelp() {
       "  df tail <run-id> [--follow]      # human-readable activity stream",
       "  df logs <run-id> [--follow] [--after <event-id>]  # raw events",
       "  df kill <run-id>",
+      "  df onboard [--refresh]           # profile the repo once; auto-injected",
+      "                                    into future spec/design/implement prompts",
       "  df history                        # print .df/journal.md",
       "",
     ].join("\n"),
@@ -354,6 +360,41 @@ async function promptForAnswers(
     rl.close();
   }
   return answers;
+}
+
+async function cmdOnboard(argv: string[]) {
+  const { values } = parseArgs({
+    args: argv,
+    allowPositionals: false,
+    options: {
+      refresh: { type: "boolean", default: false },
+    },
+  });
+  preflightClaude();
+  const refresh = Boolean(values.refresh);
+  console.log(
+    refresh
+      ? "df onboard: refreshing profile (reading repo, calling claude)…"
+      : "df onboard: checking for existing profile…",
+  );
+  const result = await onboard({ refresh });
+  if (result.cached) {
+    console.log("profile already exists. Run `df onboard --refresh` to rebuild.");
+    return;
+  }
+  const config = loadConfig();
+  console.log(
+    `profile written: ${config.root}/.df/profile.md`,
+  );
+  console.log(`cost: $${result.costUsd.toFixed(4)}  duration: ${(result.durationMs / 1000).toFixed(1)}s`);
+  console.log(`stack: ${result.profile.stack}`);
+  const cmds = result.profile.commands;
+  const present = (label: string, v: string | null) =>
+    v ? `  ${label}: ${v}` : `  ${label}: (none detected)`;
+  console.log(present("test", cmds.test));
+  console.log(present("build", cmds.build));
+  console.log(present("lint", cmds.lint));
+  console.log(present("typecheck", cmds.typecheck));
 }
 
 async function cmdHistory() {

@@ -6,7 +6,12 @@ import type {
   StageResult,
   TokenUsage,
 } from "../../core/index.js";
-import { atLeast, usageStagePatch, ZERO_USAGE } from "../../core/index.js";
+import {
+  atLeast,
+  readProfile,
+  usageStagePatch,
+  ZERO_USAGE,
+} from "../../core/index.js";
 import { correctnessCritic } from "../critics/correctness.js";
 import { securityCritic } from "../critics/security.js";
 import { uxCritic } from "../critics/ux.js";
@@ -15,6 +20,7 @@ import {
   canRunAdversarial,
   isCodexCliAvailable,
 } from "../critics/adversarial.js";
+import { testsCritic } from "../critics/tests.js";
 import type { CriticResult } from "../critics/shared.js";
 
 export interface ReviewArgs {
@@ -52,6 +58,26 @@ export async function review(args: ReviewArgs): Promise<StageResult & { data: Re
       uxCritic(shared),
     ];
     const names: CriticName[] = ["security", "correctness", "ux"];
+
+    // The tests critic runs the repo's real test command (from the
+    // profile) and turns failures into HIGH findings. Only activates
+    // when a profile exists AND has a test command set. Opt-out with
+    // DF_TESTS_CRITIC=off. Typically only meaningful in edit mode —
+    // new-mode scaffolds don't have an external profile, though they
+    // could if the user ran `df onboard` on the enclosing project
+    // before `df new`.
+    const testsMode = resolveTestsMode();
+    if (testsMode !== "off") {
+      const profile = await readProfile(ctx.root);
+      if (profile?.commands.test) {
+        critics.push(testsCritic(shared));
+        names.push("tests");
+      } else if (testsMode === "on") {
+        throw new Error(
+          "DF_TESTS_CRITIC=on but no test command in .df/profile.json — run `df onboard` first",
+        );
+      }
+    }
 
     const adversarialMode = resolveAdversarialMode();
     if (adversarialMode !== "off") {
@@ -203,6 +229,15 @@ type AdversarialMode = "auto" | "on" | "off";
 
 function resolveAdversarialMode(): AdversarialMode {
   const raw = (process.env.DF_ADVERSARIAL_REVIEW ?? "auto").trim().toLowerCase();
+  if (raw === "on" || raw === "true" || raw === "1") return "on";
+  if (raw === "off" || raw === "false" || raw === "0") return "off";
+  return "auto";
+}
+
+type TestsMode = "auto" | "on" | "off";
+
+function resolveTestsMode(): TestsMode {
+  const raw = (process.env.DF_TESTS_CRITIC ?? "auto").trim().toLowerCase();
   if (raw === "on" || raw === "true" || raw === "1") return "on";
   if (raw === "off" || raw === "false" || raw === "0") return "off";
   return "auto";

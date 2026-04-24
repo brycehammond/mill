@@ -1,6 +1,10 @@
 import { readFile, writeFile } from "node:fs/promises";
 import type { RunContext, StageResult, Finding } from "../../core/index.js";
-import { SEVERITY_ORDER, usageStagePatch } from "../../core/index.js";
+import {
+  SEVERITY_ORDER,
+  readProfileSummary,
+  usageStagePatch,
+} from "../../core/index.js";
 import { loadPrompt } from "../prompts.js";
 import { runClaude } from "../claude-cli.js";
 import { gitCommitAll, gitCommitEmpty, gitInit, gitTag, gitHead } from "../git.js";
@@ -43,7 +47,19 @@ export async function implement(args: ImplementArgs): Promise<StageResult> {
     const prior = ctx.store.getSession(ctx.runId, "implement");
     const resume = iteration > 1 && prior ? prior.sessionId : undefined;
 
-    const prompt = buildPrompt({ iteration, specBody, designBody, priorFindings, resume });
+    // Profile is only injected on the first iteration — the resumed
+    // session already has it in history. Cheap either way, since
+    // cache-read dominates.
+    const profile = iteration === 1 ? await readProfileSummary(ctx.root) : "";
+
+    const prompt = buildPrompt({
+      iteration,
+      specBody,
+      designBody,
+      priorFindings,
+      resume,
+      profile,
+    });
 
     const res = await runClaude({
       ctx,
@@ -117,9 +133,14 @@ function buildPrompt(args: {
   designBody: string;
   priorFindings: Finding[];
   resume: string | undefined;
+  profile: string;
 }): string {
   if (args.iteration === 1 || !args.resume) {
+    const profileBlock = args.profile
+      ? [`# Repo profile`, args.profile.trim(), ``].join("\n")
+      : "";
     return [
+      profileBlock,
       `# spec.md`,
       args.specBody.trim(),
       ``,
@@ -127,7 +148,9 @@ function buildPrompt(args: {
       args.designBody.trim() || "(no design doc — treat spec as sufficient)",
       ``,
       `Begin implementation. Commit logical chunks with descriptive messages.`,
-    ].join("\n");
+    ]
+      .filter((s) => s !== "")
+      .join("\n");
   }
   const sorted = [...args.priorFindings].sort(
     (a, b) => SEVERITY_ORDER[b.severity] - SEVERITY_ORDER[a.severity],
