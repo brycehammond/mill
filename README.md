@@ -40,11 +40,11 @@ npm run df -- new "TypeScript CLI that converts markdown to minified HTML"
 # committed source). Creates a df/run-<id> branch via git worktree.
 npm run df -- new "refactor the auth middleware" --mode edit --pr
 
-# Stop after design so you can review spec+design before paying for
-# implement. Resume with `df run <id>` to continue.
-npm run df -- new "..." --plan
+# Stop after a named stage so you can review before paying for the rest.
+# Resume with `df run <id>` to continue.
+npm run df -- new "..." --stop-after design
 
-# Resume a partially-completed run (crash recovery, or after --plan)
+# Resume a partially-completed run (crash recovery, or after --stop-after)
 npm run df -- run <run-id>
 
 # Inspect state

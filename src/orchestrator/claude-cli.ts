@@ -45,7 +45,6 @@ export interface RunClaudeArgs {
   ctx: RunContext;
   stage: StageName;
   prompt: string;
-  appendSystemPrompt?: string;
   systemPrompt?: string;
   // How `systemPrompt` is delivered. "append" (default) adds to Claude
   // Code's default system prompt — safest for stages that rely on the
@@ -110,7 +109,6 @@ export async function runClaude(args: RunClaudeArgs): Promise<RunClaudeResult> {
     ctx,
     stage,
     prompt,
-    appendSystemPrompt,
     systemPrompt,
     systemPromptMode = "append",
     cwd,
@@ -180,13 +178,10 @@ export async function runClaude(args: RunClaudeArgs): Promise<RunClaudeResult> {
   }
   if (settingSources && settingSources.length > 0) argv.push("--setting-sources", settingSources.join(","));
   if (jsonSchema) argv.push("--json-schema", JSON.stringify(jsonSchema));
-  // `appendSystemPrompt` always appends (legacy contract). `systemPrompt`
-  // now respects `systemPromptMode`: "append" (default) tacks onto
-  // Claude Code's default prompt; "replace" supplies the only system
-  // prompt the model sees. Critics want "replace"; everything else
-  // wants "append" so the default tool-use guidance is preserved.
-  if (appendSystemPrompt) argv.push("--append-system-prompt", appendSystemPrompt);
-  else if (systemPrompt) {
+  // "append" (default) tacks onto Claude Code's default prompt, keeping
+  // its tool-use guidance. "replace" supplies the only system prompt
+  // the model sees — right for narrow roles like critics.
+  if (systemPrompt) {
     const flag = systemPromptMode === "replace" ? "--system-prompt" : "--append-system-prompt";
     argv.push(flag, systemPrompt);
   }

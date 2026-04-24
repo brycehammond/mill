@@ -22,9 +22,9 @@ export interface RunPipelineArgs {
   config?: DfConfig;
   ctx?: RunContext;
   // If set, return after the named stage completes successfully.
-  // Used by `df new --plan` to stop after design so the user can
-  // review spec+design before paying for implement. Resume via
-  // `df run <id>` (no stopAfter) finishes the pipeline.
+  // Used by `df new --stop-after <stage>` to halt early so the user
+  // can review before paying for the rest. Resume via `df run <id>`
+  // (no stopAfter) finishes the pipeline.
   stopAfter?: StageName;
 }
 

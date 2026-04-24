@@ -100,16 +100,14 @@ function printHelp() {
       "usage:",
       "  df init [<name>]                  # create .df/ in the current git repo",
       "  df new (<requirement...> | --from <file>) [--mode new|edit|auto]",
-      "         [--stop-after spec|design|spec2tests] [--plan] [--pr]",
+      "         [--stop-after spec|design|spec2tests] [--pr]",
       "         [--detach] [--all-defaults]",
       "    --mode auto (default) detects edit when the repo has committed",
       "    source; otherwise scaffolds into .df/runs/<id>/workdir/. Edit",
       "    runs create a df/run-<id> branch via git worktree.",
       "    --stop-after halts the pipeline after the named stage so you can",
       "    review before paying for the rest. Resume with `df run <id>`.",
-      "    (This is df's concept of 'plan'; unrelated to Claude Code's",
-      "    permissionMode: plan.) --plan is a legacy alias for",
-      "    --stop-after design.",
+      "    (Unrelated to Claude Code's permissionMode: plan.)",
       "    --pr pushes the branch and opens a GitHub PR via gh (edit only).",
       "  df run <run-id>                   # resume a run, skipping completed stages",
       "  df status [<run-id>]",
@@ -160,7 +158,6 @@ async function cmdNew(argv: string[]) {
       from: { type: "string" },
       mode: { type: "string", default: "auto" },
       pr: { type: "boolean", default: false },
-      plan: { type: "boolean", default: false },
       "stop-after": { type: "string" },
     },
   });
@@ -275,14 +272,9 @@ async function cmdNew(argv: string[]) {
   }
 
   // --stop-after <stage> halts the pipeline after a named stage so the
-  // user can review before paying for the rest. --plan is the legacy
-  // alias for --stop-after design; retained so older scripts work.
-  // Note: this is unrelated to Claude Code's `permissionMode: plan`
-  // (in-process planning); different concept, same word.
-  const stopAfter = resolveStopAfter({
-    plan: Boolean(values.plan),
-    stopAfter: values["stop-after"],
-  });
+  // user can review before paying for the rest. Unrelated to Claude
+  // Code's `permissionMode: plan` (in-process planning).
+  const stopAfter = resolveStopAfter(values["stop-after"]);
   if (stopAfter === "error") {
     process.exitCode = 2;
     return;
@@ -320,29 +312,16 @@ async function cmdNew(argv: string[]) {
 type StopStage = "spec" | "design" | "spec2tests";
 const STOP_STAGES: StopStage[] = ["spec", "design", "spec2tests"];
 
-function resolveStopAfter(args: {
-  plan: boolean;
-  stopAfter: string | undefined;
-}): StopStage | undefined | "error" {
-  const raw = args.stopAfter?.trim();
-  const hasFlag = raw !== undefined && raw !== "";
-  if (args.plan && hasFlag && raw !== "design") {
+function resolveStopAfter(raw: string | undefined): StopStage | undefined | "error" {
+  const v = raw?.trim();
+  if (!v) return undefined;
+  if (!STOP_STAGES.includes(v as StopStage)) {
     console.error(
-      `df new: --plan is an alias for --stop-after design; got --stop-after ${raw}`,
+      `df new: --stop-after must be one of ${STOP_STAGES.join("|")}, got "${v}"`,
     );
     return "error";
   }
-  if (hasFlag) {
-    if (!STOP_STAGES.includes(raw as StopStage)) {
-      console.error(
-        `df new: --stop-after must be one of ${STOP_STAGES.join("|")}, got "${raw}"`,
-      );
-      return "error";
-    }
-    return raw as StopStage;
-  }
-  if (args.plan) return "design";
-  return undefined;
+  return v as StopStage;
 }
 
 async function cmdRun(argv: string[]) {
