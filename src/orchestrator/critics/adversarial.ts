@@ -38,7 +38,7 @@ let cachedCodexProbe: boolean | null = null;
 // explicit override so tests / non-standard install paths still work.
 // Returns null when the plugin isn't installed.
 export function findCodexCompanion(): string | null {
-  const override = process.env.DF_CODEX_COMPANION?.trim();
+  const override = process.env.MILL_CODEX_COMPANION?.trim();
   if (override) return existsSync(override) ? override : null;
 
   if (!existsSync(PLUGIN_GLOB_ROOT)) return null;

@@ -1,4 +1,4 @@
-// Load-bearing type surface for the dark-factory pipeline.
+// Load-bearing type surface for the mill pipeline.
 
 export type Kind = "ui" | "backend" | "cli";
 
@@ -293,7 +293,7 @@ export interface StateStore {
   listFindings(runId: string, opts?: { iteration?: number }): FindingRow[];
 
   // Cross-run aggregation. `minRuns` filters out singletons when
-  // >1 — used by `df findings` and by the edit-mode prompt injection.
+  // >1 — used by `mill findings` and by the edit-mode prompt injection.
   listLedgerEntries(opts?: {
     minRuns?: number;
     includeSuppressed?: boolean;

@@ -7,7 +7,7 @@ import type { LedgerEntry, StateStore } from "./types.js";
 
 // Render the top N recurring findings into a markdown block. Returns
 // empty string if nothing qualifies. "Recurring" means seen in at
-// least 2 runs (matching `df findings` default); suppressed
+// least 2 runs (matching `mill findings` default); suppressed
 // fingerprints are excluded.
 export function renderLedgerHint(
   store: StateStore,

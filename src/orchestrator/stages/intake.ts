@@ -32,7 +32,7 @@ export interface IntakeResult {
 // Intake is synchronous and runs from the CLI process. It records the
 // requirement on disk, creates the run row in the store, and returns the
 // fresh id so the CLI can continue with clarify inline. In edit mode it
-// also materializes a git worktree on a fresh `df/run-<id>` branch — the
+// also materializes a git worktree on a fresh `mill/run-<id>` branch — the
 // implement stage then writes commits into that worktree.
 export async function intake(args: IntakeArgs): Promise<IntakeResult> {
   const runId = newRunId();
@@ -45,13 +45,13 @@ export async function intake(args: IntakeArgs): Promise<IntakeResult> {
     const state = await inspectRepoState(args.root);
     if (!state.hasCommits) {
       throw new Error(
-        "df: edit mode requires the repo to have at least one commit. " +
+        "mill: edit mode requires the repo to have at least one commit. " +
           "Make an initial commit, or pass --mode new.",
       );
     }
     if (state.inProgressOp) {
       throw new Error(
-        `df: repository is mid-${state.inProgressOp}; complete or abort it first, then retry.`,
+        `mill: repository is mid-${state.inProgressOp}; complete or abort it first, then retry.`,
       );
     }
   }
@@ -80,7 +80,7 @@ export async function intake(args: IntakeArgs): Promise<IntakeResult> {
   if (mode === "edit") {
     const state = await inspectRepoState(args.root);
     baseBranch = state.currentBranch;
-    branch = `df/run-${runId}`;
+    branch = `mill/run-${runId}`;
     try {
       await gitWorktreeAdd(args.root, branch, paths.workdir, "HEAD");
     } catch (err) {

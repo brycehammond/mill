@@ -218,7 +218,7 @@ async function tryOpenPullRequest(args: {
     return null;
   }
   try {
-    const title = `df: run ${ctx.runId}`;
+    const title = `mill: run ${ctx.runId}`;
     const prArgs = ["pr", "create", "--title", title, "--body-file", ctx.paths.delivery];
     if (baseBranch) prArgs.push("--base", baseBranch);
     prArgs.push("--head", branch);

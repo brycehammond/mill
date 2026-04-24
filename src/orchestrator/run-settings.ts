@@ -37,7 +37,7 @@ export function guardCommand(): string {
       // without sandbox. `node --import tsx/esm` would be another path but
       // it requires tsx >= 4.7 and still needs the loader on PATH.
       throw new Error(
-        "df: could not locate node_modules/.bin/tsx; run `npm install` in the dark-factory checkout",
+        "mill: could not locate node_modules/.bin/tsx; run `npm install` in the mill checkout",
       );
     }
     return `${quote(tsx)} ${quote(guardTs)}`;

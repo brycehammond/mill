@@ -2,14 +2,14 @@ import { mkdir, stat } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { join, resolve } from "node:path";
 import type { RunPaths } from "./types.js";
-import { DF_DIR, RUNS_DIRNAME } from "./project.js";
+import { MILL_DIR, RUNS_DIRNAME } from "./project.js";
 
-// `root` here is the project root (the directory containing `.df/`).
-// Run artifacts live under `.df/runs/<runId>/` so the whole state tree
+// `root` here is the project root (the directory containing `.mill/`).
+// Run artifacts live under `.mill/runs/<runId>/` so the whole state tree
 // is scoped to the project and gitignored as a single entry.
 export function runPaths(root: string, runId: string): RunPaths {
   const absRoot = resolve(root);
-  const runDir = join(absRoot, DF_DIR, RUNS_DIRNAME, runId);
+  const runDir = join(absRoot, MILL_DIR, RUNS_DIRNAME, runId);
   const designDir = join(runDir, "design");
   return {
     root: absRoot,

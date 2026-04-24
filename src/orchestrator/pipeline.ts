@@ -22,8 +22,8 @@ export interface RunPipelineArgs {
   config?: DfConfig;
   ctx?: RunContext;
   // If set, return after the named stage completes successfully.
-  // Used by `df new --stop-after <stage>` to halt early so the user
-  // can review before paying for the rest. Resume via `df run <id>`
+  // Used by `mill new --stop-after <stage>` to halt early so the user
+  // can review before paying for the rest. Resume via `mill run <id>`
   // (no stopAfter) finishes the pipeline.
   stopAfter?: StageName;
 }
@@ -56,7 +56,7 @@ export async function runPipeline(args: RunPipelineArgs): Promise<PipelineResult
     return {
       runId: ctx.runId,
       status: "planned",
-      reason: `stopped after ${stage} (plan mode — resume with \`df run ${ctx.runId}\`)`,
+      reason: `stopped after ${stage} (plan mode — resume with \`mill run ${ctx.runId}\`)`,
       costUsd,
       durationMs,
     };
@@ -86,7 +86,7 @@ export async function runPipeline(args: RunPipelineArgs): Promise<PipelineResult
       if (planned) return planned;
     }
 
-    // 3. spec2tests (optional; gated on profile + DF_SPEC2TESTS)
+    // 3. spec2tests (optional; gated on profile + MILL_SPEC2TESTS)
     if (needsStage(ctx, "spec2tests")) {
       if (await shouldRunSpec2Tests(ctx)) {
         const r = await spec2tests(ctx);
@@ -244,17 +244,17 @@ function needsStage(ctx: RunContext, name: Parameters<typeof ctx.store.getStage>
 }
 
 // Gate spec2tests: requires a profile with a test command, and
-// DF_SPEC2TESTS not set to "off". Default is auto (enable when
+// MILL_SPEC2TESTS not set to "off". Default is auto (enable when
 // available). Explicit "on" forces an error if unavailable.
 async function shouldRunSpec2Tests(ctx: RunContext): Promise<boolean> {
-  const mode = (process.env.DF_SPEC2TESTS ?? "auto").trim().toLowerCase();
+  const mode = (process.env.MILL_SPEC2TESTS ?? "auto").trim().toLowerCase();
   if (mode === "off" || mode === "false" || mode === "0") return false;
   const profile = await readProfile(ctx.root);
   const hasTestCmd = Boolean(profile?.commands.test);
   if (!hasTestCmd) {
     if (mode === "on" || mode === "true" || mode === "1") {
       throw new Error(
-        "DF_SPEC2TESTS=on but no profile test command — run `df onboard` first",
+        "MILL_SPEC2TESTS=on but no profile test command — run `mill onboard` first",
       );
     }
     return false;

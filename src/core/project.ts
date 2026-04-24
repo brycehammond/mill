@@ -1,8 +1,8 @@
 // Project discovery and init.
 //
-// A "project" is a git repo with a `.df/` sibling to `.git/`. All
-// dark-factory state — the SQLite DB and per-run artifacts — lives under
-// `.df/` so it travels with the repo checkout and is trivially isolated
+// A "project" is a git repo with a `.mill/` sibling to `.git/`. All
+// mill state — the SQLite DB and per-run artifacts — lives under
+// `.mill/` so it travels with the repo checkout and is trivially isolated
 // from everything else in the tree. There is no global index; every
 // command resolves the current project by walking up from cwd.
 
@@ -27,39 +27,39 @@ export interface ProjectInfo {
   created_at: number;
 }
 
-export const DF_DIR = ".df";
-export const DB_FILENAME = "dark-factory.db";
+export const MILL_DIR = ".mill";
+export const DB_FILENAME = "mill.db";
 export const RUNS_DIRNAME = "runs";
 export const PROJECT_FILENAME = "project.json";
 
 // ---------- per-project paths ----------
 
-export function projectDfDir(projectRoot: string): string {
-  return join(resolve(projectRoot), DF_DIR);
+export function projectMillDir(projectRoot: string): string {
+  return join(resolve(projectRoot), MILL_DIR);
 }
 
 export function projectDbPath(projectRoot: string): string {
-  return join(projectDfDir(projectRoot), DB_FILENAME);
+  return join(projectMillDir(projectRoot), DB_FILENAME);
 }
 
 export function projectRunsDir(projectRoot: string): string {
-  return join(projectDfDir(projectRoot), RUNS_DIRNAME);
+  return join(projectMillDir(projectRoot), RUNS_DIRNAME);
 }
 
 export function projectInfoPath(projectRoot: string): string {
-  return join(projectDfDir(projectRoot), PROJECT_FILENAME);
+  return join(projectMillDir(projectRoot), PROJECT_FILENAME);
 }
 
 // ---------- discovery ----------
 
-// Walk up from `from` looking for a directory that contains `.df/project.json`.
-// The canonical project marker is `project.json` (written by `df init`);
+// Walk up from `from` looking for a directory that contains `.mill/project.json`.
+// The canonical project marker is `project.json` (written by `mill init`);
 // the DB file comes into existence lazily on the first store write.
 export function findProjectRoot(from: string = process.cwd()): string | null {
   let dir = resolve(from);
   const root = resolve(dir, sep);
   while (true) {
-    if (existsSync(join(dir, DF_DIR, PROJECT_FILENAME))) return dir;
+    if (existsSync(join(dir, MILL_DIR, PROJECT_FILENAME))) return dir;
     if (dir === root) return null;
     const parent = dirname(dir);
     if (parent === dir) return null;
@@ -99,21 +99,21 @@ export interface InitProjectResult {
   gitignoreUpdated: boolean;
 }
 
-// Creates `.df/` at the git repo root. Requires being inside a git repo
-// — "scoped to the repository" is the whole point. If `.df/` already
+// Creates `.mill/` at the git repo root. Requires being inside a git repo
+// — "scoped to the repository" is the whole point. If `.mill/` already
 // exists we leave its contents alone and just refresh the registry.
 export function initProject(args: InitProjectArgs = {}): InitProjectResult {
   const cwd = resolve(args.cwd ?? process.cwd());
   const gitRoot = findGitRoot(cwd);
   if (!gitRoot) {
     throw new Error(
-      "df init must run inside a git repository (no .git found walking up from cwd)",
+      "mill init must run inside a git repository (no .git found walking up from cwd)",
     );
   }
 
-  const dfDir = projectDfDir(gitRoot);
-  const alreadyExists = existsSync(dfDir);
-  mkdirSync(dfDir, { recursive: true });
+  const millDir = projectMillDir(gitRoot);
+  const alreadyExists = existsSync(millDir);
+  mkdirSync(millDir, { recursive: true });
   mkdirSync(projectRunsDir(gitRoot), { recursive: true });
 
   const now = Date.now();
@@ -130,7 +130,7 @@ export function initProject(args: InitProjectArgs = {}): InitProjectResult {
     "utf8",
   );
 
-  const gitignoreUpdated = ensureGitignoreEntry(gitRoot, "/.df/");
+  const gitignoreUpdated = ensureGitignoreEntry(gitRoot, "/.mill/");
 
   return {
     projectRoot: gitRoot,
@@ -229,7 +229,7 @@ export async function inspectRepoState(root: string): Promise<RepoState> {
     const out = await gitOut(root, ["ls-files"]);
     const files = out.split("\n").map((l) => l.trim()).filter(Boolean);
     trackedSourceCount = files.filter(
-      (f) => !META_FILES.has(f) && !f.startsWith(".df/"),
+      (f) => !META_FILES.has(f) && !f.startsWith(".mill/"),
     ).length;
   } catch {
     trackedSourceCount = 0;
@@ -267,8 +267,8 @@ export async function inspectRepoState(root: string): Promise<RepoState> {
 }
 
 // Heuristic: no commits OR no non-meta tracked files → scaffold into an
-// isolated workdir under `.df/runs/<id>/workdir/`. Otherwise the repo
-// already has code the user will want df to edit — route through edit
+// isolated workdir under `.mill/runs/<id>/workdir/`. Otherwise the repo
+// already has code the user will want mill to edit — route through edit
 // mode with a git worktree.
 export async function detectRunMode(root: string): Promise<RunMode> {
   const state = await inspectRepoState(root);

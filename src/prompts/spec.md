@@ -12,9 +12,9 @@ produce here. Treat this as the single source of truth for the run.
   Code auto-loads this into your context. Treat it as ground truth for
   conventions, constraints, and do-not-touch lists. Your spec must not
   contradict it.
-- Optional df blocks prepended to the user message: repo profile, recurring
+- Optional mill blocks prepended to the user message: repo profile, recurring
   findings (ledger), prior decisions, journal of past runs. These complement
-  CLAUDE.md; they do not replace it. If CLAUDE.md contradicts a df block,
+  CLAUDE.md; they do not replace it. If CLAUDE.md contradicts a mill block,
   CLAUDE.md wins.
 
 ## Your job

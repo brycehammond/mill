@@ -1,13 +1,13 @@
-// Per-project journal of df activity. One stanza per completed run,
+// Per-project journal of mill activity. One stanza per completed run,
 // appended by the deliver stage. Spec and design stages read the tail
 // and inject it into their prompts so successive runs build on prior
-// context. Stored as markdown at `.df/journal.md`; entries are
+// context. Stored as markdown at `.mill/journal.md`; entries are
 // separated by `\n---\n` so they can be tailed by splitting on that
 // delimiter.
 
 import { readFile, appendFile, writeFile, access } from "node:fs/promises";
 import { join } from "node:path";
-import { projectDfDir } from "./project.js";
+import { projectMillDir } from "./project.js";
 import type { RunMode } from "./types.js";
 
 export interface JournalEntry {
@@ -23,7 +23,7 @@ export interface JournalEntry {
 const DELIMITER = "\n---\n";
 
 export function journalPath(root: string): string {
-  return join(projectDfDir(root), "journal.md");
+  return join(projectMillDir(root), "journal.md");
 }
 
 async function fileExists(p: string): Promise<boolean> {
@@ -50,7 +50,7 @@ export async function readJournalTail(root: string, n = 20): Promise<string> {
   const stanzas = raw.split(DELIMITER).map((s) => s.trim()).filter(Boolean);
   const tail = stanzas.slice(-n);
   if (tail.length === 0) return "";
-  return `## Prior df activity on this repo\n\n${tail.join(DELIMITER)}\n`;
+  return `## Prior mill activity on this repo\n\n${tail.join(DELIMITER)}\n`;
 }
 
 export async function appendJournalEntry(

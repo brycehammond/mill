@@ -38,7 +38,7 @@ export async function designUi(ctx: RunContext): Promise<StageResult> {
   // Stitch MCP is expected to be configured in the user's global Claude
   // settings. We pull it in via `inheritUserMcps` rather than
   // `settingSources: ["user"]` so user-level hooks (Stop, PostToolUse,
-  // etc.) do NOT fire during df stages — MCPs without hooks.
+  // etc.) do NOT fire during mill stages — MCPs without hooks.
   const res = await runClaude({
     ctx,
     stage: "design",

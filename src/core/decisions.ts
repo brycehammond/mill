@@ -1,7 +1,7 @@
 // Per-project decision log (ADR-lite). Appended to by a sub-stage
 // that runs after deliver. Spec and design (edit-mode) read the tail
 // and inject it so future runs don't quietly revert design trade-offs
-// that were already debated. Lives at `.df/decisions.md`; entries
+// that were already debated. Lives at `.mill/decisions.md`; entries
 // separated by `\n---\n` so they can be tailed by splitting.
 //
 // Relationship to the other memory files:
@@ -11,7 +11,7 @@
 
 import { readFile, appendFile, writeFile, access } from "node:fs/promises";
 import { join } from "node:path";
-import { projectDfDir } from "./project.js";
+import { projectMillDir } from "./project.js";
 
 export interface DecisionEntry {
   isoDate: string;
@@ -27,7 +27,7 @@ export interface DecisionEntry {
 const DELIMITER = "\n---\n";
 
 export function decisionsPath(root: string): string {
-  return join(projectDfDir(root), "decisions.md");
+  return join(projectMillDir(root), "decisions.md");
 }
 
 async function fileExists(p: string): Promise<boolean> {

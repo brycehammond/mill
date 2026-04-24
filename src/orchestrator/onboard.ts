@@ -1,6 +1,6 @@
-// `df onboard` entrypoint. Runs a one-shot `claude` invocation against
+// `mill onboard` entrypoint. Runs a one-shot `claude` invocation against
 // the project root with Read/Glob/Grep access, produces a structured
-// ProfileData, and persists it to `.df/profile.md` + `.df/profile.json`.
+// ProfileData, and persists it to `.mill/profile.md` + `.mill/profile.json`.
 //
 // The result is auto-injected into spec, design, and implement
 // prompts on every subsequent run, replacing the per-run rediscovery

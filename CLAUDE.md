@@ -4,21 +4,21 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-`dark-factory` is a Node/TypeScript harness that `spawn`s the `claude` CLI for each pipeline stage (spec → design → (spec2tests?) → implement ⇄ review → verify → deliver → decisions). The harness does **not** call the Anthropic API directly — `claude` does. Our job is orchestration, sandboxing, budget/kill enforcement, and SQLite persistence. `README.md` has the user-facing tour; this file is for contributors.
+`mill` is a Node/TypeScript harness that `spawn`s the `claude` CLI for each pipeline stage (spec → design → (spec2tests?) → implement ⇄ review → verify → deliver → decisions). The binary is `mill`. The harness does **not** call the Anthropic API directly — `claude` does. Our job is orchestration, sandboxing, budget/kill enforcement, and SQLite persistence. `README.md` has the user-facing tour; this file is for contributors.
 
 ## Commands
 
 ```sh
-npm run df -- init           # one-time: create .df/ at the git repo root
-npm run df -- new "..."      # start a new run (prompts for clarifications inline)
-npm run df -- run <run-id>   # resume a partially-completed run
-npm run df -- status [id]    # inspect state
-npm run df -- tail <id>      # human-readable activity stream
-npm run df -- logs <id>      # raw events
-npm run df -- kill <id>      # writes .df/runs/<id>/KILLED sentinel
-npm run df -- onboard        # one-shot repo profile → .df/profile.json
-npm run df -- findings       # recurring findings across runs (ledger)
-npm run df -- history        # print .df/journal.md
+npm run mill -- init           # one-time: create .mill/ at the git repo root
+npm run mill -- new "..."      # start a new run (prompts for clarifications inline)
+npm run mill -- run <run-id>   # resume a partially-completed run
+npm run mill -- status [id]    # inspect state
+npm run mill -- tail <id>      # human-readable activity stream
+npm run mill -- logs <id>      # raw events
+npm run mill -- kill <id>      # writes .mill/runs/<id>/KILLED sentinel
+npm run mill -- onboard        # one-shot repo profile → .mill/profile.json
+npm run mill -- findings       # recurring findings across runs (ledger)
+npm run mill -- history        # print .mill/journal.md
 npm run worker               # long-running process that picks up queued runs
 
 npm run typecheck            # tsc --noEmit
@@ -40,7 +40,7 @@ There is no test runner yet. `npm run typecheck` is the verification pass.
 
 `src/orchestrator/pipeline.ts` is the driver. Four properties are load-bearing:
 
-1. **Crash recovery is stage-idempotent.** `needsStage(ctx, name)` checks `store.getStage(...).status === "completed"` and skips. The CLI can invoke `df run <id>` at any point and the pipeline picks up where it left off. New stages must persist completion through `store.finishStage(...)` or they will rerun forever on resume.
+1. **Crash recovery is stage-idempotent.** `needsStage(ctx, name)` checks `store.getStage(...).status === "completed"` and skips. The CLI can invoke `mill run <id>` at any point and the pipeline picks up where it left off. New stages must persist completion through `store.finishStage(...)` or they will rerun forever on resume.
 
 2. **Stage finalization is transactional.** Cost tally (`addRunCost`), session id (`saveSession`), and `finishStage` must commit together via `store.transaction(() => { ... })`. A crash between these calls on resume would double-bill or lose the session id. `claude-cli.ts` adds cost to the in-memory `BudgetTracker` but deliberately does *not* touch the DB — that's the caller's responsibility inside the transaction.
 
@@ -55,8 +55,18 @@ There is no test runner yet. `npm run typecheck` is the verification pass.
 Critics run via `Promise.allSettled` — one critic crashing does not kill the review; it's logged and the stage is marked failed while still producing a findings report. There are five critics, not all LLM-backed:
 
 - `security`, `correctness`, `ux` — Claude, read-only (`Read`/`Glob`/`Grep`/`Bash`), routed through `critics/shared.ts::runCritic`.
-- `tests` — **mechanical**. Runs `.df/profile.json`'s test command as a subprocess; non-zero exit → HIGH finding. Auto-off if the profile lacks a test command. Same `CriticResult` contract so `review.ts` aggregates it uniformly.
-- `adversarial` — optional, gated on `DF_ADVERSARIAL_REVIEW=auto|on|off` plus both the Codex plugin and the `codex` CLI being available. Billing is on the codex side and usage is reported as zero in `TokenUsage`.
+- `tests` — **mechanical**. Runs `.mill/profile.json`'s test command as a subprocess; non-zero exit → HIGH finding. Auto-off if the profile lacks a test command. Same `CriticResult` contract so `review.ts` aggregates it uniformly.
+- `adversarial` — optional, gated on `MILL_ADVERSARIAL_REVIEW=auto|on|off` plus both the Codex plugin and the `codex` CLI being available. Billing is on the codex side and usage is reported as zero in `TokenUsage`.
+
+### Team-mode review (MILL_AGENT_TEAMS)
+
+The three LLM critics (`security`, `correctness`, `ux`) have a second execution path: one `claude` subprocess plays "review lead," calls `TeamCreate`, and spawns each critic as a teammate via `Agent(team_name=..., subagent_type="security"|...)`. Teammates share session state and can cross-reference each other's findings mid-work via `SendMessage` — the per-subprocess path can't. `critics/team-review.ts` drives this; `prompts/review-lead.md` is the lead persona; `prompts/critic-*.md` are pushed into the session as custom subagents via the `--agents <json>` CLI flag (the JSON rejects `tools` as a comma-string — must be an array).
+
+`MILL_AGENT_TEAMS=auto|on|off` picks the path. `auto` (default) tries team mode and quietly falls back to `Promise.allSettled([securityCritic, correctnessCritic, uxCritic])` on any failure. `on` hard-fails the review stage if team mode errors. `off` skips team mode entirely. `tests` and `adversarial` never go through the team — `tests` is mechanical and `adversarial` is codex-backed.
+
+Two capability trade-offs to know about:
+1. **Session slots collapse.** Per-subprocess mode persists `review:security`, `review:correctness`, `review:ux` so each critic resumes iteration-to-iteration. Team mode persists a single `review:lead` slot; the lead carries prior-iteration context and re-briefs fresh critics each time. Keep this in mind if you add a new slot key — don't assume per-critic resume exists in team mode.
+2. **Per-critic cost attribution is lost.** The lead subprocess emits one `total_cost_usd` covering itself + the three critics. Run-level cost is still correct; per-critic cost reporting (tail/status) shows it all under the lead session. Document any new per-critic cost metric as "subprocess-path-only."
 
 ## Structured output from `claude`
 
@@ -64,12 +74,12 @@ Stages that need JSON pass a `jsonSchema` (zod → `zod-to-json-schema`) to `run
 
 ## Per-run sandbox
 
-`run-settings.ts` writes `.df/runs/<id>/workdir/.claude/settings.json` with a `PreToolUse` hook pointing at `guard.ts` (dev: `tsx guard.ts`; prod: `node guard.js`, toggled by `isSourceMode`). Two things about this are easy to miss:
+`run-settings.ts` writes `.mill/runs/<id>/workdir/.claude/settings.json` with a `PreToolUse` hook pointing at `guard.ts` (dev: `tsx guard.ts`; prod: `node guard.js`, toggled by `isSourceMode`). Two things about this are easy to miss:
 
 - Claude Code's `--setting-sources project` reads `.claude/settings.json` from **cwd only**, not walking up. The file must live in the workdir, not in a parent. (Verified against claude 2.1.117 on 2026-04-22.)
-- `guard.ts` runs **on every tool call** of every `claude` subprocess. Keep it dependency-free — no imports from `src/core/`. It reads state from env vars (`DF_RUN_KILLED`, `DF_WORKDIR`, `DF_EXTRA_WRITE_DIRS`, `DF_RUN_ID`) set by `claude-cli.ts`. It must fail open on parse/IO errors so a bug in the hook can't brick Claude Code itself.
+- `guard.ts` runs **on every tool call** of every `claude` subprocess. Keep it dependency-free — no imports from `src/core/`. It reads state from env vars (`MILL_RUN_KILLED`, `MILL_WORKDIR`, `MILL_EXTRA_WRITE_DIRS`, `MILL_RUN_ID`) set by `claude-cli.ts`. It must fail open on parse/IO errors so a bug in the hook can't brick Claude Code itself.
 
-Stages that legitimately write outside the workdir (e.g. verify writes into `.df/runs/<id>/verify/`) declare those paths via `extraWriteDirs`, which becomes `DF_EXTRA_WRITE_DIRS` (colon-separated).
+Stages that legitimately write outside the workdir (e.g. verify writes into `.mill/runs/<id>/verify/`) declare those paths via `extraWriteDirs`, which becomes `MILL_EXTRA_WRITE_DIRS` (colon-separated).
 
 ### Two layers of command restriction
 
@@ -77,7 +87,7 @@ Destructive-command blocking (`sudo`, `rm -rf /`, fork bomb) lives **only** in `
 
 ## MCPs without user hooks
 
-UI stages (design-ui, verify for kind=ui) need user-level MCP servers like Stitch and Playwright, but pulling them in via `settingSources: ["user", "project"]` would also drag in the user's global `UserPromptSubmit`/`Stop`/`PostToolUse` hooks — potentially exfiltrating run data to the user's Slack/webhook integrations. Instead, these stages pass `inheritUserMcps: true` to `runClaude`, which loads `~/.claude/settings.json` (or `~/.claude.json`) via `--mcp-config` + `--strict-mcp-config`. Only the `mcpServers` field is consumed; hooks in the same file are ignored. Override the source path with `DF_USER_MCP_CONFIG`.
+UI stages (design-ui, verify for kind=ui) need user-level MCP servers like Stitch and Playwright, but pulling them in via `settingSources: ["user", "project"]` would also drag in the user's global `UserPromptSubmit`/`Stop`/`PostToolUse` hooks — potentially exfiltrating run data to the user's Slack/webhook integrations. Instead, these stages pass `inheritUserMcps: true` to `runClaude`, which loads `~/.claude/settings.json` (or `~/.claude.json`) via `--mcp-config` + `--strict-mcp-config`. Only the `mcpServers` field is consumed; hooks in the same file are ignored. Override the source path with `MILL_USER_MCP_CONFIG`.
 
 ## Session slots
 
@@ -85,18 +95,18 @@ Each stage persists a `session_id` via `store.saveSession(runId, slot, ...)`. Sl
 
 ## Cross-run memory
 
-Three files at the project root under `.df/` accumulate state that future runs auto-inject into their prompts. When adding a new stage that takes spec/design as input, match the existing pattern: read these (via `readJournalTail`, `readDecisionsTail`, `renderLedgerHint`) and prepend to the prompt body.
+Three files at the project root under `.mill/` accumulate state that future runs auto-inject into their prompts. When adding a new stage that takes spec/design as input, match the existing pattern: read these (via `readJournalTail`, `readDecisionsTail`, `renderLedgerHint`) and prepend to the prompt body.
 
-- **`.df/journal.md`** — one stanza per completed run. Written by `stages/deliver.ts`. Entries are `\n---\n`-delimited. A write failure is caught and logged but does not fail the run.
-- **`.df/decisions.md`** — ADR-lite trade-off log. Written by `stages/decisions.ts` post-deliver, strictly gated (must cite a finding fingerprint, spec criterion, or external constraint — zero entries is the common case). Same delimiter convention.
+- **`.mill/journal.md`** — one stanza per completed run. Written by `stages/deliver.ts`. Entries are `\n---\n`-delimited. A write failure is caught and logged but does not fail the run.
+- **`.mill/decisions.md`** — ADR-lite trade-off log. Written by `stages/decisions.ts` post-deliver, strictly gated (must cite a finding fingerprint, spec criterion, or external constraint — zero entries is the common case). Same delimiter convention.
 - **findings ledger** — aggregated from the `findings` SQLite table via `store.listLedgerEntries(...)` and rendered by `core/ledger.ts::renderLedgerHint`. Edit-mode only — surfaces recurring issues so the implementer preempts them.
-- **`.df/profile.json`** — repo profile written by `df onboard` (`orchestrator/onboard.ts`). Not per-run; refresh with `df onboard --refresh`. Rendered into prompts via `readProfileSummary`.
+- **`.mill/profile.json`** — repo profile written by `mill onboard` (`orchestrator/onboard.ts`). Not per-run; refresh with `mill onboard --refresh`. Rendered into prompts via `readProfileSummary`.
 
-### CLAUDE.md is loaded by claude, not by df
+### CLAUDE.md is loaded by claude, not by mill
 
-Claude Code auto-discovers `CLAUDE.md` from cwd upward (verified: finds project-root `CLAUDE.md` even from deep workdirs like `.df/runs/<id>/workdir/`). **df must not inject CLAUDE.md content into the user prompt** — it would be double-exposed to the model. Instead, the stage prompts (`spec.md`, `design-arch.md`, `implement.md`, the three LLM critics, `onboard.md`) explicitly tell the model "treat CLAUDE.md as ground truth; any df block that disagrees with it loses." If you add a new stage prompt that cares about repo conventions, follow the same pattern: *reference* CLAUDE.md, don't read or inject it.
+Claude Code auto-discovers `CLAUDE.md` from cwd upward (verified: finds project-root `CLAUDE.md` even from deep workdirs like `.mill/runs/<id>/workdir/`). **mill must not inject CLAUDE.md content into the user prompt** — it would be double-exposed to the model. Instead, the stage prompts (`spec.md`, `design-arch.md`, `implement.md`, the three LLM critics, `onboard.md`) explicitly tell the model "treat CLAUDE.md as ground truth; any mill block that disagrees with it loses." If you add a new stage prompt that cares about repo conventions, follow the same pattern: *reference* CLAUDE.md, don't read or inject it.
 
-This holds for both `--append-system-prompt` and `--system-prompt` (replace mode used by critics). Only `--bare` disables CLAUDE.md auto-discovery; df never uses that flag.
+This holds for both `--append-system-prompt` and `--system-prompt` (replace mode used by critics). Only `--bare` disables CLAUDE.md auto-discovery; mill never uses that flag.
 
 ## Prompts
 
@@ -108,4 +118,4 @@ This holds for both `--append-system-prompt` and `--system-prompt` (replace mode
 
 ## Environment knobs
 
-All config is env-driven via `orchestrator/config.ts`. Defaults live there. `.env.example` documents them. `DF_ROOT` controls where `.df/` is discovered from — important if you run the worker from a different cwd than the checkout. Other sub-stage gates: `DF_ADVERSARIAL_REVIEW`, `DF_TESTS_CRITIC`, `DF_SPEC2TESTS` — all accept `auto|on|off`, where `on` turns a missing dependency into a hard failure rather than a skip. `DF_USER_MCP_CONFIG` overrides the path df reads MCPs from when `inheritUserMcps: true` is passed.
+All config is env-driven via `orchestrator/config.ts`. Defaults live there. `.env.example` documents them. `MILL_ROOT` controls where `.mill/` is discovered from — important if you run the worker from a different cwd than the checkout. Other sub-stage gates: `MILL_ADVERSARIAL_REVIEW`, `MILL_TESTS_CRITIC`, `MILL_SPEC2TESTS`, `MILL_AGENT_TEAMS` — all accept `auto|on|off`, where `on` turns a missing dependency (or in the teams case, a failure) into a hard failure rather than a skip/fallback. `MILL_USER_MCP_CONFIG` overrides the path mill reads MCPs from when `inheritUserMcps: true` is passed.

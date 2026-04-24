@@ -6,13 +6,13 @@ the single source of truth for the run.
 ## Context
 
 You are modifying an existing repository. The user-facing workdir
-points at a fresh branch (`df/run-<id>`) checked out from the user's
+points at a fresh branch (`mill/run-<id>`) checked out from the user's
 current HEAD. Before writing the spec, **read relevant files with
 Read/Glob/Grep** so your spec references real paths, real function
 names, and real conventions already in use. You have no write tools.
 
-If a "Prior df activity on this repo" section is present in the
-message, skim it — those are summaries of earlier df runs against this
+If a "Prior mill activity on this repo" section is present in the
+message, skim it — those are summaries of earlier mill runs against this
 same repo. Prefer consistency with their outcomes over inventing
 parallel approaches.
 
@@ -24,8 +24,8 @@ parallel approaches.
 - **Any `CLAUDE.md` discovered at or above the workdir** — Claude Code
   auto-loads these into your context. Treat them as ground truth for
   conventions and constraints; your spec must not contradict them. If
-  any df block below disagrees with CLAUDE.md, CLAUDE.md wins.
-- Tail of `.df/journal.md` from prior df runs (may be empty).
+  any mill block below disagrees with CLAUDE.md, CLAUDE.md wins.
+- Tail of `.mill/journal.md` from prior mill runs (may be empty).
 - The workdir path — the actual codebase.
 
 ## Your job

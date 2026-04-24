@@ -10,7 +10,7 @@ const LEVEL_ORDER: Record<Level, number> = {
 };
 
 function levelFromEnv(): Level {
-  const v = (process.env.DF_LOG_LEVEL ?? "info").toLowerCase();
+  const v = (process.env.MILL_LOG_LEVEL ?? "info").toLowerCase();
   if (v === "debug" || v === "info" || v === "warn" || v === "error") return v;
   return "info";
 }

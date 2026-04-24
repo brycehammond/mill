@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // Standalone PreToolUse hook invoked by the `claude` CLI on every tool call.
 // Reads the hook payload from stdin, consults env vars set by claude-cli.ts
-// (DF_RUN_KILLED, DF_WORKDIR, DF_RUN_ID), and emits a JSON decision.
+// (MILL_RUN_KILLED, MILL_WORKDIR, MILL_RUN_ID), and emits a JSON decision.
 //
 // Runs many times per run — keep it cheap and dependency-free (no core/ imports).
 //
@@ -13,7 +13,7 @@ import { existsSync, appendFileSync } from "node:fs";
 import { resolve } from "node:path";
 
 function trace(msg: string): void {
-  const path = process.env.DF_GUARD_TRACE;
+  const path = process.env.MILL_GUARD_TRACE;
   if (!path) return;
   try {
     appendFileSync(path, `${new Date().toISOString()} ${msg}\n`);
@@ -64,21 +64,21 @@ async function main(): Promise<void> {
     }
   }
 
-  const runKilled = process.env.DF_RUN_KILLED;
+  const runKilled = process.env.MILL_RUN_KILLED;
   if (runKilled && existsSync(runKilled)) {
     reply({
       decision: "block",
-      reason: `run ${process.env.DF_RUN_ID ?? ""} killed by sentinel`,
+      reason: `run ${process.env.MILL_RUN_ID ?? ""} killed by sentinel`,
     });
     return;
   }
 
   const toolName = input.tool_name;
   const toolInput = input.tool_input ?? {};
-  const workdir = process.env.DF_WORKDIR;
-  // DF_EXTRA_WRITE_DIRS: colon-separated allow-list for stages that need to
+  const workdir = process.env.MILL_WORKDIR;
+  // MILL_EXTRA_WRITE_DIRS: colon-separated allow-list for stages that need to
   // write outside the workdir (verify stage writes into runs/<id>/verify/).
-  const extraDirs = (process.env.DF_EXTRA_WRITE_DIRS ?? "")
+  const extraDirs = (process.env.MILL_EXTRA_WRITE_DIRS ?? "")
     .split(":")
     .filter(Boolean);
   const allowedWriteDirs = [workdir, ...extraDirs].filter(
@@ -115,6 +115,6 @@ async function main(): Promise<void> {
 main().catch((err) => {
   // Never crash — fail open. Our job is to be a permissive sandbox, not a
   // bottleneck. Log to stderr for observability.
-  process.stderr.write(`df-guard: ${String(err)}\n`);
+  process.stderr.write(`mill-guard: ${String(err)}\n`);
   reply({});
 });

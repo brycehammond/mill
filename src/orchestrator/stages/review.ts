@@ -23,6 +23,7 @@ import {
 } from "../critics/adversarial.js";
 import { testsCritic } from "../critics/tests.js";
 import type { CriticResult } from "../critics/shared.js";
+import { runTeamReview, type TeamReviewOutput } from "../critics/team-review.js";
 
 export interface ReviewArgs {
   ctx: RunContext;
@@ -40,7 +41,7 @@ export interface ReviewOutput {
 // Run the critics in parallel, aggregate their findings, write a
 // per-iteration index. The first three (security/correctness/ux) always
 // run; a fourth "adversarial" critic backed by `/codex:adversarial-review`
-// joins the pool when DF_ADVERSARIAL_REVIEW allows and the Codex plugin
+// joins the pool when MILL_ADVERSARIAL_REVIEW allows and the Codex plugin
 // is configured. Returns the HIGH/CRITICAL list that feeds the next
 // implement iteration.
 export async function review(args: ReviewArgs): Promise<StageResult & { data: ReviewOutput }> {
@@ -53,20 +54,45 @@ export async function review(args: ReviewArgs): Promise<StageResult & { data: Re
       : await readFile(ctx.paths.architecture, "utf8").catch(() => "");
 
     const shared = { ctx, iteration, specBody, designBody };
-    const critics: Promise<CriticResult>[] = [
-      securityCritic(shared),
-      correctnessCritic(shared),
-      uxCritic(shared),
-    ];
-    const names: CriticName[] = ["security", "correctness", "ux"];
+
+    // Decide up front whether the three LLM critics (security/correctness/ux)
+    // run as a Claude Code agent team (one subprocess, cross-critic chatter)
+    // or as independent subprocesses (today's behavior, one subprocess each).
+    // tests + adversarial never go through the team — tests is mechanical,
+    // adversarial is codex-backed.
+    const teamsMode = resolveAgentTeamsMode();
+    let teamOutcome: TeamOutcome | null = null;
+    if (teamsMode !== "off") {
+      try {
+        const teamResult = await runTeamReview(shared);
+        teamOutcome = { ok: true, output: teamResult };
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        if (teamsMode === "on") {
+          // Hard mode: surface the failure instead of quietly falling back.
+          throw new Error(`MILL_AGENT_TEAMS=on but team review failed: ${msg}`);
+        }
+        ctx.logger.warn("team review failed — falling back to per-critic subprocesses", {
+          err: msg,
+        });
+        teamOutcome = { ok: false };
+      }
+    }
+
+    const critics: Promise<CriticResult>[] = [];
+    const names: CriticName[] = [];
+    if (!teamOutcome?.ok) {
+      critics.push(securityCritic(shared), correctnessCritic(shared), uxCritic(shared));
+      names.push("security", "correctness", "ux");
+    }
 
     // The tests critic runs the repo's real test command (from the
     // profile) and turns failures into HIGH findings. Only activates
     // when a profile exists AND has a test command set. Opt-out with
-    // DF_TESTS_CRITIC=off. Typically only meaningful in edit mode —
+    // MILL_TESTS_CRITIC=off. Typically only meaningful in edit mode —
     // new-mode scaffolds don't have an external profile, though they
-    // could if the user ran `df onboard` on the enclosing project
-    // before `df new`.
+    // could if the user ran `mill onboard` on the enclosing project
+    // before `mill new`.
     const testsMode = resolveTestsMode();
     if (testsMode !== "off") {
       const profile = await readProfile(ctx.root);
@@ -75,7 +101,7 @@ export async function review(args: ReviewArgs): Promise<StageResult & { data: Re
         names.push("tests");
       } else if (testsMode === "on") {
         throw new Error(
-          "DF_TESTS_CRITIC=on but no test command in .df/profile.json — run `df onboard` first",
+          "MILL_TESTS_CRITIC=on but no test command in .mill/profile.json — run `mill onboard` first",
         );
       }
     }
@@ -96,7 +122,7 @@ export async function review(args: ReviewArgs): Promise<StageResult & { data: Re
           ? availability.reason
           : "codex CLI not found on PATH";
         throw new Error(
-          `DF_ADVERSARIAL_REVIEW=on but adversarial critic unavailable: ${reason}`,
+          `MILL_ADVERSARIAL_REVIEW=on but adversarial critic unavailable: ${reason}`,
         );
       } else {
         ctx.logger.debug("adversarial critic skipped", {
@@ -114,6 +140,17 @@ export async function review(args: ReviewArgs): Promise<StageResult & { data: Re
     let cost = 0;
     let usage: TokenUsage = { ...ZERO_USAGE };
     let anyFailed = false;
+
+    // Fold team-mode output in first so per-critic order in the summary
+    // stays consistent (security → correctness → ux → tests → adversarial).
+    if (teamOutcome?.ok) {
+      findings.push(...teamOutcome.output.findings);
+      summaries.push(...teamOutcome.output.summaries);
+      reportPaths.push(...teamOutcome.output.reportPaths);
+      cost += teamOutcome.output.cost;
+      usage = sumUsage(usage, teamOutcome.output.usage);
+      if (teamOutcome.output.anyFailed) anyFailed = true;
+    }
 
     settled.forEach((r, i) => {
       if (r.status === "fulfilled") {
@@ -222,10 +259,23 @@ function sumUsage(a: TokenUsage, b: TokenUsage): TokenUsage {
   };
 }
 
+type TeamOutcome =
+  | { ok: true; output: TeamReviewOutput }
+  | { ok: false };
+
+type AgentTeamsMode = "auto" | "on" | "off";
+
+function resolveAgentTeamsMode(): AgentTeamsMode {
+  const raw = (process.env.MILL_AGENT_TEAMS ?? "auto").trim().toLowerCase();
+  if (raw === "on" || raw === "true" || raw === "1") return "on";
+  if (raw === "off" || raw === "false" || raw === "0") return "off";
+  return "auto";
+}
+
 type AdversarialMode = "auto" | "on" | "off";
 
 function resolveAdversarialMode(): AdversarialMode {
-  const raw = (process.env.DF_ADVERSARIAL_REVIEW ?? "auto").trim().toLowerCase();
+  const raw = (process.env.MILL_ADVERSARIAL_REVIEW ?? "auto").trim().toLowerCase();
   if (raw === "on" || raw === "true" || raw === "1") return "on";
   if (raw === "off" || raw === "false" || raw === "0") return "off";
   return "auto";
@@ -234,7 +284,7 @@ function resolveAdversarialMode(): AdversarialMode {
 type TestsMode = "auto" | "on" | "off";
 
 function resolveTestsMode(): TestsMode {
-  const raw = (process.env.DF_TESTS_CRITIC ?? "auto").trim().toLowerCase();
+  const raw = (process.env.MILL_TESTS_CRITIC ?? "auto").trim().toLowerCase();
   if (raw === "on" || raw === "true" || raw === "1") return "on";
   if (raw === "off" || raw === "false" || raw === "0") return "off";
   return "auto";

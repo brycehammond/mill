@@ -1,9 +1,9 @@
-// Per-project "profile" produced by `df onboard`. A one-time
+// Per-project "profile" produced by `mill onboard`. A one-time
 // discovery pass that records the codebase's stack, command set, and
 // conventions so that every run that follows can inject that summary
 // into stage prompts instead of re-discovering it turn by turn.
 //
-// Two files live next to each other in `.df/`:
+// Two files live next to each other in `.mill/`:
 // - `profile.md`  — human-readable + prompt-injectable
 // - `profile.json`— structured fields the pipeline accesses
 //                   programmatically (e.g. `commands.test` for the
@@ -11,7 +11,7 @@
 
 import { readFile, writeFile, access } from "node:fs/promises";
 import { join } from "node:path";
-import { projectDfDir } from "./project.js";
+import { projectMillDir } from "./project.js";
 
 export interface ProfileCommands {
   test: string | null;
@@ -42,11 +42,11 @@ const JSON_FILENAME = "profile.json";
 const MD_FILENAME = "profile.md";
 
 export function profileJsonPath(root: string): string {
-  return join(projectDfDir(root), JSON_FILENAME);
+  return join(projectMillDir(root), JSON_FILENAME);
 }
 
 export function profileMdPath(root: string): string {
-  return join(projectDfDir(root), MD_FILENAME);
+  return join(projectMillDir(root), MD_FILENAME);
 }
 
 async function fileExists(p: string): Promise<boolean> {

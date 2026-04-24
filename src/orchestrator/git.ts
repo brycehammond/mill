@@ -23,8 +23,8 @@ export async function gitInit(cwd: string): Promise<void> {
 // to the (work)tree and appendFile on info/exclude is idempotent
 // modulo duplicate lines, which git tolerates.
 export async function configureGitIdentity(cwd: string): Promise<void> {
-  await git(cwd, ["config", "user.email", "df@dark-factory.local"]);
-  await git(cwd, ["config", "user.name", "dark-factory"]);
+  await git(cwd, ["config", "user.email", "mill@mill.local"]);
+  await git(cwd, ["config", "user.name", "mill"]);
   await git(cwd, ["config", "commit.gpgsign", "false"]);
   // Never commit the harness's per-run .claude/ sandbox config — it's
   // injected at run time, not part of the delivered artifact.
@@ -37,7 +37,7 @@ export async function configureGitIdentity(cwd: string): Promise<void> {
   const excludeAbs = excludeRel.startsWith("/") ? excludeRel : join(cwd, excludeRel);
   await appendFile(
     excludeAbs,
-    "\n# dark-factory harness sandbox — do not commit\n.claude/\n.df/\n",
+    "\n# mill harness sandbox — do not commit\n.claude/\n.mill/\n",
     "utf8",
   );
 }

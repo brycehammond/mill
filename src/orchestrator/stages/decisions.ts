@@ -1,12 +1,12 @@
 // Post-deliver sub-stage: extract 0–3 ADR-lite entries from this run
-// and append them to `.df/decisions.md`. Future runs inject the tail
+// and append them to `.mill/decisions.md`. Future runs inject the tail
 // into their spec + design prompts (see renderDecisionsHint), so
 // non-obvious trade-offs already weighed on this repo aren't silently
 // reversed by an implementer working from a blank spec.
 //
 // This stage is best-effort: a failure here does NOT fail the run.
 // The run has already been delivered (shipped) by the time we run.
-// We still persist a stage row so `df status` shows we tried, and so
+// We still persist a stage row so `mill status` shows we tried, and so
 // the pipeline's crash-recovery path doesn't rerun us forever.
 
 import { execFile } from "node:child_process";
@@ -211,7 +211,7 @@ async function safeRead(path: string): Promise<string> {
 
 function decisionsPathLabel(ctx: RunContext): string {
   // Path relative to the project root, so the stage artifact_path
-  // points at the shared .df/decisions.md rather than the per-run
+  // points at the shared .mill/decisions.md rather than the per-run
   // directory. The file itself is cross-run state.
-  return `${ctx.root}/.df/decisions.md`;
+  return `${ctx.root}/.mill/decisions.md`;
 }

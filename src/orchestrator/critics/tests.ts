@@ -1,5 +1,5 @@
 // The "tests" critic is mechanical, not model-backed. It runs the
-// repo's test command (from `.df/profile.json`) inside the workdir and
+// repo's test command (from `.mill/profile.json`) inside the workdir and
 // turns a non-zero exit into a HIGH finding that feeds back into the
 // review loop. The other critics are Claude calls; this one is a
 // subprocess. Same output contract (CriticResult), so review.ts
@@ -97,7 +97,7 @@ export async function testsCritic(args: TestsCriticArgs): Promise<CriticResult> 
       ),
       suggested_fix:
         "Investigate hanging tests or increase the test timeout; " +
-        "df kills the command after 5 minutes.",
+        "mill kills the command after 5 minutes.",
     });
   } else if (exitCode !== 0) {
     findings.push({

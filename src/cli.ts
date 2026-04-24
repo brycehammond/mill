@@ -72,7 +72,7 @@ async function main() {
     }
   } catch (err) {
     if (err instanceof NoProjectError) {
-      console.error(`df: ${err.message}`);
+      console.error(`mill: ${err.message}`);
       process.exitCode = 1;
       return;
     }
@@ -85,7 +85,7 @@ function preflightClaude(): void {
     execFileSync("claude", ["--version"], { stdio: "ignore" });
   } catch {
     console.error(
-      "df: `claude` CLI not found on PATH.\n" +
+      "mill: `claude` CLI not found on PATH.\n" +
         "Install with: npm i -g @anthropic-ai/claude-code",
     );
     process.exit(1);
@@ -95,32 +95,32 @@ function preflightClaude(): void {
 function printHelp() {
   process.stdout.write(
     [
-      "df — dark factory: a harness around the claude CLI",
+      "mill — a harness around the claude CLI",
       "",
       "usage:",
-      "  df init [<name>]                  # create .df/ in the current git repo",
-      "  df new (<requirement...> | --from <file>) [--mode new|edit|auto]",
+      "  mill init [<name>]                  # create .mill/ in the current git repo",
+      "  mill new (<requirement...> | --from <file>) [--mode new|edit|auto]",
       "         [--stop-after spec|design|spec2tests] [--pr]",
       "         [--detach] [--all-defaults]",
       "    --mode auto (default) detects edit when the repo has committed",
-      "    source; otherwise scaffolds into .df/runs/<id>/workdir/. Edit",
-      "    runs create a df/run-<id> branch via git worktree.",
+      "    source; otherwise scaffolds into .mill/runs/<id>/workdir/. Edit",
+      "    runs create a mill/run-<id> branch via git worktree.",
       "    --stop-after halts the pipeline after the named stage so you can",
-      "    review before paying for the rest. Resume with `df run <id>`.",
+      "    review before paying for the rest. Resume with `mill run <id>`.",
       "    (Unrelated to Claude Code's permissionMode: plan.)",
       "    --pr pushes the branch and opens a GitHub PR via gh (edit only).",
-      "  df run <run-id>                   # resume a run, skipping completed stages",
-      "  df status [<run-id>]",
-      "  df tail <run-id> [--follow]      # human-readable activity stream",
-      "  df logs <run-id> [--follow] [--after <event-id>]  # raw events",
-      "  df kill <run-id>",
-      "  df onboard [--refresh]           # profile the repo once; auto-injected",
+      "  mill run <run-id>                   # resume a run, skipping completed stages",
+      "  mill status [<run-id>]",
+      "  mill tail <run-id> [--follow]      # human-readable activity stream",
+      "  mill logs <run-id> [--follow] [--after <event-id>]  # raw events",
+      "  mill kill <run-id>",
+      "  mill onboard [--refresh]           # profile the repo once; auto-injected",
       "                                    into future spec/design/implement prompts",
-      "  df history                        # print .df/journal.md",
-      "  df findings [--all] [--limit N]  # recurring findings across runs",
-      "  df findings suppress <fingerprint> [--note <text>]",
-      "  df findings unsuppress <fingerprint>",
-      "  df findings suppressed           # list suppressed fingerprints",
+      "  mill history                        # print .mill/journal.md",
+      "  mill findings [--all] [--limit N]  # recurring findings across runs",
+      "  mill findings suppress <fingerprint> [--note <text>]",
+      "  mill findings unsuppress <fingerprint>",
+      "  mill findings suppressed           # list suppressed fingerprints",
       "",
     ].join("\n"),
   );
@@ -137,14 +137,14 @@ async function cmdInit(argv: string[]) {
   const name = values.name ?? positionals[0];
   const result = initProject({ name });
   if (result.created) {
-    console.log(`initialized df project "${result.info.name}" at ${result.projectRoot}`);
+    console.log(`initialized mill project "${result.info.name}" at ${result.projectRoot}`);
   } else {
     console.log(
-      `df project "${result.info.name}" already initialized at ${result.projectRoot} (re-registered)`,
+      `mill project "${result.info.name}" already initialized at ${result.projectRoot} (re-registered)`,
     );
   }
   if (result.gitignoreUpdated) {
-    console.log("added /.df/ to .gitignore");
+    console.log("added /.mill/ to .gitignore");
   }
 }
 
@@ -167,7 +167,7 @@ async function cmdNew(argv: string[]) {
 
   if (fromPath && positionalText) {
     console.error(
-      "df new: pass the requirement either positionally or via --from, not both",
+      "mill new: pass the requirement either positionally or via --from, not both",
     );
     process.exitCode = 2;
     return;
@@ -175,7 +175,7 @@ async function cmdNew(argv: string[]) {
 
   const rawMode = (values.mode ?? "auto").toLowerCase();
   if (rawMode !== "auto" && rawMode !== "new" && rawMode !== "edit") {
-    console.error(`df new: --mode must be auto|new|edit, got "${values.mode}"`);
+    console.error(`mill new: --mode must be auto|new|edit, got "${values.mode}"`);
     process.exitCode = 2;
     return;
   }
@@ -186,7 +186,7 @@ async function cmdNew(argv: string[]) {
       requirement = (await readFile(fromPath, "utf8")).trim();
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
-      console.error(`df new: could not read --from ${fromPath}: ${msg}`);
+      console.error(`mill new: could not read --from ${fromPath}: ${msg}`);
       process.exitCode = 2;
       return;
     }
@@ -197,8 +197,8 @@ async function cmdNew(argv: string[]) {
   if (!requirement) {
     console.error(
       fromPath
-        ? `df new: --from file ${fromPath} is empty`
-        : "df new: requirement is required",
+        ? `mill new: --from file ${fromPath} is empty`
+        : "mill new: requirement is required",
     );
     process.exitCode = 2;
     return;
@@ -213,17 +213,17 @@ async function cmdNew(argv: string[]) {
     rawMode === "auto" ? await detectRunMode(config.root) : (rawMode as RunMode);
   const prFlag = Boolean(values.pr);
   if (prFlag && effectiveMode === "new") {
-    console.error("df new: --pr requires edit mode");
+    console.error("mill new: --pr requires edit mode");
     process.exitCode = 2;
     return;
   }
 
   if (rawMode === "auto") {
     console.log(
-      `df: auto-detected mode=${effectiveMode}. Override with --mode new|edit.`,
+      `mill: auto-detected mode=${effectiveMode}. Override with --mode new|edit.`,
     );
   } else {
-    console.log(`df: mode=${effectiveMode}`);
+    console.log(`mill: mode=${effectiveMode}`);
   }
 
   let intakeResult;
@@ -237,7 +237,7 @@ async function cmdNew(argv: string[]) {
     });
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
-    console.error(`df new: intake failed: ${msg}`);
+    console.error(`mill new: intake failed: ${msg}`);
     process.exitCode = 1;
     return;
   }
@@ -302,7 +302,7 @@ async function cmdNew(argv: string[]) {
       console.log(`architecture: ${paths.architecture}`);
     }
     console.log(`\nreview those files, then continue with:`);
-    console.log(`  df run ${runId}`);
+    console.log(`  mill run ${runId}`);
   } else {
     console.log(`\ndelivery: ${paths.delivery}`);
     console.log(`workdir:  ${paths.workdir}`);
@@ -317,7 +317,7 @@ function resolveStopAfter(raw: string | undefined): StopStage | undefined | "err
   if (!v) return undefined;
   if (!STOP_STAGES.includes(v as StopStage)) {
     console.error(
-      `df new: --stop-after must be one of ${STOP_STAGES.join("|")}, got "${v}"`,
+      `mill new: --stop-after must be one of ${STOP_STAGES.join("|")}, got "${v}"`,
     );
     return "error";
   }
@@ -327,7 +327,7 @@ function resolveStopAfter(raw: string | undefined): StopStage | undefined | "err
 async function cmdRun(argv: string[]) {
   const runId = argv[0];
   if (!runId) {
-    console.error("df run: run-id required");
+    console.error("mill run: run-id required");
     process.exitCode = 2;
     return;
   }
@@ -429,17 +429,17 @@ async function cmdOnboard(argv: string[]) {
   const refresh = Boolean(values.refresh);
   console.log(
     refresh
-      ? "df onboard: refreshing profile (reading repo, calling claude)…"
-      : "df onboard: checking for existing profile…",
+      ? "mill onboard: refreshing profile (reading repo, calling claude)…"
+      : "mill onboard: checking for existing profile…",
   );
   const result = await onboard({ refresh });
   if (result.cached) {
-    console.log("profile already exists. Run `df onboard --refresh` to rebuild.");
+    console.log("profile already exists. Run `mill onboard --refresh` to rebuild.");
     return;
   }
   const config = loadConfig();
   console.log(
-    `profile written: ${config.root}/.df/profile.md`,
+    `profile written: ${config.root}/.mill/profile.md`,
   );
   console.log(`cost: $${result.costUsd.toFixed(4)}  duration: ${(result.durationMs / 1000).toFixed(1)}s`);
   console.log(`stack: ${result.profile.stack}`);
@@ -457,7 +457,7 @@ async function cmdFindings(argv: string[]) {
   if (sub === "suppress" || sub === "unsuppress") {
     const fp = argv[1];
     if (!fp) {
-      console.error(`df findings ${sub}: fingerprint required`);
+      console.error(`mill findings ${sub}: fingerprint required`);
       process.exitCode = 2;
       return;
     }
@@ -645,7 +645,7 @@ async function cmdLogs(argv: string[]) {
   });
   const runId = positionals[0];
   if (!runId) {
-    console.error("df logs: run-id required");
+    console.error("mill logs: run-id required");
     process.exitCode = 2;
     return;
   }
@@ -690,7 +690,7 @@ async function cmdTail(argv: string[]) {
   });
   const runId = positionals[0];
   if (!runId) {
-    console.error("df tail: run-id required");
+    console.error("mill tail: run-id required");
     process.exitCode = 2;
     return;
   }
@@ -854,7 +854,7 @@ function extractToolResultText(content: unknown): string {
 async function cmdKill(argv: string[]) {
   const runId = argv[0];
   if (!runId) {
-    console.error("df kill: run-id required");
+    console.error("mill kill: run-id required");
     process.exitCode = 2;
     return;
   }
@@ -901,7 +901,7 @@ function sleep(ms: number): Promise<void> {
 }
 
 main().catch((err) => {
-  console.error("df error:", err instanceof Error ? err.message : err);
+  console.error("mill error:", err instanceof Error ? err.message : err);
   process.exit(1);
 });
 

@@ -19,9 +19,9 @@ import { KilledError, killedSentinelExists, ZERO_USAGE } from "../core/index.js"
 // `--mcp-config <path>` loads only the `mcpServers` key from the file —
 // hooks in the same file are ignored. That's how we get access to user
 // MCPs (Stitch, Playwright, etc.) without triggering user-level hooks.
-// Override with DF_USER_MCP_CONFIG to point at a custom file.
+// Override with MILL_USER_MCP_CONFIG to point at a custom file.
 function resolveUserMcpConfigPath(): string | null {
-  const override = process.env.DF_USER_MCP_CONFIG?.trim();
+  const override = process.env.MILL_USER_MCP_CONFIG?.trim();
   if (override) return existsSync(override) ? override : null;
   const candidates = [
     join(homedir(), ".claude", "settings.json"),
@@ -41,11 +41,24 @@ export interface McpServerConfig {
   url?: string;
 }
 
+export interface AgentDef {
+  description: string;
+  prompt: string;
+  // Whitelist of tool names the subagent may use. Array form only — the CLI
+  // silently rejects the agent definition if this is a comma-string.
+  tools?: string[];
+  model?: string;
+}
+
 export interface RunClaudeArgs {
   ctx: RunContext;
   stage: StageName;
   prompt: string;
   systemPrompt?: string;
+  // Inline custom subagent definitions injected via --agents <json>. Each
+  // key is the subagent_type name. Used by team-mode stages to register
+  // critic personas without touching user/project agent directories.
+  agentsConfig?: Record<string, AgentDef>;
   // How `systemPrompt` is delivered. "append" (default) adds to Claude
   // Code's default system prompt — safest for stages that rely on the
   // default tool-use guidance (implement, verify). "replace" uses the
@@ -67,7 +80,7 @@ export interface RunClaudeArgs {
   settingSources?: Array<"user" | "project" | "local">;
   addDir?: string[];
   // Paths outside the workdir where the stage is allowed to Write/Edit.
-  // Passed through to the guard.ts sandbox via DF_EXTRA_WRITE_DIRS.
+  // Passed through to the guard.ts sandbox via MILL_EXTRA_WRITE_DIRS.
   extraWriteDirs?: string[];
   maxTurns?: number;
   maxThinkingTokens?: number;
@@ -111,6 +124,7 @@ export async function runClaude(args: RunClaudeArgs): Promise<RunClaudeResult> {
     prompt,
     systemPrompt,
     systemPromptMode = "append",
+    agentsConfig,
     cwd,
     permissionMode,
     allowedTools,
@@ -185,16 +199,19 @@ export async function runClaude(args: RunClaudeArgs): Promise<RunClaudeResult> {
     const flag = systemPromptMode === "replace" ? "--system-prompt" : "--append-system-prompt";
     argv.push(flag, systemPrompt);
   }
+  if (agentsConfig && Object.keys(agentsConfig).length > 0) {
+    argv.push("--agents", JSON.stringify(agentsConfig));
+  }
   for (const dir of addDir) argv.push("--add-dir", dir);
 
   const env = {
     ...process.env,
     ...extraEnv,
-    DF_RUN_ID: ctx.runId,
-    DF_RUN_KILLED: ctx.paths.killed,
-    DF_WORKDIR: ctx.paths.workdir,
+    MILL_RUN_ID: ctx.runId,
+    MILL_RUN_KILLED: ctx.paths.killed,
+    MILL_WORKDIR: ctx.paths.workdir,
     ...(extraWriteDirs.length > 0
-      ? { DF_EXTRA_WRITE_DIRS: extraWriteDirs.join(":") }
+      ? { MILL_EXTRA_WRITE_DIRS: extraWriteDirs.join(":") }
       : {}),
   };
 
@@ -362,7 +379,7 @@ export interface RunClaudeOneShotArgs {
 }
 
 // Project-scoped / utility invocation of `claude` with no RunContext.
-// Used for operations that are not per-run (e.g. `df onboard`). No
+// Used for operations that are not per-run (e.g. `mill onboard`). No
 // session persistence, no event log, no budget tally — the caller
 // handles anything beyond "send prompt, get result".
 export async function runClaudeOneShot(
@@ -397,7 +414,7 @@ export async function runClaudeOneShot(
 
   const child = spawn("claude", argv, {
     cwd: args.cwd,
-    env: { ...process.env, CLAUDE_CODE_ENTRYPOINT: "df-harness" },
+    env: { ...process.env, CLAUDE_CODE_ENTRYPOINT: "mill-harness" },
     stdio: ["pipe", "pipe", "pipe"],
   });
 

@@ -1,17 +1,25 @@
 {
-  "name": "dark-factory",
-  "private": true,
+  "name": "mill",
   "version": "0.1.0",
+  "description": "A harness around the claude CLI that runs a spec → design → implement ⇄ review → verify → deliver pipeline.",
+  "license": "UNLICENSED",
   "type": "module",
-  "bin": {
-    "df": "./dist/cli.js"
+  "engines": {
+    "node": ">=22"
   },
+  "bin": {
+    "mill": "./dist/cli.js"
+  },
+  "files": [
+    "dist"
+  ],
   "scripts": {
-    "df": "tsx src/cli.ts",
+    "mill": "tsx src/cli.ts",
     "worker": "tsx src/orchestrator/worker.ts",
     "build": "tsc -p . && cp -r src/prompts dist/prompts",
     "typecheck": "tsc --noEmit",
-    "clean": "rm -rf dist"
+    "clean": "rm -rf dist",
+    "prepack": "npm run clean && npm run build"
   },
   "devDependencies": {
     "@types/better-sqlite3": "^7.6.11",

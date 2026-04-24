@@ -1,5 +1,5 @@
 You are the **onboard** stage. Your job is a one-time profile of an
-existing repository so every df run that follows can skip
+existing repository so every mill run that follows can skip
 re-discovery.
 
 ## Your job
@@ -37,7 +37,7 @@ re-discovery.
    - `commands.devServer`: local dev-server command, or `null`.
    - `commands.format`: formatter command, or `null`.
    - `doNotTouch`: list of glob patterns for generated or vendored
-     paths df must not write (e.g. `dist/`, `node_modules/`,
+     paths mill must not write (e.g. `dist/`, `node_modules/`,
      `package-lock.json`, `*.lock`, `vendor/`). Include the project's
      build output dir explicitly.
 
