@@ -154,6 +154,10 @@ export async function runTeamReview(args: TeamReviewArgs): Promise<TeamReviewOut
   const res = await runClaude({
     ctx,
     stage: "review",
+    // Team mode persists one session slot (the lead); per-critic slots
+    // are not used here. runClaude saves into review:lead so --resume
+    // hits the lead on subsequent iterations.
+    sessionSlot: slot,
     prompt: userMessage,
     systemPrompt: leadPrompt,
     systemPromptMode: "replace",
@@ -165,10 +169,10 @@ export async function runTeamReview(args: TeamReviewArgs): Promise<TeamReviewOut
     disallowedTools: LEAD_DISALLOWED,
     jsonSchema: TeamReviewJsonSchema,
     resume: prior?.sessionId,
-    // Higher than per-critic subprocess (20) because the lead does
+    // Higher than per-critic subprocess (40) because the lead does
     // orchestration turns + three subagents' worth of work + optional
     // cross-critic chatter, all in one session.
-    maxTurns: 60,
+    maxTurns: 80,
   });
 
   const parsed = TeamReviewOutputSchema.parse(pickStructured(res));
@@ -222,17 +226,11 @@ export async function runTeamReview(args: TeamReviewArgs): Promise<TeamReviewOut
     reportPaths.push(reportPath);
   }
 
-  // Single transaction: run-level cost/usage, lead session, findings rows.
-  // Mirrors runCritic's atomicity — a crash between these would double-bill
-  // on resume. The lead session ID is the only one persisted in team mode;
-  // per-critic session resume is a capability we trade for cross-critic
-  // coordination (the lead carries context iteration-to-iteration instead).
+  // cost, usage, and the lead session are persisted incrementally by
+  // runClaude. Findings go in one transaction so a crash between inserts
+  // leaves a coherent set. Per-critic session resume is not used in team
+  // mode — the lead carries context iteration-to-iteration instead.
   ctx.store.transaction(() => {
-    ctx.store.addRunCost(ctx.runId, res.costUsd);
-    ctx.store.addRunUsage(ctx.runId, res.usage);
-    if (res.sessionId) {
-      ctx.store.saveSession(ctx.runId, slot, res.sessionId, res.costUsd);
-    }
     for (const [i, critic] of TEAM_CRITICS.entries()) {
       const entry = byName.get(critic);
       if (!entry) continue;

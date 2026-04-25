@@ -83,7 +83,6 @@ export async function onboard(args: OnboardArgs = {}): Promise<OnboardResult> {
     permissionMode: "default",
     jsonSchema: zodToJsonSchema(ProfileSchema),
     maxTurns: 30,
-    maxBudgetUsd: 2.0,
     timeoutMs: 10 * 60 * 1000,
     model: args.model ?? config.model,
   });

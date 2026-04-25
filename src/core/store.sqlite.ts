@@ -29,6 +29,11 @@ CREATE TABLE IF NOT EXISTS runs (
   created_at INTEGER NOT NULL,
   requirement_path TEXT NOT NULL,
   spec_path TEXT,
+  -- The resolved test command for this run. In new mode, spec2tests
+  -- bootstraps a test runner and writes the command here. In edit
+  -- mode, this mirrors profile.commands.test (or overrides it). The
+  -- tests critic prefers this over the project profile.
+  test_command TEXT,
   total_cost_usd REAL NOT NULL DEFAULT 0,
   total_input_tokens INTEGER NOT NULL DEFAULT 0,
   total_cache_creation_tokens INTEGER NOT NULL DEFAULT 0,
@@ -136,6 +141,7 @@ export class SqliteStateStore implements StateStore {
       ["runs", "total_cache_read_tokens", "INTEGER NOT NULL DEFAULT 0"],
       ["runs", "total_output_tokens", "INTEGER NOT NULL DEFAULT 0"],
       ["runs", "mode", "TEXT NOT NULL DEFAULT 'new'"],
+      ["runs", "test_command", "TEXT"],
       ["stages", "input_tokens", "INTEGER NOT NULL DEFAULT 0"],
       ["stages", "cache_creation_tokens", "INTEGER NOT NULL DEFAULT 0"],
       ["stages", "cache_read_tokens", "INTEGER NOT NULL DEFAULT 0"],
@@ -223,7 +229,9 @@ export class SqliteStateStore implements StateStore {
 
   updateRun(
     id: string,
-    patch: Partial<Pick<RunRow, "status" | "kind" | "spec_path" | "total_cost_usd">>,
+    patch: Partial<
+      Pick<RunRow, "status" | "kind" | "spec_path" | "test_command" | "total_cost_usd">
+    >,
   ): void {
     const keys = Object.keys(patch) as (keyof typeof patch)[];
     if (keys.length === 0) return;
@@ -310,6 +318,42 @@ export class SqliteStateStore implements StateStore {
     this.db
       .prepare(`UPDATE stages SET ${fields.join(", ")} WHERE run_id = ? AND name = ?`)
       .run(...vals, runId, name);
+  }
+
+  addStageCost(runId: string, name: StageName, delta: number): void {
+    if (!Number.isFinite(delta) || delta === 0) return;
+    this.db
+      .prepare(
+        `UPDATE stages SET cost_usd = cost_usd + ? WHERE run_id = ? AND name = ?`,
+      )
+      .run(delta, runId, name);
+  }
+
+  addStageUsage(runId: string, name: StageName, usage: TokenUsage): void {
+    const input = toTokenDelta(usage.input);
+    const cc = toTokenDelta(usage.cache_creation);
+    const cr = toTokenDelta(usage.cache_read);
+    const out = toTokenDelta(usage.output);
+    if (input === 0 && cc === 0 && cr === 0 && out === 0) return;
+    this.db
+      .prepare(
+        `UPDATE stages SET
+           input_tokens = input_tokens + ?,
+           cache_creation_tokens = cache_creation_tokens + ?,
+           cache_read_tokens = cache_read_tokens + ?,
+           output_tokens = output_tokens + ?
+         WHERE run_id = ? AND name = ?`,
+      )
+      .run(input, cc, cr, out, runId, name);
+  }
+
+  setStageSession(runId: string, name: StageName, sessionId: string): void {
+    if (!sessionId) return;
+    this.db
+      .prepare(
+        `UPDATE stages SET session_id = ? WHERE run_id = ? AND name = ?`,
+      )
+      .run(sessionId, runId, name);
   }
 
   getStage(runId: string, name: StageName): StageRow | null {

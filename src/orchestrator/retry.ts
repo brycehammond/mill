@@ -8,11 +8,13 @@
 //
 // Scope and deliberate non-goals:
 // - One retry, not N. More than one means the model isn't understanding
-//   the hint and additional attempts waste budget.
+//   the hint and additional attempts waste turns.
 // - Only for recoverable classes (output-too-short, output-not-parseable).
-//   Kill sentinels, budget exceeded, subprocess crashes are fatal.
-// - Attempts accumulate cost and usage; the returned result reflects the
-//   sum, so existing stage code (addRunCost, addRunUsage) stays correct.
+//   Kill sentinels and subprocess crashes are fatal.
+// - Attempts accumulate cost and usage in the DB incrementally via
+//   runClaude (both attempts share the stage slot). The returned result
+//   still carries the summed numbers for the caller's StageResult.cost
+//   reporting in the pipeline summary.
 // - Emits events via `store.appendEvent(..., "remediation", ...)` so
 //   `mill tail` and `mill logs` surface the retry. Not written to
 //   `.mill/journal.md` — that file is one-stanza-per-completed-run and
@@ -62,8 +64,9 @@ export async function runWithRetry(args: RetrySpec): Promise<RunClaudeResult> {
   const second = await attempt(firstHint);
   const secondHint = validate(second);
 
-  // Roll first+second cost and usage into the returned result so the
-  // stage's existing addRunCost/addRunUsage calls capture the total.
+  // Cost and usage were already accumulated into the DB by runClaude on
+  // both attempts. We still roll them up in the returned result so the
+  // caller's StageResult.cost (used for CLI reporting) reflects the total.
   // Session id, text, structured_output come from the *second* attempt
   // since that's the one whose output the caller is about to act on.
   const combined: RunClaudeResult = {

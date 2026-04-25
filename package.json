@@ -8,15 +8,17 @@
     "node": ">=22"
   },
   "bin": {
-    "mill": "./dist/cli.js"
+    "mill": "./bin/mill.js"
   },
   "files": [
+    "bin",
     "dist"
   ],
   "scripts": {
     "mill": "tsx src/cli.ts",
     "worker": "tsx src/orchestrator/worker.ts",
     "build": "tsc -p . && cp -r src/prompts dist/prompts",
+    "test": "tsx --test 'src/**/*.test.ts'",
     "typecheck": "tsc --noEmit",
     "clean": "rm -rf dist",
     "prepack": "npm run clean && npm run build"

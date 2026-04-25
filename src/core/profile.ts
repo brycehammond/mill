@@ -105,6 +105,22 @@ export async function readProfileSummary(root: string): Promise<string> {
   return data?.markdown?.trim() ?? "";
 }
 
+// Resolve the test command that should run for a given run. Prefer the
+// run-scoped command (set by spec2tests in any mode) over the project
+// profile; fall back to null if neither is set.
+//
+// The run-scoped field lets new-mode builds — which don't have a project
+// profile — still gate review on real test output.
+export async function resolveTestCommand(args: {
+  root: string;
+  runTestCommand: string | null | undefined;
+}): Promise<string | null> {
+  const run = typeof args.runTestCommand === "string" ? args.runTestCommand.trim() : "";
+  if (run) return run;
+  const profile = await readProfile(args.root);
+  return profile?.commands.test || null;
+}
+
 export async function writeProfile(
   root: string,
   data: ProfileData,

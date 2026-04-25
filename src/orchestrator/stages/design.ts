@@ -1,5 +1,4 @@
-import type { RunContext, StageResult, TokenUsage } from "../../core/index.js";
-import { usageStagePatch, ZERO_USAGE } from "../../core/index.js";
+import type { RunContext, StageResult } from "../../core/index.js";
 import { designArchitecture } from "./design.arch.js";
 import { designUi } from "./design.ui.js";
 
@@ -12,28 +11,13 @@ export async function design(ctx: RunContext): Promise<StageResult> {
     const result =
       kind === "ui" ? await designUi(ctx) : await designArchitecture(ctx);
 
-    const data = result.data as
-      | { sessionId?: string; usage?: TokenUsage }
-      | undefined;
-    const sessionId = data?.sessionId;
-    const usage = data?.usage ?? ZERO_USAGE;
-    const cost = result.cost ?? 0;
-
-    ctx.store.transaction(() => {
-      ctx.store.addRunCost(ctx.runId, cost);
-      ctx.store.addRunUsage(ctx.runId, usage);
-      if (sessionId) {
-        ctx.store.saveSession(ctx.runId, "design", sessionId, cost);
-      }
-      ctx.store.finishStage(ctx.runId, "design", {
-        status: result.ok ? "completed" : "failed",
-        cost_usd: cost,
-        ...usageStagePatch(usage),
-        session_id: sessionId ?? null,
-        artifact_path:
-          kind === "ui" ? ctx.paths.designIntent : ctx.paths.architecture,
-        error: result.ok ? null : (result.error ?? "design failed"),
-      });
+    // cost, usage, and session are persisted incrementally by runClaude
+    // inside designUi / designArchitecture. Finalize the stage row here.
+    ctx.store.finishStage(ctx.runId, "design", {
+      status: result.ok ? "completed" : "failed",
+      artifact_path:
+        kind === "ui" ? ctx.paths.designIntent : ctx.paths.architecture,
+      error: result.ok ? null : (result.error ?? "design failed"),
     });
     return result;
   } catch (err) {

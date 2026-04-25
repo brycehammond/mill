@@ -104,6 +104,10 @@ export interface RunRow {
   created_at: number;
   requirement_path: string;
   spec_path: string | null;
+  // Resolved test command for the run — written by spec2tests when it
+  // scaffolds or re-uses a runner. Tests critic prefers this over the
+  // project profile. Null when spec2tests didn't run / couldn't.
+  test_command: string | null;
   total_cost_usd: number;
   total_input_tokens: number;
   total_cache_creation_tokens: number;
@@ -238,13 +242,17 @@ export interface RunContext {
   paths: RunPaths;
   store: StateStore;
   abortController: AbortController;
-  budget: BudgetTracker;
+  costs: CostTracker;
   logger: Logger;
   model: string | undefined;
   root: string;
   // Default wall-clock cap for a single `claude` subprocess. Stages override
   // per-call; if neither, runClaude uses this. Milliseconds.
   stageTimeoutMs: number;
+  // Per-stage timeout overrides (milliseconds). Stages not listed fall back
+  // to stageTimeoutMs. implement/verify get longer budgets by default because
+  // a from-scratch build genuinely needs more than 10 minutes.
+  stageTimeoutsMs: Partial<Record<StageName, number>>;
 }
 
 export interface StateStore {
@@ -266,12 +274,15 @@ export interface StateStore {
       | "total_output_tokens"
       | "spec_path"
       | "mode"
-    > & { spec_path?: string | null; mode?: RunMode },
+      | "test_command"
+    > & { spec_path?: string | null; mode?: RunMode; test_command?: string | null },
   ): void;
   getRun(id: string): RunRow | null;
   updateRun(
     id: string,
-    patch: Partial<Pick<RunRow, "status" | "kind" | "spec_path" | "total_cost_usd">>,
+    patch: Partial<
+      Pick<RunRow, "status" | "kind" | "spec_path" | "test_command" | "total_cost_usd">
+    >,
   ): void;
   addRunCost(id: string, delta: number): void;
   addRunUsage(id: string, usage: TokenUsage): void;
@@ -283,6 +294,12 @@ export interface StateStore {
     name: StageName,
     patch: Partial<Omit<StageRow, "run_id" | "name">>,
   ): void;
+  // Incremental accumulators for the stage row. Used by runClaude so that a
+  // SIGTERM mid-stream still leaves accurate cost/usage/session on disk. The
+  // caller's finishStage only sets terminal fields (status, error, artifact).
+  addStageCost(runId: string, name: StageName, delta: number): void;
+  addStageUsage(runId: string, name: StageName, usage: TokenUsage): void;
+  setStageSession(runId: string, name: StageName, sessionId: string): void;
   getStage(runId: string, name: StageName): StageRow | null;
   listStages(runId: string): StageRow[];
 
@@ -319,35 +336,23 @@ export interface StateStore {
   ): { sessionId: string; totalCostUsd: number } | null;
 }
 
-export interface BudgetTracker {
+// Pure cost/token tally — no caps. The harness streams cumulative cost
+// from each `claude` result message into here for reporting (delivery,
+// pipeline summary). Auth is via Claude subscription, so there is no
+// per-run dollar ceiling to enforce.
+export interface CostTracker {
   addCost(stage: StageName, cost: number): void;
   addUsage(stage: StageName, usage: TokenUsage): void;
   runTotal(): number;
   stageTotal(stage: StageName): number;
   runUsageTotal(): TokenUsage;
   stageUsageTotal(stage: StageName): TokenUsage;
-  checkRunBudget(): void;
   snapshot(): {
     run: number;
     byStage: Partial<Record<StageName, number>>;
     runUsage: TokenUsage;
     byStageUsage: Partial<Record<StageName, TokenUsage>>;
   };
-  limits: { runBudgetUsd: number; stageBudgetUsd: number };
-}
-
-export class BudgetExceededError extends Error {
-  scope: "run" | "stage";
-  stage?: StageName;
-  used: number;
-  limit: number;
-  constructor(scope: "run" | "stage", limit: number, used: number, stage?: StageName) {
-    super(`${scope} budget exceeded: $${used.toFixed(4)} > $${limit.toFixed(2)}`);
-    this.scope = scope;
-    this.limit = limit;
-    this.used = used;
-    this.stage = stage;
-  }
 }
 
 export class KilledError extends Error {

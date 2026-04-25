@@ -14,7 +14,7 @@ import type {
   RunContext,
   Severity,
 } from "../../core/index.js";
-import { ZERO_USAGE, readProfile } from "../../core/index.js";
+import { ZERO_USAGE, resolveTestCommand } from "../../core/index.js";
 import type { CriticResult } from "./shared.js";
 
 const execP = promisify(exec);
@@ -36,11 +36,14 @@ const MAX_OUTPUT_BYTES = 2 * 1024 * 1024;
 
 export async function testsCritic(args: TestsCriticArgs): Promise<CriticResult> {
   const { ctx, iteration } = args;
-  const profile = await readProfile(ctx.root);
-  const testCmd = profile?.commands.test;
+  const run = ctx.store.getRun(ctx.runId);
+  const testCmd = await resolveTestCommand({
+    root: ctx.root,
+    runTestCommand: run?.test_command ?? null,
+  });
   if (!testCmd) {
     throw new Error(
-      "tests critic: no test command in profile — should have been gated out by review.ts",
+      "tests critic: no test command resolved — should have been gated out by review.ts",
     );
   }
 

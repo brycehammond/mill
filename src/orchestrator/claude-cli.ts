@@ -15,22 +15,25 @@ import type {
 } from "../core/index.js";
 import { KilledError, killedSentinelExists, ZERO_USAGE } from "../core/index.js";
 
-// Resolve the path to a JSON file containing user-level MCP servers.
+// Resolve paths to JSON files containing user-level MCP servers.
 // `--mcp-config <path>` loads only the `mcpServers` key from the file —
 // hooks in the same file are ignored. That's how we get access to user
 // MCPs (Stitch, Playwright, etc.) without triggering user-level hooks.
-// Override with MILL_USER_MCP_CONFIG to point at a custom file.
-function resolveUserMcpConfigPath(): string | null {
+//
+// Claude Code stores MCPs in two different files in practice:
+//   - `~/.claude/settings.json` (managed via `claude mcp add`)
+//   - `~/.claude.json`          (older location, still written by some flows)
+// Users commonly have servers split across both, so we return every file
+// that exists and let the caller pass each to `--mcp-config` (the flag is
+// repeatable). Override with MILL_USER_MCP_CONFIG to force a single file.
+function resolveUserMcpConfigPaths(): string[] {
   const override = process.env.MILL_USER_MCP_CONFIG?.trim();
-  if (override) return existsSync(override) ? override : null;
+  if (override) return existsSync(override) ? [override] : [];
   const candidates = [
     join(homedir(), ".claude", "settings.json"),
     join(homedir(), ".claude.json"),
   ];
-  for (const p of candidates) {
-    if (existsSync(p)) return p;
-  }
-  return null;
+  return candidates.filter((p) => existsSync(p));
 }
 
 export interface McpServerConfig {
@@ -53,6 +56,11 @@ export interface AgentDef {
 export interface RunClaudeArgs {
   ctx: RunContext;
   stage: StageName;
+  // Session slot for saveSession / resume bookkeeping. Defaults to `stage`.
+  // Callers that run multiple `claude` subprocesses under the same stage
+  // (critics, team-lead) pass unique slots like "review:security" so each
+  // subprocess can resume its own session across iterations.
+  sessionSlot?: string;
   prompt: string;
   systemPrompt?: string;
   // Inline custom subagent definitions injected via --agents <json>. Each
@@ -84,7 +92,6 @@ export interface RunClaudeArgs {
   extraWriteDirs?: string[];
   maxTurns?: number;
   maxThinkingTokens?: number;
-  maxBudgetUsd?: number;
   jsonSchema?: unknown;
   resume?: string;
   forkSession?: boolean;
@@ -103,7 +110,7 @@ export interface RunClaudeResult {
   // Token counts from the `result` message's `usage` object. Zeroed when
   // absent (older claude versions or the `error_*` subtypes).
   usage: TokenUsage;
-  subtype: "success" | "error_max_turns" | "error_during_execution" | "error_budget";
+  subtype: "success" | "error_max_turns" | "error_during_execution";
   durationMs: number;
   numTurns: number;
   isError: boolean;
@@ -121,6 +128,7 @@ export async function runClaude(args: RunClaudeArgs): Promise<RunClaudeResult> {
   const {
     ctx,
     stage,
+    sessionSlot,
     prompt,
     systemPrompt,
     systemPromptMode = "append",
@@ -136,13 +144,13 @@ export async function runClaude(args: RunClaudeArgs): Promise<RunClaudeResult> {
     extraWriteDirs = [],
     maxTurns,
     maxThinkingTokens,
-    maxBudgetUsd,
     jsonSchema,
     resume,
     forkSession,
     env: extraEnv,
     timeoutMs,
   } = args;
+  const slot = sessionSlot ?? stage;
 
   if (killedSentinelExists(ctx.paths.killed)) {
     throw new KilledError(ctx.runId);
@@ -161,11 +169,6 @@ export async function runClaude(args: RunClaudeArgs): Promise<RunClaudeResult> {
   if (forkSession) argv.push("--fork-session");
   if (maxTurns) argv.push("--max-turns", String(maxTurns));
   if (maxThinkingTokens) argv.push("--max-thinking-tokens", String(maxThinkingTokens));
-  // Per-stage budget cap. Default to the per-stage limit if the caller
-  // didn't override — every stage should have a hard cap, no exceptions.
-  const effectiveBudget =
-    maxBudgetUsd != null ? maxBudgetUsd : ctx.budget.limits.stageBudgetUsd;
-  if (effectiveBudget > 0) argv.push("--max-budget-usd", String(effectiveBudget));
   if (permissionMode) argv.push("--permission-mode", permissionMode);
   if (allowedTools && allowedTools.length > 0) argv.push("--allowedTools", allowedTools.join(","));
   if (disallowedTools && disallowedTools.length > 0) argv.push("--disallowedTools", disallowedTools.join(","));
@@ -183,8 +186,9 @@ export async function runClaude(args: RunClaudeArgs): Promise<RunClaudeResult> {
     mcpConfigs.push(JSON.stringify({ mcpServers }));
   }
   if (inheritUserMcps) {
-    const userMcpPath = resolveUserMcpConfigPath();
-    if (userMcpPath) mcpConfigs.push(userMcpPath);
+    for (const userMcpPath of resolveUserMcpConfigPaths()) {
+      mcpConfigs.push(userMcpPath);
+    }
   }
   if (mcpConfigs.length > 0) {
     argv.push("--mcp-config", ...mcpConfigs);
@@ -204,7 +208,7 @@ export async function runClaude(args: RunClaudeArgs): Promise<RunClaudeResult> {
   }
   for (const dir of addDir) argv.push("--add-dir", dir);
 
-  const env = {
+  const env: NodeJS.ProcessEnv = {
     ...process.env,
     ...extraEnv,
     MILL_RUN_ID: ctx.runId,
@@ -214,6 +218,12 @@ export async function runClaude(args: RunClaudeArgs): Promise<RunClaudeResult> {
       ? { MILL_EXTRA_WRITE_DIRS: extraWriteDirs.join(":") }
       : {}),
   };
+  // Force `claude` onto its own login flow (subscription / workspace).
+  // If ANTHROPIC_API_KEY or ANTHROPIC_AUTH_TOKEN leaks through from the
+  // parent env, claude silently switches to API billing — surprising the
+  // user with a bill they didn't opt into.
+  delete env.ANTHROPIC_API_KEY;
+  delete env.ANTHROPIC_AUTH_TOKEN;
 
   const child = spawn("claude", argv, {
     cwd: cwd ?? ctx.paths.workdir,
@@ -244,11 +254,13 @@ export async function runClaude(args: RunClaudeArgs): Promise<RunClaudeResult> {
   };
   ctx.abortController.signal.addEventListener("abort", onAbort);
 
-  // Default to the context's stage timeout if the caller didn't override.
-  // Hung stages are a real failure mode — `claude` can wedge on MCP calls
-  // or infinite tool-use loops.
+  // Default to the stage-specific override, then the context default, if the
+  // caller didn't override. Hung stages are a real failure mode — `claude`
+  // can wedge on MCP calls or infinite tool-use loops.
   const effectiveTimeoutMs =
-    timeoutMs && timeoutMs > 0 ? timeoutMs : ctx.stageTimeoutMs;
+    timeoutMs && timeoutMs > 0
+      ? timeoutMs
+      : (ctx.stageTimeoutsMs[stage] ?? ctx.stageTimeoutMs);
   const timer =
     effectiveTimeoutMs > 0 ? setTimeout(onAbort, effectiveTimeoutMs) : undefined;
   if (timer) timer.unref();
@@ -271,6 +283,32 @@ export async function runClaude(args: RunClaudeArgs): Promise<RunClaudeResult> {
   const POST_RESULT_GRACE_MS = 20_000;
   let postResultTimer: NodeJS.Timeout | null = null;
 
+  // Incremental persistence. Each `result` event carries `total_cost_usd`
+  // that is cumulative for the session; we persist the delta so a SIGTERM
+  // mid-stream still leaves accurate cost/usage on the stage and run rows.
+  // session_id is picked up from `system/init` and saved immediately so a
+  // killed stage can resume via `--resume <sid>` instead of starting over.
+  let persistedCostUsd = 0;
+  let persistedUsage: TokenUsage = { ...ZERO_USAGE };
+  let persistedSessionId = "";
+
+  const persistSession = (sid: string) => {
+    if (!sid || sid === persistedSessionId) return;
+    persistedSessionId = sid;
+    try {
+      // Only the primary session for a stage goes on the stage row's
+      // session_id column. Sub-slots (critic-specific sessions under
+      // stage="review") persist only to the sessions table so the
+      // stage row's id keeps its meaning.
+      if (slot === stage) {
+        ctx.store.setStageSession(ctx.runId, stage, sid);
+      }
+      ctx.store.saveSession(ctx.runId, slot, sid, persistedCostUsd);
+    } catch (err) {
+      ctx.logger.warn("failed to persist session id", { err: String(err) });
+    }
+  };
+
   const handleLine = (line: string) => {
     if (!line.trim()) return;
     let msg: Record<string, unknown>;
@@ -284,6 +322,13 @@ export async function runClaude(args: RunClaudeArgs): Promise<RunClaudeResult> {
       ctx.store.appendEvent(ctx.runId, stage, msgType, msg);
     } catch (err) {
       ctx.logger.warn("failed to append event", { err: String(err), msgType });
+    }
+    // Session id is available at `system/init` — the earliest possible point.
+    // Persist then so a crash before any `result` message still leaves a
+    // session id the user can resume against.
+    if (msgType === "system") {
+      const sid = typeof msg.session_id === "string" ? msg.session_id : "";
+      if (sid) persistSession(sid);
     }
     if (msgType === "result") {
       const rm = msg as {
@@ -304,22 +349,69 @@ export async function runClaude(args: RunClaudeArgs): Promise<RunClaudeResult> {
         };
       };
       const u = rm.usage ?? {};
+      const turnUsage: TokenUsage = {
+        input: safeInt(u.input_tokens),
+        cache_creation: safeInt(u.cache_creation_input_tokens),
+        cache_read: safeInt(u.cache_read_input_tokens),
+        output: safeInt(u.output_tokens),
+      };
       resultBox.value = {
         text: typeof rm.result === "string" ? rm.result : "",
         structuredOutput: rm.structured_output ?? null,
-        sessionId: rm.session_id ?? "",
+        sessionId: rm.session_id ?? persistedSessionId,
         costUsd: rm.total_cost_usd ?? 0,
-        usage: {
-          input: safeInt(u.input_tokens),
-          cache_creation: safeInt(u.cache_creation_input_tokens),
-          cache_read: safeInt(u.cache_read_input_tokens),
-          output: safeInt(u.output_tokens),
-        },
+        usage: turnUsage,
         subtype: rm.subtype,
         durationMs: rm.duration_ms ?? 0,
         numTurns: rm.num_turns ?? 0,
         isError: Boolean(rm.is_error),
       };
+      // Persist the delta since the last result. total_cost_usd is
+      // cumulative across the session; turn usage is per-turn, so we
+      // accumulate it directly. The in-memory tracker mirrors the DB
+      // adds for live reporting (delivery summary, pipeline result).
+      const costDelta = Math.max(0, (rm.total_cost_usd ?? 0) - persistedCostUsd);
+      if (costDelta > 0) {
+        try {
+          ctx.store.addRunCost(ctx.runId, costDelta);
+          ctx.store.addStageCost(ctx.runId, stage, costDelta);
+        } catch (err) {
+          ctx.logger.warn("failed to persist cost delta", { err: String(err) });
+        }
+        ctx.costs.addCost(stage, costDelta);
+        persistedCostUsd += costDelta;
+      }
+      if (
+        turnUsage.input +
+          turnUsage.cache_creation +
+          turnUsage.cache_read +
+          turnUsage.output >
+        0
+      ) {
+        try {
+          ctx.store.addRunUsage(ctx.runId, turnUsage);
+          ctx.store.addStageUsage(ctx.runId, stage, turnUsage);
+        } catch (err) {
+          ctx.logger.warn("failed to persist usage delta", { err: String(err) });
+        }
+        ctx.costs.addUsage(stage, turnUsage);
+        persistedUsage = {
+          input: persistedUsage.input + turnUsage.input,
+          cache_creation: persistedUsage.cache_creation + turnUsage.cache_creation,
+          cache_read: persistedUsage.cache_read + turnUsage.cache_read,
+          output: persistedUsage.output + turnUsage.output,
+        };
+      }
+      const sid = rm.session_id ?? persistedSessionId;
+      if (sid) {
+        persistSession(sid);
+        // Update the sessions table's cost-at-last-update snapshot.
+        try {
+          ctx.store.saveSession(ctx.runId, slot, sid, persistedCostUsd);
+        } catch (err) {
+          ctx.logger.warn("failed to update session cost", { err: String(err) });
+        }
+      }
       // Arm the force-kill only once we have the final structured payload
       // a schema-using caller was waiting on. Intermediate per-turn results
       // (team mode) or non-schema results don't trip this.
@@ -377,14 +469,6 @@ export async function runClaude(args: RunClaudeArgs): Promise<RunClaudeResult> {
     );
   }
 
-  // In-memory budget tally only — DB writes (addRunCost, addRunUsage,
-  // saveSession) are the caller's job so they can happen in the same
-  // transaction as finishStage. Budget check fires here so an over-budget
-  // stage doesn't falsely succeed.
-  ctx.budget.addCost(stage, result.costUsd);
-  ctx.budget.addUsage(stage, result.usage);
-  ctx.budget.checkRunBudget();
-
   return result;
 }
 
@@ -403,7 +487,6 @@ export interface RunClaudeOneShotArgs {
   settingSources?: Array<"user" | "project" | "local">;
   jsonSchema?: unknown;
   maxTurns?: number;
-  maxBudgetUsd?: number;
   timeoutMs?: number;
   model?: string;
   addDir?: string[];
@@ -412,7 +495,7 @@ export interface RunClaudeOneShotArgs {
 
 // Project-scoped / utility invocation of `claude` with no RunContext.
 // Used for operations that are not per-run (e.g. `mill onboard`). No
-// session persistence, no event log, no budget tally — the caller
+// session persistence, no event log, no cost tally — the caller
 // handles anything beyond "send prompt, get result".
 export async function runClaudeOneShot(
   args: RunClaudeOneShotArgs,
@@ -427,9 +510,6 @@ export async function runClaudeOneShot(
 
   if (args.model) argv.push("--model", args.model);
   if (args.maxTurns) argv.push("--max-turns", String(args.maxTurns));
-  if (args.maxBudgetUsd && args.maxBudgetUsd > 0) {
-    argv.push("--max-budget-usd", String(args.maxBudgetUsd));
-  }
   if (args.permissionMode) argv.push("--permission-mode", args.permissionMode);
   if (args.allowedTools && args.allowedTools.length > 0) {
     argv.push("--allowedTools", args.allowedTools.join(","));
@@ -444,9 +524,15 @@ export async function runClaudeOneShot(
   if (args.systemPrompt) argv.push("--append-system-prompt", args.systemPrompt);
   for (const dir of args.addDir ?? []) argv.push("--add-dir", dir);
 
+  const probeEnv: NodeJS.ProcessEnv = {
+    ...process.env,
+    CLAUDE_CODE_ENTRYPOINT: "mill-harness",
+  };
+  delete probeEnv.ANTHROPIC_API_KEY;
+  delete probeEnv.ANTHROPIC_AUTH_TOKEN;
   const child = spawn("claude", argv, {
     cwd: args.cwd,
-    env: { ...process.env, CLAUDE_CODE_ENTRYPOINT: "mill-harness" },
+    env: probeEnv,
     stdio: ["pipe", "pipe", "pipe"],
   });
 

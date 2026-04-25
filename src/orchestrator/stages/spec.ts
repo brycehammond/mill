@@ -5,7 +5,6 @@ import {
   readJournalTail,
   readProfileSummary,
   renderLedgerHint,
-  usageStagePatch,
 } from "../../core/index.js";
 import { loadPrompt } from "../prompts.js";
 import { extractMarkdownBlock, runClaude } from "../claude-cli.js";
@@ -94,18 +93,11 @@ export async function spec(ctx: RunContext): Promise<StageResult> {
     const md = extractMarkdownBlock(res.text);
     await writeFile(ctx.paths.spec, md.trim() + "\n", "utf8");
 
+    // cost, usage, and session are persisted incrementally by runClaude.
     ctx.store.transaction(() => {
-      ctx.store.addRunCost(ctx.runId, res.costUsd);
-      ctx.store.addRunUsage(ctx.runId, res.usage);
-      if (res.sessionId) {
-        ctx.store.saveSession(ctx.runId, "spec", res.sessionId, res.costUsd);
-      }
       ctx.store.updateRun(ctx.runId, { spec_path: ctx.paths.spec });
       ctx.store.finishStage(ctx.runId, "spec", {
         status: "completed",
-        cost_usd: res.costUsd,
-        ...usageStagePatch(res.usage),
-        session_id: res.sessionId,
         artifact_path: ctx.paths.spec,
       });
     });

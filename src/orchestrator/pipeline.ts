@@ -1,12 +1,11 @@
 import type { Finding, RunContext, StageName, StageResult } from "../core/index.js";
 import {
-  BudgetExceededError,
+  atLeast,
   KilledError,
   killedSentinelExists,
-  readProfile,
 } from "../core/index.js";
 import { buildContext } from "./context.js";
-import { loadConfig, type DfConfig } from "./config.js";
+import { loadConfig, type MillConfig } from "./config.js";
 import { clarify } from "./stages/clarify.js";
 import { spec } from "./stages/spec.js";
 import { design } from "./stages/design.js";
@@ -19,7 +18,7 @@ import { decisions } from "./stages/decisions.js";
 
 export interface RunPipelineArgs {
   runId: string;
-  config?: DfConfig;
+  config?: MillConfig;
   ctx?: RunContext;
   // If set, return after the named stage completes successfully.
   // Used by `mill new --stop-after <stage>` to halt early so the user
@@ -50,7 +49,7 @@ export async function runPipeline(args: RunPipelineArgs): Promise<PipelineResult
   const stopAfter = args.stopAfter;
   const plannedStop = (stage: StageName): PipelineResult | null => {
     if (stopAfter !== stage) return null;
-    const costUsd = ctx.budget.runTotal();
+    const costUsd = ctx.costs.runTotal();
     const durationMs = Date.now() - startedAt;
     ctx.logger.info("pipeline stopped after stage (plan mode)", { stage });
     return {
@@ -110,6 +109,38 @@ export async function runPipeline(args: RunPipelineArgs): Promise<PipelineResult
     let allHigh: Finding[] = [];
     let stopReason = "";
 
+    // Resume awareness: if a prior `mill run` got partway through this
+    // loop, the implement stage row is already `completed` and we have
+    // findings persisted for one or more iterations. Re-running
+    // implement for an iteration we already completed is wasted spend;
+    // skip ahead to the iteration that actually needs work. We use the
+    // findings table as the source of truth — the highest iteration
+    // with any finding rows is the iteration whose review ran.
+    const persistedHighestIter = highestIterationWithFindings(ctx);
+    if (persistedHighestIter > 0) {
+      ctx.logger.info("review loop resume: skipping completed iterations", {
+        iterations: persistedHighestIter,
+      });
+      iteration = persistedHighestIter;
+      // Seed previousHigh from the highest-iteration findings so the
+      // next implement call gets the right prior-findings prompt.
+      previousHigh = ctx.store
+        .listFindings(ctx.runId, { iteration: persistedHighestIter })
+        .filter((f) => atLeast(f.severity, "HIGH"))
+        .map((f) => ({
+          critic: f.critic,
+          severity: f.severity,
+          title: f.title,
+          // Detail body isn't persisted on the row; the next implement
+          // doesn't need it (the title + severity + critic is what
+          // shows up in its prompt anyway).
+          evidence: "",
+          suggested_fix: "",
+        }));
+      currentHigh = previousHigh;
+      allHigh = currentHigh;
+    }
+
     while (iteration < config.maxReviewIters) {
       iteration += 1;
       ctx.logger.info("implement iteration", { iteration });
@@ -167,7 +198,7 @@ export async function runPipeline(args: RunPipelineArgs): Promise<PipelineResult
     }
 
     const finalRun = ctx.store.getRun(ctx.runId);
-    const costUsd = finalRun?.total_cost_usd ?? ctx.budget.runTotal();
+    const costUsd = finalRun?.total_cost_usd ?? ctx.costs.runTotal();
     const durationMs = Date.now() - startedAt;
     const passed = verifyResult.ok && allHigh.length === 0;
 
@@ -180,28 +211,13 @@ export async function runPipeline(args: RunPipelineArgs): Promise<PipelineResult
     };
   } catch (err) {
     const durationMs = Date.now() - startedAt;
-    const costUsd = ctx.budget.runTotal();
+    const costUsd = ctx.costs.runTotal();
     if (err instanceof KilledError) {
       ctx.store.updateRun(ctx.runId, { status: "killed" });
       ctx.logger.warn("pipeline killed", { reason: err.message });
       return {
         runId: ctx.runId,
         status: "killed",
-        reason: err.message,
-        costUsd,
-        durationMs,
-      };
-    }
-    if (err instanceof BudgetExceededError) {
-      ctx.store.updateRun(ctx.runId, { status: "failed" });
-      ctx.logger.error("budget exceeded", {
-        scope: err.scope,
-        limit: err.limit,
-        used: err.used,
-      });
-      return {
-        runId: ctx.runId,
-        status: "failed",
         reason: err.message,
         costUsd,
         durationMs,
@@ -235,6 +251,17 @@ function throwIfKilledOrBroken(
   }
 }
 
+// Highest iteration number that has any persisted findings. Used to
+// resume the implement⇄review loop without re-running iterations whose
+// review already produced findings on disk. Returns 0 when the loop
+// hasn't started yet.
+function highestIterationWithFindings(ctx: RunContext): number {
+  const all = ctx.store.listFindings(ctx.runId);
+  let max = 0;
+  for (const f of all) if (f.iteration > max) max = f.iteration;
+  return max;
+}
+
 function needsStage(ctx: RunContext, name: Parameters<typeof ctx.store.getStage>[1]): boolean {
   const row = ctx.store.getStage(ctx.runId, name);
   // `skipped` counts as terminal — no rerun on resume. Only `completed`
@@ -243,22 +270,19 @@ function needsStage(ctx: RunContext, name: Parameters<typeof ctx.store.getStage>
   return row.status !== "completed" && row.status !== "skipped";
 }
 
-// Gate spec2tests: requires a profile with a test command, and
-// MILL_SPEC2TESTS not set to "off". Default is auto (enable when
-// available). Explicit "on" forces an error if unavailable.
-async function shouldRunSpec2Tests(ctx: RunContext): Promise<boolean> {
+// Gate spec2tests: default-on in both modes. In edit mode the stage
+// reuses the profile's test command; in new mode it bootstraps a
+// runner. `MILL_SPEC2TESTS=off` skips the stage entirely — useful when
+// the user is debugging a pipeline issue and doesn't want the cost of
+// a test scaffold. The stage itself still handles the degenerate
+// "nothing to test" case defensively.
+//
+// Note: readProfile is intentionally not consulted here anymore. The
+// stage's prompt branches on profile presence; the pipeline just
+// decides yes/no.
+async function shouldRunSpec2Tests(_ctx: RunContext): Promise<boolean> {
   const mode = (process.env.MILL_SPEC2TESTS ?? "auto").trim().toLowerCase();
   if (mode === "off" || mode === "false" || mode === "0") return false;
-  const profile = await readProfile(ctx.root);
-  const hasTestCmd = Boolean(profile?.commands.test);
-  if (!hasTestCmd) {
-    if (mode === "on" || mode === "true" || mode === "1") {
-      throw new Error(
-        "MILL_SPEC2TESTS=on but no profile test command — run `mill onboard` first",
-      );
-    }
-    return false;
-  }
   return true;
 }
 

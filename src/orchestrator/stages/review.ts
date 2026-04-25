@@ -4,14 +4,11 @@ import type {
   Finding,
   RunContext,
   StageResult,
-  TokenUsage,
 } from "../../core/index.js";
 import {
   atLeast,
   findingFingerprint,
-  readProfile,
-  usageStagePatch,
-  ZERO_USAGE,
+  resolveTestCommand,
 } from "../../core/index.js";
 import { correctnessCritic } from "../critics/correctness.js";
 import { securityCritic } from "../critics/security.js";
@@ -86,22 +83,23 @@ export async function review(args: ReviewArgs): Promise<StageResult & { data: Re
       names.push("security", "correctness", "ux");
     }
 
-    // The tests critic runs the repo's real test command (from the
-    // profile) and turns failures into HIGH findings. Only activates
-    // when a profile exists AND has a test command set. Opt-out with
-    // MILL_TESTS_CRITIC=off. Typically only meaningful in edit mode —
-    // new-mode scaffolds don't have an external profile, though they
-    // could if the user ran `mill onboard` on the enclosing project
-    // before `mill new`.
+    // The tests critic runs the run's test command and turns failures
+    // into HIGH findings. Activates whenever a test command is
+    // resolvable — either spec2tests wrote it to the run row, or an
+    // edit-mode profile has one. Opt-out with MILL_TESTS_CRITIC=off.
     const testsMode = resolveTestsMode();
     if (testsMode !== "off") {
-      const profile = await readProfile(ctx.root);
-      if (profile?.commands.test) {
+      const run = ctx.store.getRun(ctx.runId);
+      const testCmd = await resolveTestCommand({
+        root: ctx.root,
+        runTestCommand: run?.test_command ?? null,
+      });
+      if (testCmd) {
         critics.push(testsCritic(shared));
         names.push("tests");
       } else if (testsMode === "on") {
         throw new Error(
-          "MILL_TESTS_CRITIC=on but no test command in .mill/profile.json — run `mill onboard` first",
+          "MILL_TESTS_CRITIC=on but no test command resolved — spec2tests didn't run, and no project profile has one. Run `mill onboard` first or set MILL_SPEC2TESTS=on.",
         );
       }
     }
@@ -138,7 +136,6 @@ export async function review(args: ReviewArgs): Promise<StageResult & { data: Re
     const summaries: { critic: string; summary: string }[] = [];
     const reportPaths: string[] = [];
     let cost = 0;
-    let usage: TokenUsage = { ...ZERO_USAGE };
     let anyFailed = false;
 
     // Fold team-mode output in first so per-critic order in the summary
@@ -148,17 +145,17 @@ export async function review(args: ReviewArgs): Promise<StageResult & { data: Re
       summaries.push(...teamOutcome.output.summaries);
       reportPaths.push(...teamOutcome.output.reportPaths);
       cost += teamOutcome.output.cost;
-      usage = sumUsage(usage, teamOutcome.output.usage);
       if (teamOutcome.output.anyFailed) anyFailed = true;
     }
 
+    let succeededCount = 0;
     settled.forEach((r, i) => {
       if (r.status === "fulfilled") {
         findings.push(...r.value.findings);
         summaries.push({ critic: names[i]!, summary: r.value.summary });
         reportPaths.push(r.value.reportPath);
         cost += r.value.cost;
-        usage = sumUsage(usage, r.value.usage);
+        succeededCount += 1;
       } else {
         anyFailed = true;
         ctx.logger.error("critic failed", {
@@ -171,21 +168,30 @@ export async function review(args: ReviewArgs): Promise<StageResult & { data: Re
         });
       }
     });
+    if (teamOutcome?.ok) succeededCount += 1;
 
     const highFindings = findings.filter((f) => atLeast(f.severity, "HIGH"));
 
-    // Per-critic cost + findings are already committed inside runCritic()'s
-    // transaction. This transaction only finalizes the stage row itself —
-    // tokens here are the sum across all critics for the iteration, mirroring
-    // cost_usd.
-    ctx.store.transaction(() => {
-      ctx.store.finishStage(ctx.runId, "review", {
-        status: anyFailed ? "failed" : "completed",
-        cost_usd: cost,
-        ...usageStagePatch(usage),
-        artifact_path: ctx.paths.reviewsDir,
-        error: anyFailed ? "one or more critics failed" : null,
-      });
+    // Per-critic cost/usage/findings are already committed (cost/usage via
+    // runClaude's incremental persistence, findings via runCritic's
+    // transaction). This just finalizes the stage row.
+    //
+    // Tolerance: review is "completed" as long as at least one critic
+    // produced findings. A single critic blowing its turn cap shouldn't
+    // tank the run — the other critics' findings still feed the next
+    // implement iteration. We surface the partial failure in the stage
+    // row's error column for visibility without throwing.
+    const partial = anyFailed && succeededCount > 0;
+    const allFailed = anyFailed && succeededCount === 0;
+    const errorMsg = allFailed
+      ? "all critics failed"
+      : partial
+        ? `partial failure (${succeededCount} ok); see review reports`
+        : null;
+    ctx.store.finishStage(ctx.runId, "review", {
+      status: allFailed ? "failed" : "completed",
+      artifact_path: ctx.paths.reviewsDir,
+      error: errorMsg,
     });
 
     const data: ReviewOutput = {
@@ -195,7 +201,7 @@ export async function review(args: ReviewArgs): Promise<StageResult & { data: Re
       cost,
       reportPaths,
     };
-    return { ok: !anyFailed, cost, data };
+    return { ok: !allFailed, cost, data };
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     ctx.store.finishStage(ctx.runId, "review", {
@@ -220,7 +226,6 @@ export async function review(args: ReviewArgs): Promise<StageResult & { data: Re
 //  1. max iterations reached
 //  2. no HIGH+ findings this iteration
 //  3. HIGH findings this iteration are a subset of last iteration's (stuck)
-//  4. budget exceeded (caller handles this via BudgetExceededError)
 export function shouldStopReviewLoop(args: {
   iteration: number;
   maxIters: number;
@@ -248,15 +253,6 @@ export function shouldStopReviewLoop(args: {
     }
   }
   return { stop: false, reason: "" };
-}
-
-function sumUsage(a: TokenUsage, b: TokenUsage): TokenUsage {
-  return {
-    input: a.input + b.input,
-    cache_creation: a.cache_creation + b.cache_creation,
-    cache_read: a.cache_read + b.cache_read,
-    output: a.output + b.output,
-  };
 }
 
 type TeamOutcome =

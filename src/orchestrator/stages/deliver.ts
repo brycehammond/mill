@@ -13,6 +13,11 @@ import {
   type RunMode,
 } from "../../core/index.js";
 import { gitDiffStat } from "../git.js";
+import {
+  promoteWorkdir,
+  resolvePromoteMode,
+  type PromoteResult,
+} from "../promote.js";
 
 const execFileP = promisify(execFile);
 
@@ -63,6 +68,31 @@ export async function deliver(args: DeliverArgs): Promise<StageResult> {
       });
     }
 
+    // New-mode promotion: copy the workdir contents up into the project
+    // root so the result is "right there" instead of buried under
+    // `.mill/runs/<id>/workdir/`. Edit mode already commits on its own
+    // branch in the user's worktree, so it isn't promoted.
+    let promoteResult: PromoteResult | null = null;
+    if (ctx.mode === "new" && passed) {
+      try {
+        promoteResult = await promoteWorkdir({
+          workdir: ctx.paths.workdir,
+          root: ctx.root,
+          mode: resolvePromoteMode(),
+        });
+        ctx.store.appendEvent(ctx.runId, "deliver", "workdir_promoted", {
+          ...promoteResult,
+          root: ctx.root,
+        });
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        ctx.logger.warn("workdir promotion failed", { err: msg });
+        ctx.store.appendEvent(ctx.runId, "deliver", "workdir_promote_failed", {
+          error: msg,
+        });
+      }
+    }
+
     const durationMs = args.endedAt - args.startedAt;
     const runUsage = run
       ? {
@@ -71,13 +101,13 @@ export async function deliver(args: DeliverArgs): Promise<StageResult> {
           cache_read: run.total_cache_read_tokens,
           output: run.total_output_tokens,
         }
-      : ctx.budget.runUsageTotal();
+      : ctx.costs.runUsageTotal();
 
     const md = renderDelivery({
       runId: ctx.runId,
       kind: ctx.kind,
       mode: ctx.mode,
-      totalCostUsd: run?.total_cost_usd ?? ctx.budget.runTotal(),
+      totalCostUsd: run?.total_cost_usd ?? ctx.costs.runTotal(),
       totalUsage: runUsage,
       durationMs,
       iterationCount: args.iterationCount,
@@ -88,6 +118,9 @@ export async function deliver(args: DeliverArgs): Promise<StageResult> {
       worktree,
       diffStat,
       prUrl,
+      promoteRoot: promoteResult?.promoted ? ctx.root : null,
+      promoteSkipReason:
+        promoteResult && !promoteResult.promoted ? promoteResult.reason : null,
       // `deliver` is still marked `running` in the store here — finishStage
       // runs below so the updateRun + finishStage pair can share one
       // transaction. Patch the rendered row to reflect the terminal state
@@ -117,7 +150,7 @@ export async function deliver(args: DeliverArgs): Promise<StageResult> {
         requirementFirstLine: requirement,
         branch: worktree?.branch ?? null,
         verify: passed ? "pass" : "fail",
-        costUsd: run?.total_cost_usd ?? ctx.budget.runTotal(),
+        costUsd: run?.total_cost_usd ?? ctx.costs.runTotal(),
       });
     } catch (err) {
       ctx.logger.warn("journal append failed", {
@@ -252,6 +285,10 @@ function renderDelivery(d: {
   worktree: WorktreeInfo | null;
   diffStat: string;
   prUrl: string | null;
+  // New-mode only: where the workdir was promoted to (parent root). Null
+  // when promotion was skipped or didn't run.
+  promoteRoot: string | null;
+  promoteSkipReason: string | null;
   stages: {
     name: string;
     status: string;
@@ -312,8 +349,14 @@ function renderDelivery(d: {
     `- **Implement iterations**: ${d.iterationCount}`,
     `- **Verify result**: ${d.verifyPass ? "PASS" : "FAIL"}${d.verifyReportPath ? ` — see ${d.verifyReportPath}` : ""}`,
     `- **Workdir**: ${d.workdir}`,
-    ``,
   ];
+
+  if (d.promoteRoot) {
+    sections.push(`- **Promoted to**: ${d.promoteRoot}`);
+  } else if (d.promoteSkipReason) {
+    sections.push(`- **Promote skipped**: ${d.promoteSkipReason}`);
+  }
+  sections.push(``);
 
   if (changesSection) {
     sections.push(changesSection, ``);

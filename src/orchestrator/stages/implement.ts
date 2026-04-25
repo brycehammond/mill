@@ -1,10 +1,10 @@
-import { readFile, writeFile } from "node:fs/promises";
+import { readFile } from "node:fs/promises";
 import type { RunContext, StageResult, Finding } from "../../core/index.js";
 import {
   SEVERITY_ORDER,
   readProfileSummary,
   renderLedgerHint,
-  usageStagePatch,
+  resolveTestCommand,
 } from "../../core/index.js";
 import { loadPrompt } from "../prompts.js";
 import { runClaude } from "../claude-cli.js";
@@ -57,6 +57,13 @@ export async function implement(args: ImplementArgs): Promise<StageResult> {
         ? renderLedgerHint(ctx.store, { limit: 5 })
         : "";
 
+    const timeoutMs = ctx.stageTimeoutsMs.implement ?? ctx.stageTimeoutMs;
+    const timeBudgetMin = Math.round(timeoutMs / 60_000);
+    const run = ctx.store.getRun(ctx.runId);
+    const testCommand = await resolveTestCommand({
+      root: ctx.root,
+      runTestCommand: run?.test_command ?? null,
+    });
     const prompt = buildPrompt({
       iteration,
       specBody,
@@ -65,6 +72,8 @@ export async function implement(args: ImplementArgs): Promise<StageResult> {
       resume,
       profile,
       ledger,
+      timeBudgetMin,
+      testCommand,
     });
 
     const res = await runClaude({
@@ -104,19 +113,12 @@ export async function implement(args: ImplementArgs): Promise<StageResult> {
       if (head) await gitTag(ctx.paths.workdir, `impl/iter-${iteration}`);
     }
 
-    ctx.store.transaction(() => {
-      ctx.store.addRunCost(ctx.runId, res.costUsd);
-      ctx.store.addRunUsage(ctx.runId, res.usage);
-      if (res.sessionId) {
-        ctx.store.saveSession(ctx.runId, "implement", res.sessionId, res.costUsd);
-      }
-      ctx.store.finishStage(ctx.runId, "implement", {
-        status: "completed",
-        cost_usd: res.costUsd,
-        ...usageStagePatch(res.usage),
-        session_id: res.sessionId,
-        artifact_path: ctx.paths.workdir,
-      });
+    // cost, usage, and session are persisted incrementally by runClaude as
+    // result events stream in, so a SIGTERM mid-stage still leaves the row
+    // accurate. finishStage only sets terminal fields here.
+    ctx.store.finishStage(ctx.runId, "implement", {
+      status: "completed",
+      artifact_path: ctx.paths.workdir,
     });
     return {
       ok: true,
@@ -141,7 +143,17 @@ function buildPrompt(args: {
   resume: string | undefined;
   profile: string;
   ledger: string;
+  timeBudgetMin: number;
+  testCommand: string | null;
 }): string {
+  // Stages get a hard wall-clock timeout. Surfacing it in the prompt lets
+  // the model pace itself: commit logical chunks as it goes (so SIGTERM
+  // doesn't cost the whole attempt), and prioritize the spec's acceptance
+  // criteria over nice-to-haves when the budget is tight.
+  const budgetBlock = `# Time budget\nYou have ~${args.timeBudgetMin} minutes of wall-clock time for this stage before the subprocess is force-killed. Commit one AC at a time so a SIGTERM mid-flight only costs you the current AC, not the whole run.`;
+  const testBlock = args.testCommand
+    ? `# Test command\nRun \`${args.testCommand}\` to execute the test suite. Run it (a) at the start, to confirm red tests for each AC, (b) after each AC is implemented, to confirm green, and (c) before you finish, to confirm the full suite is green.`
+    : `# Test command\nThe test command for this run was not set (spec2tests didn't run or didn't record one). Decide on a runner that matches the tech choices, wire it up early, and use it. Announce it in your final summary.`;
   if (args.iteration === 1 || !args.resume) {
     const profileBlock = args.profile
       ? [`# Repo profile`, args.profile.trim(), ``].join("\n")
@@ -150,13 +162,17 @@ function buildPrompt(args: {
     return [
       profileBlock,
       ledgerBlock,
+      budgetBlock,
+      ``,
+      testBlock,
+      ``,
       `# spec.md`,
       args.specBody.trim(),
       ``,
       `# design`,
       args.designBody.trim() || "(no design doc — treat spec as sufficient)",
       ``,
-      `Begin implementation. Commit logical chunks with descriptive messages.`,
+      `Begin implementation. Follow the red→green→refactor→commit cadence, one AC at a time.`,
     ]
       .filter((s) => s !== "")
       .join("\n");
@@ -171,7 +187,11 @@ function buildPrompt(args: {
     )
     .join("\n\n");
   return [
-    `Review iteration ${args.iteration}. The prior review pass returned the following HIGH/CRITICAL findings that remain unresolved. Address each one, rebutting in a commit message if you disagree.`,
+    budgetBlock,
+    ``,
+    testBlock,
+    ``,
+    `Review iteration ${args.iteration}. The prior review pass returned the following HIGH/CRITICAL findings that remain unresolved. Address each one, rebutting in a commit message if you disagree. When you change behavior, add or update a test first.`,
     ``,
     findingsBlock,
     ``,

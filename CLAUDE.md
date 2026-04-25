@@ -22,13 +22,14 @@ npm run mill -- history        # print .mill/journal.md
 npm run worker               # long-running process that picks up queued runs
 
 npm run typecheck            # tsc --noEmit
+npm test                     # node test runner via tsx (src/**/*.test.ts)
 npm run build                # tsc + cp -r src/prompts dist/prompts (clean first!)
 npm run clean                # rm -rf dist
 ```
 
 The `build` target's `cp -r src/prompts dist/prompts` fails if `dist/prompts` already exists (macOS cp copies *into* rather than replacing). Always `npm run clean && npm run build` for a full build.
 
-There is no test runner yet. `npm run typecheck` is the verification pass.
+`npm test` runs Node's built-in test runner under `tsx` with no extra deps. Coverage is intentionally pure-function-shaped — the harness `spawn`s `claude`, so end-to-end tests would require live API calls. Today's suites: `core/costs.test.ts` (cost tally), `core/types.test.ts` (severity ordering, finding fingerprint), `core/store.sqlite.test.ts` (SQLite round-trip via `:memory:`), `orchestrator/claude-cli.test.ts` (JSON / markdown extractors and `pickStructured`), `orchestrator/stages/review.test.ts` (`shouldStopReviewLoop`). When you add a new pure helper or load-bearing invariant, add a test next to it (`*.test.ts` colocated).
 
 ## Import extension rule
 
@@ -42,7 +43,7 @@ There is no test runner yet. `npm run typecheck` is the verification pass.
 
 1. **Crash recovery is stage-idempotent.** `needsStage(ctx, name)` checks `store.getStage(...).status === "completed"` and skips. The CLI can invoke `mill run <id>` at any point and the pipeline picks up where it left off. New stages must persist completion through `store.finishStage(...)` or they will rerun forever on resume.
 
-2. **Stage finalization is transactional.** Cost tally (`addRunCost`), session id (`saveSession`), and `finishStage` must commit together via `store.transaction(() => { ... })`. A crash between these calls on resume would double-bill or lose the session id. `claude-cli.ts` adds cost to the in-memory `BudgetTracker` but deliberately does *not* touch the DB — that's the caller's responsibility inside the transaction.
+2. **Cost, usage, and session id are persisted incrementally by `runClaude`.** As `result` events stream in, `claude-cli.ts` deltas `addRunCost` / `addStageCost` / `addRunUsage` / `addStageUsage` and calls `saveSession` / `setStageSession`. This means a SIGTERM (timeout, kill) leaves the stage/run rows billed and resumable — the fix for a bug where a 10-min timeout on implement silently dropped ~$0.70 of real spend. Stage callers only call `finishStage(status, artifact_path, error)` — no cost math. If you add a new stage, follow the same pattern (no `addRunCost` / `saveSession` in callers). Callers that run multiple subprocesses under one stage (critics, team-lead) pass a unique `sessionSlot` so each can resume. Note: the per-stage budget check fires after streaming settles, so an over-budget stage fails fast even though the cost is already in the DB.
 
 3. **Kill is checked in two places.** The `KILLED` sentinel file is checked (a) by the `PreToolUse` guard hook on every tool call inside `claude`, and (b) by `throwIfKilledOrBroken` after each stage in the pipeline. Both checks must remain; the hook blocks in-flight tool use, the pipeline check unwinds the stack cleanly via `KilledError`.
 
@@ -95,7 +96,7 @@ Destructive-command blocking (`sudo`, `rm -rf /`, fork bomb) lives **only** in `
 
 ## MCPs without user hooks
 
-UI stages (design-ui, verify for kind=ui) need user-level MCP servers like Stitch and Playwright, but pulling them in via `settingSources: ["user", "project"]` would also drag in the user's global `UserPromptSubmit`/`Stop`/`PostToolUse` hooks — potentially exfiltrating run data to the user's Slack/webhook integrations. Instead, these stages pass `inheritUserMcps: true` to `runClaude`, which loads `~/.claude/settings.json` (or `~/.claude.json`) via `--mcp-config` + `--strict-mcp-config`. Only the `mcpServers` field is consumed; hooks in the same file are ignored. Override the source path with `MILL_USER_MCP_CONFIG`.
+UI stages (design-ui, verify for kind=ui) need user-level MCP servers like Stitch and Playwright, but pulling them in via `settingSources: ["user", "project"]` would also drag in the user's global `UserPromptSubmit`/`Stop`/`PostToolUse` hooks — potentially exfiltrating run data to the user's Slack/webhook integrations. Instead, these stages pass `inheritUserMcps: true` to `runClaude`, which loads **both** `~/.claude/settings.json` and `~/.claude.json` (every one that exists) via repeated `--mcp-config` + `--strict-mcp-config`. Both files must be passed because Claude Code writes MCPs to either location depending on how they were installed, and users frequently have servers split across both (e.g. figma in `settings.json`, stitch/blender in `.claude.json`) — picking only the first file made MCPs from the other silently invisible. Only the `mcpServers` field is consumed from each; hooks in the same files are ignored. `MILL_USER_MCP_CONFIG` overrides to a single explicit file.
 
 ## Session slots
 
@@ -124,6 +125,27 @@ This holds for both `--append-system-prompt` and `--system-prompt` (replace mode
 
 `runClaude({ systemPrompt, systemPromptMode })` controls whether the stage prompt is appended to Claude Code's default system prompt (`append`, default — keeps tool-use guidance) or replaces it entirely (`replace`, for narrow roles like critics). Critics use `replace` so the default coder framing (nudges toward `TodoWrite`, writing tests, fixing code) doesn't leak into a review task. If you add a new stage with a scoped role and a self-contained prompt, `replace` is the right call; otherwise stick with `append`.
 
+## Stage timeouts
+
+`MILL_TIMEOUT_SEC_PER_STAGE` (default 600s) is the global fallback. Specific stages override via their own vars: `MILL_TIMEOUT_SEC_IMPLEMENT` defaults to 7200s (2h), `MILL_TIMEOUT_SEC_VERIFY` defaults to 1800s (30m). Implement got the long budget because a from-scratch TDD build on a real app is 100+ tool calls. `MILL_TIMEOUT_SEC_PER_RUN` (default 14400s / 4h) caps the whole pipeline. Overrides live on `ctx.stageTimeoutsMs[stage]`; `runClaude` picks the first of: caller override → stage-specific → `ctx.stageTimeoutMs`. The implement prompt surfaces the stage's wall-clock budget so the model can pace itself and commit one-AC-per-commit before getting SIGTERM'd.
+
+## TDD workflow (spec2tests + implement)
+
+The pipeline is test-driven end-to-end:
+
+- **`spec` writes numbered acceptance criteria.** `prompts/spec.md` demands testable bullets; verify is told to run them. If a criterion can't be verified, it goes in the open-questions list.
+- **`spec2tests` runs between design and implement in both new and edit mode.** In edit mode it reuses `profile.commands.test`; in new mode it bootstraps a framework matching the spec's tech choices (Vitest for Node, pytest for Python, `swift test`, `cargo test`, etc.), writes failing tests tagged `[AC-<N>]`, and commits the scaffold. Output schema requires `test_command: string` — the stage persists it to `runs.test_command` via `updateRun` so downstream stages don't need to re-discover it. The stage is ungated on profile presence (gated only by `MILL_SPEC2TESTS=auto|on|off`; default on).
+- **`implement` receives the test command in its prompt** and is told to work AC-by-AC in a red → green → refactor → commit cadence. `stages/implement.ts::buildPrompt` resolves the command via `resolveTestCommand({ root, runTestCommand: run.test_command })` — same resolver the tests critic uses. The implement prompt also discourages adding untested production code.
+- **`tests` critic** (mechanical, in `critics/tests.ts`) runs the resolved test command each review iteration and emits a HIGH finding on non-zero exit. Previously profile-gated; now uses `resolveTestCommand` so it fires in new-mode runs too. `review.ts` gates critic registration on the same resolver.
+
+The resolver's priority is **`run.test_command` first, then `profile.commands.test`**. This means an edit-mode run can still override the project profile with a run-specific command (e.g. running just the test file relevant to the change) — spec2tests simply writes its decision there. If neither is set, the tests critic skips and the implement prompt tells the model it has to configure a runner itself.
+
+When adding new stages that need to run tests, use `resolveTestCommand`; do not re-read the profile directly.
+
+## New-mode workdir promotion
+
+Edit-mode runs commit onto a fresh `mill/<slug>-<shortId>` branch via `git worktree add` (in `stages/intake.ts`). The slug is derived from the requirement text via `slugifyRequirement` (`core/slug.ts`) — biographical preambles ("I am a…", "As a…") are skipped in favor of the next sentence; stop words filtered; truncated to 40 chars at a word boundary. The 4-char shortId (last 4 chars of the run id) keeps two runs with similar intents from colliding. Falls back to `mill/run-<runId>` only when the requirement degenerates to all stop words. Result: branches show up in `git branch -a` as `mill/add-dark-mode-toggle-settings-page-sa2n` instead of `mill/run-20260424-140852-sa2n`. New-mode runs build into `.mill/runs/<id>/workdir/` with a self-contained git history — useful for sandboxing and parallel runs, but the result is invisible to anyone looking at the project root. After a clean delivery (verify pass + zero unresolved HIGH+), `deliver.ts` calls `promoteWorkdir` (`orchestrator/promote.ts`) to copy the workdir contents up into `ctx.root`. Two non-obvious rules: (1) `.git/` is skipped — copying it would destroy the parent's repo. The workdir's git history stays accessible at `.mill/runs/<id>/workdir/.git/` for users who want to cherry-pick it. (2) `.gitignore` is *merged*, not overwritten — the workdir's language-specific rules (`.build/`, `.swiftpm/`, …) are preserved alongside the `/.mill/` rule that `mill init` lays down. `MILL_PROMOTE_NEW_WORKDIR=auto|on|off` gates: `auto` skips when the parent root has user content beyond `{.git, .gitignore, .mill}` (don't silently overwrite); `on` always promotes; `off` never. Failures are logged + eventized (`workdir_promoted` / `workdir_promote_failed`) but never fail the run — the workdir is the source of truth either way.
+
 ## Environment knobs
 
-All config is env-driven via `orchestrator/config.ts`. Defaults live there. `.env.example` documents them. `MILL_ROOT` controls where `.mill/` is discovered from — important if you run the worker from a different cwd than the checkout. Other sub-stage gates: `MILL_ADVERSARIAL_REVIEW`, `MILL_TESTS_CRITIC`, `MILL_SPEC2TESTS`, `MILL_AGENT_TEAMS` — all accept `auto|on|off`, where `on` turns a missing dependency (or in the teams case, a failure) into a hard failure rather than a skip/fallback. `MILL_USER_MCP_CONFIG` overrides the path mill reads MCPs from when `inheritUserMcps: true` is passed.
+All config is env-driven via `orchestrator/config.ts`. Defaults live there. `.env.example` documents them. `MILL_ROOT` controls where `.mill/` is discovered from — important if you run the worker from a different cwd than the checkout. Other sub-stage gates: `MILL_ADVERSARIAL_REVIEW`, `MILL_TESTS_CRITIC`, `MILL_SPEC2TESTS`, `MILL_AGENT_TEAMS` — all accept `auto|on|off`, where `on` turns a missing dependency (or in the teams case, a failure) into a hard failure rather than a skip/fallback. `MILL_PROMOTE_NEW_WORKDIR=auto|on|off` gates new-mode workdir promotion (see above). `MILL_USER_MCP_CONFIG` overrides the paths mill reads MCPs from when `inheritUserMcps: true` is passed, collapsing the default two-file load to the single file specified. `ANTHROPIC_API_KEY` and `ANTHROPIC_AUTH_TOKEN` are scrubbed from the `claude` subprocess env so a key in the parent shell can't silently flip billing to API mode.

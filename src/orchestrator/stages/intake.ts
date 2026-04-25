@@ -4,6 +4,7 @@ import {
   inspectRepoState,
   newRunId,
   runPaths,
+  slugifyRequirement,
 } from "../../core/index.js";
 import type { RunMode, StateStore } from "../../core/index.js";
 import {
@@ -80,7 +81,13 @@ export async function intake(args: IntakeArgs): Promise<IntakeResult> {
   if (mode === "edit") {
     const state = await inspectRepoState(args.root);
     baseBranch = state.currentBranch;
-    branch = `mill/run-${runId}`;
+    // Branch name: `mill/<slug-from-requirement>-<shortId>`. Suffix is
+    // the run id's last 4 chars (random base36) so two runs with the
+    // same intent don't collide. Falls back to the legacy `run-<runId>`
+    // form when the requirement degenerates to all stop words.
+    const slug = slugifyRequirement(args.requirement);
+    const shortId = runId.slice(-4);
+    branch = slug ? `mill/${slug}-${shortId}` : `mill/run-${runId}`;
     try {
       await gitWorktreeAdd(args.root, branch, paths.workdir, "HEAD");
     } catch (err) {

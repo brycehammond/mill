@@ -66,6 +66,9 @@ export async function runCritic(args: RunCriticArgs): Promise<CriticResult> {
   const res = await runClaude({
     ctx,
     stage: "review",
+    // Each critic resumes its own session across review iterations. The
+    // slot is what runClaude saves into so --resume wires up correctly.
+    sessionSlot: slot,
     prompt,
     systemPrompt,
     // Critics fully own the system prompt — using "replace" drops
@@ -88,7 +91,11 @@ export async function runCritic(args: RunCriticArgs): Promise<CriticResult> {
     ],
     jsonSchema: CriticJsonSchema,
     resume: prior?.sessionId,
-    maxTurns: 20,
+    // Critics on a substantial codebase need plenty of Read/Glob/Grep
+    // turns before they can form an opinion. 20 was tight for a few-
+    // thousand-LOC project; 40 leaves room without giving the critic
+    // license to wander.
+    maxTurns: 40,
   });
 
   const parsed = CriticOutputSchema.parse(pickStructured(res));
@@ -105,14 +112,10 @@ export async function runCritic(args: RunCriticArgs): Promise<CriticResult> {
   const reportPath = join(reportDir, `${critic}.md`);
   await writeFile(reportPath, renderCriticReport(critic, parsed), "utf8");
 
-  // Commit cost + session + findings for this critic atomically. review.ts
-  // finalizes the `review` stage row after all three critics settle.
+  // cost, usage, and session are persisted incrementally by runClaude
+  // (under slot `review:<critic>`). Findings go in a transaction here so
+  // a crash between inserts leaves a coherent findings set.
   ctx.store.transaction(() => {
-    ctx.store.addRunCost(ctx.runId, res.costUsd);
-    ctx.store.addRunUsage(ctx.runId, res.usage);
-    if (res.sessionId) {
-      ctx.store.saveSession(ctx.runId, slot, res.sessionId, res.costUsd);
-    }
     for (const f of findings) {
       ctx.store.insertFinding({
         run_id: ctx.runId,

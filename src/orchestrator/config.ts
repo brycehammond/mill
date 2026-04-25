@@ -1,15 +1,17 @@
 import { resolve } from "node:path";
-import { findProjectRoot } from "../core/index.js";
+import { findProjectRoot, type StageName } from "../core/index.js";
 
-export interface DfConfig {
+export interface MillConfig {
   // Project root: the directory containing `.mill/`. Every command that
   // touches state is scoped to this root. `mill init` creates it;
   // `loadConfig()` refuses to return without one.
   root: string;
-  budgetUsdPerRun: number;
-  budgetUsdPerStage: number;
   timeoutSecPerRun: number;
   timeoutSecPerStage: number;
+  // Per-stage overrides. Stages not listed inherit timeoutSecPerStage.
+  // implement/verify default to 1800s because they genuinely write a lot
+  // of code; everyone else is fine at 600s.
+  timeoutSecPerStageOverrides: Partial<Record<StageName, number>>;
   maxConcurrentRuns: number;
   maxReviewIters: number;
   model: string | undefined;
@@ -33,15 +35,17 @@ export class NoProjectError extends Error {
 // Find the project the caller is cd'd inside, or honor MILL_ROOT for
 // scripts/tests that run outside a project tree. Throws NoProjectError
 // when no project is resolvable so the CLI can print a friendly message.
-export function loadConfig(): DfConfig {
+export function loadConfig(): MillConfig {
   const root = resolveProjectRoot();
   if (!root) throw new NoProjectError();
   return {
     root,
-    budgetUsdPerRun: numEnv("MILL_BUDGET_USD_PER_RUN", 20),
-    budgetUsdPerStage: numEnv("MILL_BUDGET_USD_PER_STAGE", 5),
-    timeoutSecPerRun: numEnv("MILL_TIMEOUT_SEC_PER_RUN", 3600),
+    timeoutSecPerRun: numEnv("MILL_TIMEOUT_SEC_PER_RUN", 14400),
     timeoutSecPerStage: numEnv("MILL_TIMEOUT_SEC_PER_STAGE", 600),
+    timeoutSecPerStageOverrides: {
+      implement: numEnv("MILL_TIMEOUT_SEC_IMPLEMENT", 7200),
+      verify: numEnv("MILL_TIMEOUT_SEC_VERIFY", 1800),
+    },
     maxConcurrentRuns: numEnv("MILL_MAX_CONCURRENT_RUNS", 2),
     maxReviewIters: numEnv("MILL_MAX_REVIEW_ITERS", 3),
     model: process.env.MILL_MODEL || undefined,

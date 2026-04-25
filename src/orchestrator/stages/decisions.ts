@@ -18,7 +18,6 @@ import type { FindingRow, RunContext, StageResult } from "../../core/index.js";
 import {
   appendDecisionEntries,
   readDecisionsTail,
-  usageStagePatch,
   type DecisionEntry,
 } from "../../core/index.js";
 import { loadPrompt } from "../prompts.js";
@@ -113,17 +112,10 @@ export async function decisions(args: DecisionsArgs): Promise<StageResult> {
       await appendDecisionEntries(ctx.root, entries);
     }
 
+    // cost, usage, and session are persisted incrementally by runClaude.
     ctx.store.transaction(() => {
-      ctx.store.addRunCost(ctx.runId, res.costUsd);
-      ctx.store.addRunUsage(ctx.runId, res.usage);
-      if (res.sessionId) {
-        ctx.store.saveSession(ctx.runId, "decisions", res.sessionId, res.costUsd);
-      }
       ctx.store.finishStage(ctx.runId, "decisions", {
         status: "completed",
-        cost_usd: res.costUsd,
-        ...usageStagePatch(res.usage),
-        session_id: res.sessionId,
         artifact_path: entries.length > 0 ? decisionsPathLabel(ctx) : null,
       });
       ctx.store.appendEvent(ctx.runId, "decisions", "decisions_extracted", {

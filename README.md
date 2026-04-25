@@ -46,9 +46,10 @@ cd /path/to/your/repo
 mill init
 ```
 
-Requires Node ≥ 22. No `ANTHROPIC_API_KEY` needed — `claude` handles auth via
-its own login flow (subscription or workspace). Setting `ANTHROPIC_API_KEY`
-will silently switch `claude` to API billing.
+Requires Node ≥ 22. `claude` handles auth via its own login flow
+(subscription or workspace); mill scrubs `ANTHROPIC_API_KEY` /
+`ANTHROPIC_AUTH_TOKEN` from the env it passes to `claude`, so an
+API key in your shell can't accidentally route billing through the API.
 
 ## Usage
 
@@ -57,7 +58,7 @@ will silently switch `claude` to API billing.
 mill new "TypeScript CLI that converts markdown to minified HTML"
 
 # Edit-mode run on an existing repo (auto-detected when the repo has
-# committed source). Creates a mill/run-<id> branch via git worktree.
+# committed source). Creates a mill/<slug>-<short-id> branch via git worktree.
 mill new "refactor the auth middleware" --mode edit --pr
 
 # Stop after a named stage so you can review before paying for the rest.
@@ -88,7 +89,6 @@ npm run worker
 Each pipeline stage calls `runClaude()` in `src/orchestrator/claude-cli.ts`,
 which `spawn`s the `claude` binary with flags for that stage:
 
-- `--max-budget-usd <n>` caps cost per invocation (no in-harness token math).
 - `--json-schema <schema>` forces structured output from clarify, design-ui,
   verify, and the critics. We pass a zod schema converted to JSON Schema.
 - `--resume <session-id>` keeps the implementer's session across review
@@ -109,7 +109,10 @@ which `spawn`s the `claude` binary with flags for that stage:
 - blocks `rm -rf /`, `sudo`, and related destructive commands
 
 The harness never calls the Anthropic API itself — `claude` does. We just
-orchestrate, sandbox, enforce budgets, and persist.
+orchestrate, sandbox, and persist. Auth runs through the user's Claude
+subscription (the harness scrubs `ANTHROPIC_API_KEY` / `ANTHROPIC_AUTH_TOKEN`
+from the env handed to `claude`), so there is no per-run dollar cap to
+enforce; cost numbers in the delivery report are tally-only.
 
 ## Critics
 
@@ -176,7 +179,7 @@ keep getting flagged on this repo.
 src/
 ├── cli.ts                          # mill init|new|run|status|logs|tail|kill
 │                                   # |onboard|history|findings
-├── core/                           # types, SQLite store, paths, budget, logger
+├── core/                           # types, SQLite store, paths, costs, logger
 │   ├── journal.ts | ledger.ts | decisions.ts | profile.ts | project.ts
 │   └── store.sqlite.ts
 └── orchestrator/
@@ -217,8 +220,6 @@ See `.env.example`. Relevant knobs:
 
 | Var | Default | Purpose |
 |---|---|---|
-| `MILL_BUDGET_USD_PER_RUN` | 20 | Hard cap on cumulative cost per run |
-| `MILL_BUDGET_USD_PER_STAGE` | 5 | Passed to each `claude` as `--max-budget-usd` |
 | `MILL_TIMEOUT_SEC_PER_RUN` | 3600 | Wall-clock cap per run |
 | `MILL_TIMEOUT_SEC_PER_STAGE` | 600 | Wall-clock cap per stage |
 | `MILL_MAX_REVIEW_ITERS` | 3 | implement ⇄ review loop cap |

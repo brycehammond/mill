@@ -1,39 +1,21 @@
 import {
-  BudgetExceededError,
   ZERO_USAGE,
-  type BudgetTracker,
+  type CostTracker,
   type StageName,
-  type StageRow,
   type TokenUsage,
 } from "./types.js";
 
-// Helper for stages to project a TokenUsage onto the StageRow columns
-// that finishStage accepts, so the persisted row matches what the
-// in-memory BudgetTracker saw.
-export function usageStagePatch(
-  usage: TokenUsage,
-): Pick<
-  StageRow,
-  "input_tokens" | "cache_creation_tokens" | "cache_read_tokens" | "output_tokens"
-> {
-  return {
-    input_tokens: usage.input,
-    cache_creation_tokens: usage.cache_creation,
-    cache_read_tokens: usage.cache_read,
-    output_tokens: usage.output,
-  };
-}
-
-export class BudgetTrackerImpl implements BudgetTracker {
+// In-memory cost / token-usage accumulator for a single run. Mirrors the
+// numbers the SQLite `runs` / `stages` rows hold — the DB is the source
+// of truth for resume; this is the live-process aggregator that stages
+// read for reporting (delivery summary, pipeline result).
+export class CostTrackerImpl implements CostTracker {
   private runUsed = 0;
   private readonly stageUsed = new Map<StageName, number>();
   private runTokens: TokenUsage = { ...ZERO_USAGE };
   private readonly stageTokens = new Map<StageName, TokenUsage>();
 
-  readonly limits: { runBudgetUsd: number; stageBudgetUsd: number };
-
-  constructor(runBudgetUsd: number, stageBudgetUsd: number, seedRunCost = 0) {
-    this.limits = { runBudgetUsd, stageBudgetUsd };
+  constructor(seedRunCost = 0) {
     this.runUsed = seedRunCost;
   }
 
@@ -64,15 +46,6 @@ export class BudgetTrackerImpl implements BudgetTracker {
   stageUsageTotal(stage: StageName): TokenUsage {
     return { ...(this.stageTokens.get(stage) ?? ZERO_USAGE) };
   }
-
-  checkRunBudget(): void {
-    if (this.runUsed > this.limits.runBudgetUsd) {
-      throw new BudgetExceededError("run", this.limits.runBudgetUsd, this.runUsed);
-    }
-  }
-
-  // Per-stage cap is enforced by `claude --max-budget-usd` in claude-cli.ts;
-  // the harness only tallies for reporting / cross-stage run total.
 
   snapshot() {
     const byStage: Partial<Record<StageName, number>> = {};
