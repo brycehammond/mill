@@ -41,6 +41,15 @@ export interface RetrySpec {
 export async function runWithRetry(args: RetrySpec): Promise<RunClaudeResult> {
   const { ctx, stage, label, attempt, validate } = args;
   const first = await attempt(undefined);
+  // Terminal subtypes (error_max_turns, error_during_execution) and
+  // is_error=true mean the model never finished its turn — adding a
+  // hint to the prompt cannot recover that. Retrying just doubles the
+  // spend before failing identically. Surface the real subtype so the
+  // caller can fix the underlying issue (bump maxTurns, investigate).
+  // Without this guard, an `error_max_turns` produced an empty result
+  // text → output-too-short validator → retry-with-hint → second
+  // error_max_turns, hiding the real cause.
+  throwIfTerminal(first, label, "first attempt");
   const firstHint = validate(first);
   if (firstHint === null) return first;
 
@@ -62,6 +71,7 @@ export async function runWithRetry(args: RetrySpec): Promise<RunClaudeResult> {
   }
 
   const second = await attempt(firstHint);
+  throwIfTerminal(second, label, "retry attempt");
   const secondHint = validate(second);
 
   // Cost and usage were already accumulated into the DB by runClaude on
@@ -100,6 +110,17 @@ export async function runWithRetry(args: RetrySpec): Promise<RunClaudeResult> {
     // ignore
   }
   throw new Error(`${label}: validation failed after retry (${secondHint})`);
+}
+
+function throwIfTerminal(
+  res: RunClaudeResult,
+  label: string,
+  which: string,
+): void {
+  if (res.subtype === "success" && !res.isError) return;
+  throw new Error(
+    `${label}: claude ${which} returned ${res.subtype} (is_error=${res.isError}); retry-with-hint cannot recover from a non-success result. Likely cause: maxTurns too low, or the model errored mid-turn.`,
+  );
 }
 
 function sumUsage(a: TokenUsage, b: TokenUsage): TokenUsage {

@@ -76,8 +76,14 @@ export async function spec(ctx: RunContext): Promise<StageResult> {
           systemPrompt,
           // Edit mode: read codebase with Read/Glob/Grep before specifying.
           // runClaude defaults cwd to ctx.paths.workdir, which is the git
-          // worktree checkout in edit mode.
-          maxTurns: ctx.mode === "edit" ? 12 : 4,
+          // worktree checkout in edit mode. 30 turns matches the critic
+          // budget — a real codebase needs many Read/Glob/Grep calls
+          // before the model can write a meaningful spec, and 12 was
+          // bottoming out as `error_max_turns` on populated repos
+          // (silent failure: empty markdown block triggered the
+          // output-too-short retry loop, doubling spend without ever
+          // letting the model finish the spec).
+          maxTurns: ctx.mode === "edit" ? 30 : 4,
           permissionMode: "default",
           allowedTools: ctx.mode === "edit" ? ["Read", "Glob", "Grep"] : [],
         }),
