@@ -5,6 +5,8 @@ import {
   readDecisionsTail,
   readJournalTail,
   readProfileSummary,
+  readStitchRef,
+  writeStitchRef,
 } from "../../core/index.js";
 import { loadPrompt } from "../prompts.js";
 import { zodToJsonSchema } from "zod-to-json-schema";
@@ -24,14 +26,28 @@ const UiDesignOutput = z.object({
 const UiDesignSchema = zodToJsonSchema(UiDesignOutput);
 
 export async function designUi(ctx: RunContext): Promise<StageResult> {
-  const systemPrompt = await loadPrompt("design-ui");
   const specBody = await readFile(ctx.paths.spec, "utf8");
   const journal = await readJournalTail(ctx.root, 20);
   const decisionsBlock = await readDecisionsTail(ctx.root, 10);
   const profile = await readProfileSummary(ctx.root);
   const profileBlock = profile ? `## Repo profile\n\n${profile}\n` : "";
 
-  const prompt = [profileBlock, decisionsBlock, journal, `## Spec`, specBody]
+  // Reuse mode: edit-mode runs that find a prior `.mill/stitch.json`
+  // get a different prompt (instructs `get_project` + `edit_screens`
+  // instead of `create_project`) and the project-level Stitch tools
+  // needed to confirm/recover from a stale URL. New mode and edit-mode
+  // first runs (no prior ref) take the original create-from-scratch
+  // path. Stale-URL recovery is the model's job — see design-ui-edit.md.
+  const existingRef = await readStitchRef(ctx.root);
+  const reuseMode = ctx.mode === "edit" && existingRef !== null;
+  const promptName = reuseMode ? "design-ui-edit" : "design-ui";
+  const systemPrompt = await loadPrompt(promptName);
+
+  const reuseBlock = reuseMode
+    ? `## Reuse Stitch project\n\nA prior run on this repo created a Stitch project. Reuse it instead of creating a new one.\n\n- **URL**: ${existingRef!.projectUrl}\n- **From run**: ${existingRef!.lastRunId}\n`
+    : "";
+
+  const prompt = [profileBlock, reuseBlock, decisionsBlock, journal, `## Spec`, specBody]
     .filter((s) => s !== "")
     .join("\n\n");
 
@@ -39,6 +55,22 @@ export async function designUi(ctx: RunContext): Promise<StageResult> {
   // settings. We pull it in via `inheritUserMcps` rather than
   // `settingSources: ["user"]` so user-level hooks (Stop, PostToolUse,
   // etc.) do NOT fire during mill stages — MCPs without hooks.
+  const allowedTools = [
+    "mcp__stitch__generate_screen_from_text",
+    "mcp__stitch__edit_screens",
+    "mcp__stitch__get_screen",
+    "mcp__stitch__list_screens",
+    "mcp__stitch__create_project",
+    "Read",
+    "Write",
+  ];
+  if (reuseMode) {
+    // get_project lets the model confirm the persisted URL is still
+    // valid; list_projects is the recovery path if it isn't (find a
+    // similarly-named project before falling back to create_project).
+    allowedTools.push("mcp__stitch__get_project", "mcp__stitch__list_projects");
+  }
+
   const res = await runClaude({
     ctx,
     stage: "design",
@@ -48,15 +80,7 @@ export async function designUi(ctx: RunContext): Promise<StageResult> {
     inheritUserMcps: true,
     permissionMode: "bypassPermissions",
     jsonSchema: UiDesignSchema,
-    allowedTools: [
-      "mcp__stitch__generate_screen_from_text",
-      "mcp__stitch__edit_screens",
-      "mcp__stitch__get_screen",
-      "mcp__stitch__list_screens",
-      "mcp__stitch__create_project",
-      "Read",
-      "Write",
-    ],
+    allowedTools,
     // Stitch generation is async: the model calls create_project,
     // generate_screen_from_text, then polls list_screens until the
     // screen materializes. Add the 2-3 ToolSearch turns Claude Code
@@ -72,6 +96,23 @@ export async function designUi(ctx: RunContext): Promise<StageResult> {
     "utf8",
   );
   if (parsed.stitch_url) {
+    // Update the cross-run pointer first, before the per-run artifact.
+    // A failure to update `.mill/stitch.json` (e.g. permissions) must
+    // not block the per-run `stitch_url.txt` from being written, so
+    // it's its own try/catch — but it should fire first so the cross-
+    // run state catches the latest URL even if writing the per-run
+    // file later fails for unrelated reasons.
+    try {
+      await writeStitchRef(ctx.root, {
+        projectUrl: parsed.stitch_url.trim(),
+        lastRunId: ctx.runId,
+        updatedAt: new Date().toISOString(),
+      });
+    } catch (err) {
+      ctx.logger.warn("failed to persist .mill/stitch.json", {
+        err: err instanceof Error ? err.message : String(err),
+      });
+    }
     await writeFile(ctx.paths.stitchUrl, parsed.stitch_url.trim() + "\n", "utf8");
   }
 

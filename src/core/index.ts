@@ -8,4 +8,5 @@ export * from "./journal.js";
 export * from "./profile.js";
 export * from "./ledger.js";
 export * from "./decisions.js";
+export * from "./stitch.js";
 export { SqliteStateStore, openStore } from "./store.js";

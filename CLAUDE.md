@@ -110,6 +110,7 @@ Three files at the project root under `.mill/` accumulate state that future runs
 - **`.mill/decisions.md`** — ADR-lite trade-off log. Written by `stages/decisions.ts` post-deliver, strictly gated (must cite a finding fingerprint, spec criterion, or external constraint — zero entries is the common case). Same delimiter convention.
 - **findings ledger** — aggregated from the `findings` SQLite table via `store.listLedgerEntries(...)` and rendered by `core/ledger.ts::renderLedgerHint`. Edit-mode only — surfaces recurring issues so the implementer preempts them.
 - **`.mill/profile.json`** — repo profile written by `mill onboard` (`orchestrator/onboard.ts`). Not per-run; refresh with `mill onboard --refresh`. Rendered into prompts via `readProfileSummary`.
+- **`.mill/stitch.json`** — Stitch project reference (URL + lastRunId + updatedAt) written by `stages/design.ui.ts` after a successful UI design. Edit-mode design runs that find this file load `prompts/design-ui-edit.md` instead of `prompts/design-ui.md` and get `mcp__stitch__get_project` + `mcp__stitch__list_projects` added to their allowedTools so they can confirm the URL is still live and reuse it via `edit_screens` instead of `create_project`. Stale-URL recovery is the model's job — the edit prompt instructs it to fall back to `create_project` if `get_project` returns not-found, and the new URL is written here on success. Helpers: `readStitchRef` / `writeStitchRef` in `core/stitch.ts`.
 
 ### CLAUDE.md is loaded by claude, not by mill
 
