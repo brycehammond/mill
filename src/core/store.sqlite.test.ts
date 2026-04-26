@@ -801,6 +801,226 @@ describe("SqliteStateStore", () => {
     s.close();
   });
 
+  // ---- project report aggregates ----
+
+  it("getProjectReportAggregates returns zeros for an empty project", () => {
+    const s = freshStore();
+    s.addProject({ id: "p1-aaaa", name: "p1", root_path: "/tmp/p1" });
+    const agg = s.getProjectReportAggregates("p1-aaaa");
+    assert.equal(agg.total_runs, 0);
+    assert.equal(agg.total_cost_usd, 0);
+    assert.equal(agg.avg_cost_usd, 0);
+    assert.equal(agg.avg_duration_ms, null);
+    assert.equal(agg.success_rate, null);
+    assert.equal(agg.first_run_at, null);
+    assert.equal(agg.last_run_at, null);
+    assert.equal(agg.by_status.completed, 0);
+    assert.equal(agg.by_mode.new, 0);
+    s.close();
+  });
+
+  it("getProjectReportAggregates rolls up status, cost, tokens, and duration", () => {
+    const s = freshStore();
+    s.addProject({ id: "p1-aaaa", name: "p1", root_path: "/tmp/p1" });
+    // r1: completed, mode=new, cost $1, ran for 500ms (start=1000, end=1500)
+    s.createRun({
+      id: "r1",
+      project_id: "p1-aaaa",
+      status: "completed",
+      kind: "ui",
+      mode: "new",
+      created_at: 1000,
+      requirement_path: "/x",
+    });
+    s.addRunCost("r1", 1.0);
+    s.addRunUsage("r1", {
+      input: 100,
+      cache_creation: 50,
+      cache_read: 200,
+      output: 25,
+    });
+    s.startStage("r1", "implement");
+    s.finishStage("r1", "implement", {
+      status: "completed",
+      started_at: 1000,
+      finished_at: 1500,
+    });
+    // r2: failed, mode=edit, cost $0.50, ran for 200ms (start=2000, end=2200)
+    s.createRun({
+      id: "r2",
+      project_id: "p1-aaaa",
+      status: "failed",
+      kind: "ui",
+      mode: "edit",
+      created_at: 2000,
+      requirement_path: "/y",
+    });
+    s.addRunCost("r2", 0.5);
+    s.startStage("r2", "implement");
+    s.finishStage("r2", "implement", {
+      status: "failed",
+      started_at: 2000,
+      finished_at: 2200,
+    });
+    // r3: queued, mode=edit, no cost, no stages
+    s.createRun({
+      id: "r3",
+      project_id: "p1-aaaa",
+      status: "queued",
+      kind: "ui",
+      mode: "edit",
+      created_at: 3000,
+      requirement_path: "/z",
+    });
+
+    const agg = s.getProjectReportAggregates("p1-aaaa");
+    assert.equal(agg.total_runs, 3);
+    assert.equal(agg.total_cost_usd, 1.5);
+    assert.equal(agg.avg_cost_usd, 0.5);
+    assert.equal(agg.total_input_tokens, 100);
+    assert.equal(agg.total_cache_read_tokens, 200);
+    assert.equal(agg.total_output_tokens, 25);
+    assert.equal(agg.first_run_at, 1000);
+    assert.equal(agg.last_run_at, 3000);
+    assert.equal(agg.by_status.completed, 1);
+    assert.equal(agg.by_status.failed, 1);
+    assert.equal(agg.by_status.queued, 1);
+    assert.equal(agg.by_mode.new, 1);
+    assert.equal(agg.by_mode.edit, 2);
+    // Avg duration over r1 (500ms) and r2 (200ms) = 350ms; r3 has no
+    // finished stage and is excluded.
+    assert.equal(agg.avg_duration_ms, 350);
+    // success_rate = 1 completed / (1 completed + 1 failed + 0 killed) = 0.5
+    assert.equal(agg.success_rate, 0.5);
+    s.close();
+  });
+
+  it("getProjectReportAggregates ignores runs from other projects", () => {
+    const s = freshStore();
+    s.addProject({ id: "p1-aaaa", name: "p1", root_path: "/tmp/p1" });
+    s.addProject({ id: "p2-bbbb", name: "p2", root_path: "/tmp/p2" });
+    s.createRun({
+      id: "r1",
+      project_id: "p1-aaaa",
+      status: "completed",
+      kind: "ui",
+      created_at: 1,
+      requirement_path: "/x",
+    });
+    s.addRunCost("r1", 1.0);
+    s.createRun({
+      id: "r2",
+      project_id: "p2-bbbb",
+      status: "completed",
+      kind: "ui",
+      created_at: 2,
+      requirement_path: "/y",
+    });
+    s.addRunCost("r2", 999);
+    const agg = s.getProjectReportAggregates("p1-aaaa");
+    assert.equal(agg.total_runs, 1);
+    assert.equal(agg.total_cost_usd, 1.0);
+    s.close();
+  });
+
+  it("getProjectCostByMonth returns a contiguous span ending in the current month", () => {
+    const s = freshStore();
+    s.addProject({ id: "p1-aaaa", name: "p1", root_path: "/tmp/p1" });
+    // Build a run in the current UTC month so we know at least one
+    // bucket has activity. Other buckets are zero-filled.
+    const now = Date.now();
+    s.createRun({
+      id: "r1",
+      project_id: "p1-aaaa",
+      status: "completed",
+      kind: "ui",
+      created_at: now,
+      requirement_path: "/x",
+    });
+    s.addRunCost("r1", 2.5);
+    const buckets = s.getProjectCostByMonth("p1-aaaa", 6);
+    assert.equal(buckets.length, 6);
+    // Months are oldest first; the last entry is the current month.
+    const last = buckets[buckets.length - 1]!;
+    const d = new Date();
+    const expected = `${d.getUTCFullYear().toString().padStart(4, "0")}-${(
+      d.getUTCMonth() + 1
+    )
+      .toString()
+      .padStart(2, "0")}`;
+    assert.equal(last.month, expected);
+    assert.equal(last.cost_usd, 2.5);
+    assert.equal(last.run_count, 1);
+    // Older months were zero-filled.
+    for (let i = 0; i < buckets.length - 1; i++) {
+      assert.equal(buckets[i]!.cost_usd, 0);
+      assert.equal(buckets[i]!.run_count, 0);
+    }
+    s.close();
+  });
+
+  it("getProjectStageRollups returns one row per stage in STAGE_ORDER, zero-filled", () => {
+    const s = freshStore();
+    s.addProject({ id: "p1-aaaa", name: "p1", root_path: "/tmp/p1" });
+    s.createRun({
+      id: "r1",
+      project_id: "p1-aaaa",
+      status: "completed",
+      kind: "ui",
+      created_at: 1,
+      requirement_path: "/x",
+    });
+    s.startStage("r1", "implement");
+    s.finishStage("r1", "implement", {
+      status: "completed",
+      started_at: 100,
+      finished_at: 600,
+      cost_usd: 0.4,
+    });
+    s.startStage("r1", "verify");
+    s.finishStage("r1", "verify", {
+      status: "failed",
+      started_at: 700,
+      finished_at: 800,
+      cost_usd: 0.1,
+    });
+    // Manually add cost via addStageCost to mimic streaming deltas.
+    s.addStageCost("r1", "implement", 0.6);
+
+    const rollups = s.getProjectStageRollups("p1-aaaa");
+    // One row per stage in STAGE_ORDER, in that order.
+    const names = rollups.map((r) => r.name);
+    assert.deepEqual(names, [
+      "intake",
+      "clarify",
+      "spec",
+      "design",
+      "spec2tests",
+      "implement",
+      "review",
+      "verify",
+      "deliver",
+      "decisions",
+    ]);
+    const impl = rollups.find((r) => r.name === "implement")!;
+    assert.equal(impl.total_runs, 1);
+    assert.equal(impl.completed, 1);
+    assert.equal(impl.failed, 0);
+    assert.equal(impl.total_cost_usd, 1.0);
+    assert.equal(impl.avg_duration_ms, 500);
+    const ver = rollups.find((r) => r.name === "verify")!;
+    assert.equal(ver.failed, 1);
+    assert.equal(ver.completed, 0);
+    // failed stage: avg_duration_ms only counts completed rows, so null.
+    assert.equal(ver.avg_duration_ms, null);
+    // Untouched stages are all zeros.
+    const intake = rollups.find((r) => r.name === "intake")!;
+    assert.equal(intake.total_runs, 0);
+    assert.equal(intake.total_cost_usd, 0);
+    assert.equal(intake.avg_duration_ms, null);
+    s.close();
+  });
+
   it("FK ON DELETE CASCADE removes gates and webhooks when the project row is hard-deleted", () => {
     // removeProject is a soft delete (sets removed_at); to exercise the
     // cascade we issue a raw DELETE via the store helper.

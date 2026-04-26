@@ -8,7 +8,10 @@ import type {
   DisplayStageRow,
   EventRow,
   FindingRow,
+  ProjectCostByMonth,
+  ProjectReportAggregates,
   ProjectRow,
+  ProjectStageRollup,
   ProjectWebhookRow,
   RunMode,
   RunRow,
@@ -20,7 +23,7 @@ import type {
   StateStore,
   TokenUsage,
 } from "./types.js";
-import { findingFingerprint } from "./types.js";
+import { findingFingerprint, STAGE_ORDER } from "./types.js";
 import { publishRunEvent } from "./event-bus.js";
 
 // Single writer; orchestrator is the only process calling mutating methods.
@@ -395,6 +398,198 @@ export class SqliteStateStore implements StateStore {
         `SELECT * FROM runs ${whereSql} ORDER BY created_at DESC LIMIT ?`,
       )
       .all(...args, limit) as RunRow[];
+  }
+
+  // ---- project report aggregates ----
+  //
+  // The three methods below back the /api/v1/projects/:id/report endpoint.
+  // Each is a single SQL pass; volumes are bounded by a project's run
+  // history (hundreds at most for a busy project), so we don't need
+  // pagination or pre-aggregated tables.
+
+  getProjectReportAggregates(projectId: string): ProjectReportAggregates {
+    const totals = this.db
+      .prepare(
+        `SELECT
+           COUNT(*) as total_runs,
+           COALESCE(SUM(total_cost_usd), 0) as total_cost_usd,
+           COALESCE(SUM(total_input_tokens), 0) as total_input_tokens,
+           COALESCE(SUM(total_output_tokens), 0) as total_output_tokens,
+           COALESCE(SUM(total_cache_read_tokens), 0) as total_cache_read_tokens,
+           COALESCE(SUM(total_cache_creation_tokens), 0) as total_cache_creation_tokens,
+           MIN(created_at) as first_run_at,
+           MAX(created_at) as last_run_at
+         FROM runs
+         WHERE project_id = ?`,
+      )
+      .get(projectId) as {
+      total_runs: number;
+      total_cost_usd: number;
+      total_input_tokens: number;
+      total_output_tokens: number;
+      total_cache_read_tokens: number;
+      total_cache_creation_tokens: number;
+      first_run_at: number | null;
+      last_run_at: number | null;
+    };
+
+    const statusRows = this.db
+      .prepare(
+        `SELECT status, COUNT(*) as n FROM runs WHERE project_id = ? GROUP BY status`,
+      )
+      .all(projectId) as { status: string; n: number }[];
+    const by_status: Record<RunStatus, number> = {
+      queued: 0,
+      awaiting_clarification: 0,
+      running: 0,
+      completed: 0,
+      failed: 0,
+      killed: 0,
+      paused_budget: 0,
+      awaiting_approval: 0,
+    };
+    for (const r of statusRows) {
+      if (r.status in by_status) {
+        by_status[r.status as RunStatus] = r.n;
+      }
+    }
+
+    const modeRows = this.db
+      .prepare(
+        `SELECT mode, COUNT(*) as n FROM runs WHERE project_id = ? GROUP BY mode`,
+      )
+      .all(projectId) as { mode: string; n: number }[];
+    const by_mode: Record<RunMode, number> = { new: 0, edit: 0 };
+    for (const r of modeRows) {
+      if (r.mode === "new" || r.mode === "edit") {
+        by_mode[r.mode] = r.n;
+      }
+    }
+
+    // Per-run duration: max(stages.finished_at) - run.created_at. Only
+    // counted when the run has at least one finished stage.
+    const durRow = this.db
+      .prepare(
+        `SELECT AVG(dur) as avg_dur FROM (
+           SELECT MAX(s.finished_at) - r.created_at AS dur
+           FROM runs r
+           JOIN stages s ON s.run_id = r.id
+           WHERE r.project_id = ? AND s.finished_at IS NOT NULL
+           GROUP BY r.id
+         )`,
+      )
+      .get(projectId) as { avg_dur: number | null };
+
+    const denom =
+      by_status.completed + by_status.failed + by_status.killed;
+    const success_rate = denom > 0 ? by_status.completed / denom : null;
+    const avg_cost_usd =
+      totals.total_runs > 0 ? totals.total_cost_usd / totals.total_runs : 0;
+
+    return {
+      total_runs: totals.total_runs,
+      by_status,
+      by_mode,
+      total_cost_usd: totals.total_cost_usd,
+      total_input_tokens: totals.total_input_tokens,
+      total_output_tokens: totals.total_output_tokens,
+      total_cache_read_tokens: totals.total_cache_read_tokens,
+      total_cache_creation_tokens: totals.total_cache_creation_tokens,
+      avg_cost_usd,
+      first_run_at: totals.first_run_at,
+      last_run_at: totals.last_run_at,
+      avg_duration_ms: durRow.avg_dur,
+      success_rate,
+    };
+  }
+
+  getProjectCostByMonth(
+    projectId: string,
+    months: number,
+  ): ProjectCostByMonth[] {
+    const span = Math.max(1, Math.floor(months));
+    // SQLite has no native UTC month bucket; group by strftime('%Y-%m')
+    // on a unix-ms timestamp (divide by 1000, treat as seconds).
+    const rows = this.db
+      .prepare(
+        `SELECT
+           strftime('%Y-%m', created_at / 1000, 'unixepoch') as month,
+           COALESCE(SUM(total_cost_usd), 0) as cost_usd,
+           COUNT(*) as run_count
+         FROM runs
+         WHERE project_id = ?
+         GROUP BY month`,
+      )
+      .all(projectId) as { month: string; cost_usd: number; run_count: number }[];
+    const byMonth = new Map<string, { cost_usd: number; run_count: number }>();
+    for (const r of rows) {
+      byMonth.set(r.month, { cost_usd: r.cost_usd, run_count: r.run_count });
+    }
+    // Build a contiguous span of `months` calendar months ending in
+    // the current UTC month so the UI gets a stable timeline.
+    const out: ProjectCostByMonth[] = [];
+    const now = new Date();
+    let y = now.getUTCFullYear();
+    let m = now.getUTCMonth(); // 0-11
+    for (let i = 0; i < span; i++) {
+      const key = `${y.toString().padStart(4, "0")}-${(m + 1)
+        .toString()
+        .padStart(2, "0")}`;
+      const hit = byMonth.get(key);
+      out.unshift({
+        month: key,
+        cost_usd: hit?.cost_usd ?? 0,
+        run_count: hit?.run_count ?? 0,
+      });
+      m -= 1;
+      if (m < 0) {
+        m = 11;
+        y -= 1;
+      }
+    }
+    return out;
+  }
+
+  getProjectStageRollups(projectId: string): ProjectStageRollup[] {
+    const rows = this.db
+      .prepare(
+        `SELECT
+           s.name as name,
+           COALESCE(SUM(s.cost_usd), 0) as total_cost_usd,
+           COUNT(*) as total_runs,
+           SUM(CASE WHEN s.status = 'completed' THEN 1 ELSE 0 END) as completed,
+           SUM(CASE WHEN s.status = 'failed' THEN 1 ELSE 0 END) as failed,
+           AVG(CASE
+                 WHEN s.status = 'completed' AND s.started_at IS NOT NULL AND s.finished_at IS NOT NULL
+                 THEN s.finished_at - s.started_at
+                 ELSE NULL
+               END) as avg_duration_ms
+         FROM stages s
+         JOIN runs r ON r.id = s.run_id
+         WHERE r.project_id = ?
+         GROUP BY s.name`,
+      )
+      .all(projectId) as {
+      name: string;
+      total_cost_usd: number;
+      total_runs: number;
+      completed: number;
+      failed: number;
+      avg_duration_ms: number | null;
+    }[];
+    const byName = new Map<string, (typeof rows)[number]>();
+    for (const r of rows) byName.set(r.name, r);
+    return STAGE_ORDER.map((name) => {
+      const r = byName.get(name);
+      return {
+        name,
+        total_cost_usd: r?.total_cost_usd ?? 0,
+        total_runs: r?.total_runs ?? 0,
+        completed: r?.completed ?? 0,
+        failed: r?.failed ?? 0,
+        avg_duration_ms: r?.avg_duration_ms ?? null,
+      };
+    });
   }
 
   // ---- projects ----

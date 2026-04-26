@@ -4,12 +4,21 @@ import { Hono } from "hono";
 import {
   addProject,
   ensureRunDirs,
+  projectStateDir,
+  readDecisions,
+  readJournal,
+  readProfile,
+  readStitchRef,
   resolveProjectByIdentifier,
   runPaths,
   STAGE_ORDER,
   type CriticName,
   type LedgerEntry,
+  type ProfileData,
+  type ProjectCostByMonth,
+  type ProjectReportAggregates,
   type ProjectRow,
+  type ProjectStageRollup,
   type ProjectWebhookRow,
   type RunMode,
   type RunRow,
@@ -17,7 +26,9 @@ import {
   type Severity,
   type StageName,
   type StateStore,
+  type StitchProjectRef,
 } from "../core/index.js";
+import { createLogger } from "../core/logger.js";
 import { SUPPORTED_WEBHOOK_EVENTS } from "./notify.js";
 import { intake, recordAnswers } from "../orchestrator/index.js";
 import { buildContext } from "../orchestrator/context.js";
@@ -612,6 +623,26 @@ export function buildServer(args: BuildServerArgs): Hono {
     });
   });
 
+  // Project report — bundles everything the report screen needs that
+  // isn't already exposed elsewhere. The UI separately calls
+  // getProject / listRuns / projectFindings / getProjectGates /
+  // listProjectWebhooks so we don't duplicate those here.
+  app.get("/api/v1/projects/:id/report", async (c) => {
+    const id = c.req.param("id");
+    const project = resolveProjectByIdentifier(store, id);
+    if (!project) httpError(404, `project not found: ${id}`);
+    const aggregates = store.getProjectReportAggregates(project.id);
+    const cost_by_month = store.getProjectCostByMonth(project.id, 12);
+    const stage_rollups = store.getProjectStageRollups(project.id);
+    const state_files = await readProjectStateFiles(project.id);
+    return c.json({
+      aggregates,
+      cost_by_month,
+      stage_rollups,
+      state_files,
+    } satisfies ProjectReportResponse);
+  });
+
   app.get("/api/v1/findings/suppressed", (c) =>
     c.json({ entries: store.listSuppressedFingerprints() }),
   );
@@ -758,6 +789,66 @@ function buildDashboard(store: StateStore): Dashboard {
     project_count: projects.length,
     projects: perProject,
     top_recurring_findings: ledger,
+  };
+}
+
+// Wire shape for the /api/v1/projects/:id/report endpoint. Mirrored
+// in web/src/types.ts for the UI client.
+interface ProjectReportResponse {
+  aggregates: ProjectReportAggregates;
+  cost_by_month: ProjectCostByMonth[];
+  stage_rollups: ProjectStageRollup[];
+  state_files: {
+    journal_md: string | null;
+    decisions_md: string | null;
+    profile_md: string | null;
+    profile_json: ProfileData | null;
+    stitch: StitchProjectRef | null;
+  };
+}
+
+// Read every per-project state file in parallel. A read failure on any
+// one file degrades to null for that field — a corrupt journal must not
+// take down the whole report. Missing files (the common case for fresh
+// projects) also return null and are not logged.
+const REPORT_LOG = createLogger({ component: "report" });
+
+async function readProjectStateFiles(
+  projectId: string,
+): Promise<ProjectReportResponse["state_files"]> {
+  const dir = projectStateDir(projectId);
+  const safe = async <T>(
+    label: string,
+    fn: () => Promise<T>,
+  ): Promise<T | null> => {
+    try {
+      return await fn();
+    } catch (err) {
+      REPORT_LOG.warn(`failed to read ${label}`, {
+        project_id: projectId,
+        error: err instanceof Error ? err.message : String(err),
+      });
+      return null;
+    }
+  };
+  const [journal, decisions, profile, stitch] = await Promise.all([
+    safe("journal.md", () => readJournal(dir).then((s) => (s ? s : null))),
+    safe("decisions.md", () => readDecisions(dir).then((s) => (s ? s : null))),
+    safe("profile", () => readProfile(dir)),
+    safe("stitch.json", () => readStitchRef(dir)),
+  ]);
+  // readProfile returns the structured object including the embedded
+  // markdown; expose both so the UI can render the markdown directly
+  // and still show structured fields if it wants to.
+  const profile_md = profile?.markdown && profile.markdown.trim()
+    ? profile.markdown
+    : null;
+  return {
+    journal_md: journal,
+    decisions_md: decisions,
+    profile_md,
+    profile_json: profile,
+    stitch,
   };
 }
 

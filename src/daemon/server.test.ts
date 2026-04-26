@@ -668,6 +668,158 @@ describe("daemon server", () => {
     await h.cleanup();
   });
 
+  it("GET /api/v1/projects/:id/report 404s on unknown project", async () => {
+    h = buildHarness();
+    const res = await fetchJson(h.app, "GET", "/api/v1/projects/nope/report");
+    assert.equal(res.status, 404);
+    await h.cleanup();
+  });
+
+  it("GET /api/v1/projects/:id/report returns zeros for an empty project", async () => {
+    h = buildHarness();
+    // Isolate state-file reads to a temp dir for this test (the
+    // endpoint reads from MILL_HOME via projectStateDir).
+    const millHome = await mkdtemp(join(tmpdir(), "mill-report-empty-"));
+    const prevHome = process.env.MILL_HOME;
+    process.env.MILL_HOME = millHome;
+    try {
+      const repo3 = await makeRepo("report-empty");
+      const created = await fetchJson(h.app, "POST", "/projects", {
+        root_path: repo3,
+      });
+      const projectId = (created.body as { project: { id: string } }).project.id;
+      const res = await fetchJson(
+        h.app,
+        "GET",
+        `/api/v1/projects/${projectId}/report`,
+      );
+      assert.equal(res.status, 200);
+      const body = res.body as {
+        aggregates: { total_runs: number; total_cost_usd: number };
+        cost_by_month: { month: string }[];
+        stage_rollups: { name: string; total_runs: number }[];
+        state_files: {
+          journal_md: string | null;
+          decisions_md: string | null;
+          profile_md: string | null;
+          profile_json: unknown;
+          stitch: unknown;
+        };
+      };
+      assert.equal(body.aggregates.total_runs, 0);
+      assert.equal(body.aggregates.total_cost_usd, 0);
+      assert.equal(body.cost_by_month.length, 12);
+      assert.equal(body.stage_rollups.length, 10);
+      // Zero-filled rollups for an empty project.
+      for (const sr of body.stage_rollups) {
+        assert.equal(sr.total_runs, 0);
+      }
+      assert.equal(body.state_files.journal_md, null);
+      assert.equal(body.state_files.decisions_md, null);
+      assert.equal(body.state_files.profile_md, null);
+      assert.equal(body.state_files.profile_json, null);
+      assert.equal(body.state_files.stitch, null);
+    } finally {
+      if (prevHome === undefined) delete process.env.MILL_HOME;
+      else process.env.MILL_HOME = prevHome;
+    }
+    await h.cleanup();
+  });
+
+  it("GET /api/v1/projects/:id/report rolls up runs and surfaces state files", async () => {
+    h = buildHarness();
+    const millHome = await mkdtemp(join(tmpdir(), "mill-report-full-"));
+    const prevHome = process.env.MILL_HOME;
+    process.env.MILL_HOME = millHome;
+    try {
+      const repo4 = await makeRepo("report-full");
+      const created = await fetchJson(h.app, "POST", "/projects", {
+        root_path: repo4,
+      });
+      const projectId = (created.body as { project: { id: string } }).project.id;
+
+      // Drop journal + decisions + profile files into the project's
+      // state dir so the report surfaces them.
+      const stateDir = join(millHome, "projects", projectId);
+      await execFileP("mkdir", ["-p", stateDir]);
+      await writeFile(
+        join(stateDir, "journal.md"),
+        "### r1 · new · ✅\n\n- Date: 2026-04-01\n- Cost: $0.10\n",
+        "utf8",
+      );
+      await writeFile(
+        join(stateDir, "decisions.md"),
+        "## 2026-04-01 · Use SQLite\n\n**Context**: ...\n",
+        "utf8",
+      );
+      await writeFile(
+        join(stateDir, "profile.json"),
+        JSON.stringify({
+          generatedAt: "2026-04-01T00:00:00Z",
+          stack: "Node/TypeScript",
+          commands: { test: "npm test" },
+          doNotTouch: [],
+          markdown: "# Profile\n\nNode/TypeScript repo.\n",
+        }),
+        "utf8",
+      );
+
+      // Seed a completed run with cost + a stage so aggregates are non-zero.
+      h.store.createRun({
+        id: "rep-r1",
+        project_id: projectId,
+        status: "completed",
+        kind: "ui",
+        mode: "new",
+        created_at: Date.now(),
+        requirement_path: "/x",
+      });
+      h.store.addRunCost("rep-r1", 0.42);
+      h.store.startStage("rep-r1", "implement");
+      h.store.finishStage("rep-r1", "implement", {
+        status: "completed",
+        started_at: 1000,
+        finished_at: 2000,
+        cost_usd: 0.42,
+      });
+
+      const res = await fetchJson(
+        h.app,
+        "GET",
+        `/api/v1/projects/${projectId}/report`,
+      );
+      assert.equal(res.status, 200);
+      const body = res.body as {
+        aggregates: {
+          total_runs: number;
+          total_cost_usd: number;
+          by_status: Record<string, number>;
+        };
+        stage_rollups: { name: string; total_runs: number; total_cost_usd: number }[];
+        state_files: {
+          journal_md: string | null;
+          decisions_md: string | null;
+          profile_md: string | null;
+          profile_json: { stack: string } | null;
+        };
+      };
+      assert.equal(body.aggregates.total_runs, 1);
+      assert.equal(body.aggregates.total_cost_usd, 0.42);
+      assert.equal(body.aggregates.by_status.completed, 1);
+      const impl = body.stage_rollups.find((s) => s.name === "implement")!;
+      assert.equal(impl.total_runs, 1);
+      assert.equal(impl.total_cost_usd, 0.42);
+      assert.match(body.state_files.journal_md ?? "", /r1 · new/);
+      assert.match(body.state_files.decisions_md ?? "", /Use SQLite/);
+      assert.match(body.state_files.profile_md ?? "", /Node\/TypeScript/);
+      assert.equal(body.state_files.profile_json?.stack, "Node/TypeScript");
+    } finally {
+      if (prevHome === undefined) delete process.env.MILL_HOME;
+      else process.env.MILL_HOME = prevHome;
+    }
+    await h.cleanup();
+  });
+
   it("/api/v1/findings/suppressed CRUD round-trips", async () => {
     h = buildHarness();
     const fp = "ux|MEDIUM|missing copy";

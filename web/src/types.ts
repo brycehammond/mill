@@ -203,3 +203,72 @@ export interface WireEvent {
   kind: string;
   payload: unknown;
 }
+
+// ---- Project report (mirrors src/core/types.ts + src/daemon/server.ts) ----
+
+export interface ProjectReportAggregates {
+  total_runs: number;
+  by_status: Record<RunStatus, number>;
+  by_mode: Record<RunMode, number>;
+  total_cost_usd: number;
+  total_input_tokens: number;
+  total_output_tokens: number;
+  total_cache_read_tokens: number;
+  total_cache_creation_tokens: number;
+  avg_cost_usd: number;
+  first_run_at: number | null;
+  last_run_at: number | null;
+  avg_duration_ms: number | null;
+  success_rate: number | null;
+}
+
+export interface ProjectCostByMonth {
+  month: string;
+  cost_usd: number;
+  run_count: number;
+}
+
+export interface ProjectStageRollup {
+  name: StageName;
+  total_cost_usd: number;
+  total_runs: number;
+  completed: number;
+  failed: number;
+  avg_duration_ms: number | null;
+}
+
+export interface ProfileCommands {
+  test: string | null;
+  build: string | null;
+  lint: string | null;
+  typecheck: string | null;
+  devServer: string | null;
+  format: string | null;
+}
+
+export interface ProfileData {
+  generatedAt: string;
+  stack: string;
+  commands: ProfileCommands;
+  doNotTouch: string[];
+  markdown: string;
+}
+
+export interface StitchProjectRef {
+  projectUrl: string;
+  lastRunId: string;
+  updatedAt: string;
+}
+
+export interface ProjectReportResponse {
+  aggregates: ProjectReportAggregates;
+  cost_by_month: ProjectCostByMonth[];
+  stage_rollups: ProjectStageRollup[];
+  state_files: {
+    journal_md: string | null;
+    decisions_md: string | null;
+    profile_md: string | null;
+    profile_json: ProfileData | null;
+    stitch: StitchProjectRef | null;
+  };
+}

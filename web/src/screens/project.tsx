@@ -58,7 +58,15 @@ export function ProjectScreen({ projectId }: { projectId: string }) {
   return (
     <div className="space-y-6">
       <header>
-        <h1 className="font-mono text-lg">{p.name}</h1>
+        <div className="flex items-baseline justify-between gap-2 flex-wrap">
+          <h1 className="font-mono text-lg">{p.name}</h1>
+          <a
+            href={`/projects/${encodeURIComponent(projectId)}/report`}
+            className="text-xs text-blue-300 hover:text-blue-200 font-mono"
+          >
+            view report →
+          </a>
+        </div>
         <div className="text-xs text-ink-300 font-mono break-all">{p.root_path}</div>
         <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 mt-3 text-xs">
           <Stat label="today" value={fmtUsd(p.cost_today_usd)} />

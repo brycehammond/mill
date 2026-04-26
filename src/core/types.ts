@@ -272,6 +272,55 @@ export interface FindingRow {
   fingerprint: string;
 }
 
+// Project-scoped lifetime aggregates. Powers the project report page —
+// one row, derived from `runs` + `stages`. Counts are for the project's
+// entire history; cost/token totals sum across every run.
+export interface ProjectReportAggregates {
+  total_runs: number;
+  by_status: Record<RunStatus, number>;
+  by_mode: Record<RunMode, number>;
+  total_cost_usd: number;
+  total_input_tokens: number;
+  total_output_tokens: number;
+  total_cache_read_tokens: number;
+  total_cache_creation_tokens: number;
+  // total_cost_usd / total_runs, or 0 when total_runs == 0.
+  avg_cost_usd: number;
+  first_run_at: number | null;
+  last_run_at: number | null;
+  // Average end-to-end run duration in ms. Derived from
+  // max(stages.finished_at) - run.created_at across runs that have at
+  // least one finished stage. Null when no run has finished a stage.
+  avg_duration_ms: number | null;
+  // completed / (completed + failed + killed). Null when denominator is 0
+  // (no terminal-state runs yet).
+  success_rate: number | null;
+}
+
+// Calendar-month rollup of cost + run count. Months returned in
+// chronological order. Months with no activity are still included so the
+// UI can render a stable timeline (zero-cost rows for gaps).
+export interface ProjectCostByMonth {
+  month: string; // "YYYY-MM" UTC
+  cost_usd: number;
+  run_count: number;
+}
+
+// Per-stage rollup across the project's lifetime. One row per stage in
+// STAGE_ORDER (zeros for stages never run, so the UI table is stable).
+export interface ProjectStageRollup {
+  name: StageName;
+  // Total cost for this stage across every run that touched it.
+  total_cost_usd: number;
+  // Distinct runs whose `stages` row exists for this stage (any status).
+  total_runs: number;
+  completed: number;
+  failed: number;
+  // Average duration of (finished_at - started_at) across completed
+  // stage rows. Null when no completed row has both timestamps.
+  avg_duration_ms: number | null;
+}
+
 // Aggregated view across runs. One row per fingerprint.
 export interface LedgerEntry {
   fingerprint: string;
@@ -460,6 +509,16 @@ export interface StateStore {
     limit?: number;
     projectId?: string;
   }): RunRow[];
+
+  // Lifetime aggregates for the project report page. Single SQL pass
+  // over runs + stages; safe to call on the request path.
+  getProjectReportAggregates(projectId: string): ProjectReportAggregates;
+  // Last `months` calendar months UTC, oldest first. Includes zero-cost
+  // rows for months with no runs so the UI gets a contiguous timeline.
+  getProjectCostByMonth(projectId: string, months: number): ProjectCostByMonth[];
+  // One row per stage in STAGE_ORDER (zero-filled when the stage was
+  // never run for this project), so the UI can render a stable table.
+  getProjectStageRollups(projectId: string): ProjectStageRollup[];
 
   startStage(runId: string, name: StageName): void;
   finishStage(

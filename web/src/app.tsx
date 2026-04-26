@@ -3,6 +3,7 @@ import { RouterProvider, match, useRoute } from "./router.js";
 import { DashboardScreen } from "./screens/dashboard.js";
 import { LoginScreen } from "./screens/login.js";
 import { ProjectScreen } from "./screens/project.js";
+import { ProjectReportScreen } from "./screens/project-report.js";
 import { RunScreen } from "./screens/run.js";
 import { FindingsScreen } from "./screens/findings.js";
 
@@ -13,6 +14,16 @@ function Routes() {
     return (
       <Layout>
         <DashboardScreen />
+      </Layout>
+    );
+  }
+  // The more-specific /projects/:id/report path must match before the
+  // /projects/:id arm since `match` requires equal segment counts.
+  const projectReport = match("/projects/:id/report", path);
+  if (projectReport) {
+    return (
+      <Layout>
+        <ProjectReportScreen projectId={projectReport.id!} />
       </Layout>
     );
   }

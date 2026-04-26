@@ -7,11 +7,9 @@ import {
   fmtRelativeTs,
   fmtUsd,
 } from "../components/format.js";
-import {
-  RunStatusBadge,
-  SeverityBadge,
-  StageStatusGlyph,
-} from "../components/StatusBadge.js";
+import { RunStatusBadge } from "../components/StatusBadge.js";
+import { StageTimeline } from "../components/StageTimeline.js";
+import { FindingsCounts } from "../components/FindingsCounts.js";
 import { useRunEventStream } from "../sse.js";
 import { ErrorState, Loading, SectionHeading } from "./dashboard.js";
 import type { DisplayStage, Run, RunDetail, WireEvent } from "../types.js";
@@ -37,7 +35,7 @@ export function RunScreen({ runId }: { runId: string }) {
       <RunHeader runId={runId} run={d.run} stages={d.stages} />
       <ApprovalBanner runId={runId} run={d.run} stages={d.stages} />
       <BudgetBanner runId={runId} run={d.run} />
-      <StageTimeline stages={d.stages} />
+      <StageTimelineSection stages={d.stages} />
       <ActivityFeedPanel runId={runId} />
       <FindingsPanel runId={runId} totals={d.findings_counts} />
       <CostPanel stages={d.stages} runTotal={d.run.total_cost_usd} />
@@ -353,41 +351,12 @@ function DT({ label, value }: { label: string; value: string }) {
   );
 }
 
-function StageTimeline({ stages }: { stages: DisplayStage[] }) {
-  if (stages.length === 0) {
-    return null;
-  }
+function StageTimelineSection({ stages }: { stages: DisplayStage[] }) {
+  if (stages.length === 0) return null;
   return (
     <section>
       <SectionHeading>stages</SectionHeading>
-      <ol className="rounded border border-ink-700 bg-ink-800 divide-y divide-ink-700">
-        {stages.map((s, idx) => {
-          const dur =
-            s.started_at && s.finished_at
-              ? s.finished_at - s.started_at
-              : null;
-          return (
-            <li
-              key={`${s.name}-${s.iteration ?? "n"}-${idx}`}
-              className="px-3 py-2 flex items-center gap-3 text-sm"
-            >
-              <StageStatusGlyph status={s.status} />
-              <span className="font-mono w-32 sm:w-44 truncate">
-                {s.displayName}
-              </span>
-              <span className="text-xs text-ink-300 font-mono w-16 shrink-0">
-                {fmtUsd(s.cost_usd)}
-              </span>
-              <span className="text-xs text-ink-300 font-mono w-16 shrink-0">
-                {fmtDurationMs(dur)}
-              </span>
-              <span className="text-xs text-ink-300 truncate">
-                {s.error ? `error: ${s.error}` : ""}
-              </span>
-            </li>
-          );
-        })}
-      </ol>
+      <StageTimeline stages={stages} />
     </section>
   );
 }
@@ -540,28 +509,14 @@ function FindingsPanel({
   totals: RunDetail["findings_counts"];
 }) {
   // Counts come from the run detail. The list endpoint isn't on the
-  // server yet for per-run findings (only ledger entries), so we keep
-  // this simple — show counts plus a hint.
+  // server yet for per-run findings (only ledger entries), so we just
+  // show the severity counts.
   void runId;
-  if (totals.total === 0) {
-    return null;
-  }
+  if (totals.total === 0) return null;
   return (
     <section>
       <SectionHeading>findings</SectionHeading>
-      <div className="rounded border border-ink-700 bg-ink-800 p-3 flex items-center gap-3 flex-wrap">
-        {(["CRITICAL", "HIGH", "MEDIUM", "LOW"] as const).map((sev) =>
-          totals[sev] > 0 ? (
-            <div key={sev} className="flex items-center gap-1.5">
-              <SeverityBadge severity={sev} />
-              <span className="font-mono text-sm">{totals[sev]}</span>
-            </div>
-          ) : null,
-        )}
-        <span className="text-xs text-ink-300 ml-auto">
-          {totals.total} total
-        </span>
-      </div>
+      <FindingsCounts totals={totals} />
     </section>
   );
 }

@@ -5,6 +5,7 @@ import type {
   LedgerEntry,
   Project,
   ProjectGates,
+  ProjectReportResponse,
   Run,
   RunDetail,
   SessionInfo,
@@ -136,6 +137,12 @@ export const api = {
     req<{ entries: LedgerEntry[] }>(
       "GET",
       `/api/v1/projects/${encodeURIComponent(projectId)}/findings`,
+    ),
+
+  getProjectReport: (projectId: string) =>
+    req<ProjectReportResponse>(
+      "GET",
+      `/api/v1/projects/${encodeURIComponent(projectId)}/report`,
     ),
 
   findings: (
