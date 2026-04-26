@@ -28,6 +28,7 @@ import {
   loadConfig,
   NoProjectError,
   onboard,
+  startStageProgressTicker,
 } from "./orchestrator/index.js";
 import type { PipelineResult } from "./orchestrator/pipeline.js";
 
@@ -438,12 +439,27 @@ async function cmdNew(argv: string[]) {
     : "spec → design → implement ⇄ review → verify → deliver";
   console.log(`${dim("▸")} running pipeline: ${stageList}`);
   installInlineAbortHandler(ctx);
-  const result = await runPipeline({
+  const ticker = startStageProgressTicker({
+    store,
     runId,
-    config,
-    ctx,
-    ...(stopAfter ? { stopAfter } : {}),
+    fmtDurationMs,
+    fmtCost,
+    green,
+    red,
+    yellow,
+    dim,
   });
+  let result: PipelineResult;
+  try {
+    result = await runPipeline({
+      runId,
+      config,
+      ctx,
+      ...(stopAfter ? { stopAfter } : {}),
+    });
+  } finally {
+    ticker.stop();
+  }
   const paths = runPaths(config.root, runId);
   printPipelineOutcome(result, { store, paths, stopAfter });
 }
@@ -562,7 +578,22 @@ async function cmdRun(argv: string[]) {
     store.updateRun(runId, { status: "running" });
   }
   installInlineAbortHandler(ctx);
-  const result = await runPipeline({ runId, config, ctx });
+  const ticker = startStageProgressTicker({
+    store,
+    runId,
+    fmtDurationMs,
+    fmtCost,
+    green,
+    red,
+    yellow,
+    dim,
+  });
+  let result: PipelineResult;
+  try {
+    result = await runPipeline({ runId, config, ctx });
+  } finally {
+    ticker.stop();
+  }
   const paths = runPaths(config.root, runId);
   printPipelineOutcome(result, { store, paths });
 }

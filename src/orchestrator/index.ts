@@ -5,3 +5,5 @@ export { loadConfig, NoProjectError } from "./config.js";
 export type { MillConfig } from "./config.js";
 export { onboard } from "./onboard.js";
 export type { OnboardArgs, OnboardResult } from "./onboard.js";
+export { startStageProgressTicker } from "./progress.js";
+export type { ProgressTickerHandle } from "./progress.js";
