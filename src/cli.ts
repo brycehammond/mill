@@ -12,7 +12,9 @@ import {
   detectRunMode,
   readJournal,
   journalPath,
+  atLeast,
   type Clarifications,
+  type DisplayStageRow,
   type RunMode,
   type RunRow,
   type StageRow,
@@ -261,11 +263,10 @@ function printHelp() {
       h("Runs"),
       `  ${c("mill new")} (<requirement...> | --from <file>)`,
       `           [--mode new|edit|auto] [--stop-after spec|design|spec2tests]`,
-      `           [--pr] [--detach] [--all-defaults]`,
+      `           [--detach] [--all-defaults]`,
       `    ${d("--mode auto")}         detects edit when the repo has committed source,`,
       `                        otherwise new (scaffolds into .mill/runs/<id>/workdir/)`,
       `    ${d("--stop-after <s>")}    halts after a named stage; resume with mill run <id>`,
-      `    ${d("--pr")}                pushes the branch and opens a GitHub PR (edit only)`,
       `    ${d("--detach")}            queues the run; use mill worker to execute`,
       `    ${d("--all-defaults")}      accept every clarify default (no prompting)`,
       `  ${c("mill run")} <run-id>              resume a run, skipping completed stages`,
@@ -315,7 +316,6 @@ async function cmdNew(argv: string[]) {
       "all-defaults": { type: "boolean", default: false },
       from: { type: "string" },
       mode: { type: "string", default: "auto" },
-      pr: { type: "boolean", default: false },
       "stop-after": { type: "string" },
     },
   });
@@ -369,12 +369,6 @@ async function cmdNew(argv: string[]) {
 
   const effectiveMode: RunMode =
     rawMode === "auto" ? await detectRunMode(config.root) : (rawMode as RunMode);
-  const prFlag = Boolean(values.pr);
-  if (prFlag && effectiveMode === "new") {
-    console.error("mill new: --pr requires edit mode");
-    process.exitCode = 2;
-    return;
-  }
 
   if (rawMode === "auto") {
     console.log(`${dim("mode:")} ${effectiveMode} ${dim("(auto)")}`);
@@ -389,7 +383,6 @@ async function cmdNew(argv: string[]) {
       root: config.root,
       store,
       mode: effectiveMode,
-      pr: prFlag,
     });
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
@@ -493,12 +486,12 @@ function printPipelineOutcome(
   if (result.reason) console.log(dim(`  reason: ${result.reason}`));
 
   // Compact per-stage breakdown — easier to scan than JSON.
-  const stages = opts.store.listStages(result.runId);
+  const stages = opts.store.listDisplayStages(result.runId);
   if (stages.length > 0) {
     console.log();
     const rows = stages.map((s) => [
       dim("·"),
-      s.name,
+      s.displayName,
       colorStageStatus(s.status),
       fmtCost(s.cost_usd),
       s.started_at ? dim(fmtStageDuration(s)) : dim("—"),
@@ -523,7 +516,7 @@ function printPipelineOutcome(
   }
 }
 
-function fmtStageDuration(s: StageRow): string {
+function fmtStageDuration(s: Pick<StageRow, "started_at" | "finished_at">): string {
   if (!s.started_at) return "—";
   const end = s.finished_at ?? Date.now();
   return fmtDurationMs(end - s.started_at);
@@ -852,10 +845,10 @@ async function cmdStatus(argv: string[]) {
     process.exitCode = 1;
     return;
   }
-  const stages = store.listStages(runId);
+  const stages = store.listDisplayStages(runId);
   renderRunHeader(run);
   console.log();
-  renderStageTable(stages);
+  renderStageTable(stages, store, runId);
 }
 
 function renderRunHeader(run: RunRow) {
@@ -875,11 +868,29 @@ function renderRunHeader(run: RunRow) {
   console.log(renderTable(rows));
 }
 
-function renderStageTable(stages: StageRow[]) {
+function renderStageTable(
+  stages: DisplayStageRow[],
+  store?: ReturnType<typeof openStore>,
+  runId?: string,
+) {
   if (stages.length === 0) {
     console.log(dim("(no stages yet)"));
     return;
   }
+  // Per-iteration HIGH+ finding counts let the user see at a glance
+  // *which* review iteration found what — review#1 might have flagged
+  // 5 issues, review#3 only 2. Looked up once and cached so the table
+  // doesn't fan out one DB call per row.
+  const highByIter = new Map<number, number>();
+  if (store && runId && stages.some((s) => s.name === "review")) {
+    for (const f of store.listFindings(runId)) {
+      if (atLeast(f.severity, "HIGH")) {
+        highByIter.set(f.iteration, (highByIter.get(f.iteration) ?? 0) + 1);
+      }
+    }
+  }
+  const notes = stages.map((s) => stageNote(s, highByIter));
+  const showNote = notes.some((n) => n !== "");
   const header = [
     dim("stage"),
     dim("status"),
@@ -890,9 +901,10 @@ function renderStageTable(stages: StageRow[]) {
     dim("out"),
     dim("elapsed"),
     dim("started"),
+    ...(showNote ? [dim("note")] : []),
   ];
-  const rows = stages.map((s) => [
-    s.name,
+  const rows = stages.map((s, i) => [
+    s.displayName,
     colorStageStatus(s.status),
     fmtCost(s.cost_usd),
     compactTokens(s.input_tokens),
@@ -901,12 +913,25 @@ function renderStageTable(stages: StageRow[]) {
     compactTokens(s.output_tokens),
     s.started_at ? dim(fmtStageDuration(s)) : dim("—"),
     s.started_at ? dim(relTime(s.started_at)) : dim("—"),
+    ...(showNote ? [notes[i] ? dim(notes[i]!) : ""] : []),
   ]);
   console.log(
     renderTable([header, ...rows], {
       alignRight: new Set([2, 3, 4, 5, 6, 7]),
     }),
   );
+}
+
+function stageNote(
+  s: DisplayStageRow,
+  highByIter: Map<number, number>,
+): string {
+  if (s.name === "review" && s.iteration !== null && s.status === "completed") {
+    const n = highByIter.get(s.iteration) ?? 0;
+    if (n === 0) return "no HIGH+ findings";
+    return `${n} HIGH+ ${n === 1 ? "finding" : "findings"}`;
+  }
+  return "";
 }
 
 // Format token counts for the compact per-stage column: 1.2k, 342, 4.8M, etc.

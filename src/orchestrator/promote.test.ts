@@ -1,13 +1,41 @@
 import { strict as assert } from "node:assert";
+import { execFile } from "node:child_process";
 import { mkdir, mkdtemp, readFile, readdir, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, it } from "node:test";
+import { promisify } from "node:util";
 import {
+  importWorkdirBranchToParent,
   isParentSafeForAutoPromote,
   promoteWorkdir,
   resolvePromoteMode,
 } from "./promote.js";
+
+const execFileP = promisify(execFile);
+
+async function git(cwd: string, args: string[]): Promise<string> {
+  const { stdout } = await execFileP("git", args, { cwd });
+  return stdout;
+}
+
+async function initRepoWithCommit(
+  dir: string,
+  branch: string,
+  filename: string,
+  content: string,
+): Promise<void> {
+  await git(dir, ["init", "--initial-branch=" + branch]).catch(async () => {
+    await git(dir, ["init"]);
+    await git(dir, ["checkout", "-b", branch]);
+  });
+  await git(dir, ["config", "user.email", "test@example.com"]);
+  await git(dir, ["config", "user.name", "test"]);
+  await git(dir, ["config", "commit.gpgsign", "false"]);
+  await writeFile(join(dir, filename), content, "utf8");
+  await git(dir, ["add", "-A"]);
+  await git(dir, ["commit", "-m", "initial"]);
+}
 
 async function tempDir(prefix: string): Promise<string> {
   return mkdtemp(join(tmpdir(), `mill-promote-${prefix}-`));
@@ -127,5 +155,85 @@ describe("promoteWorkdir", () => {
     const entries = await readdir(root);
     assert.ok(entries.includes("Package.swift"));
     assert.ok(entries.includes("README.md")); // user file preserved (not in workdir)
+  });
+});
+
+describe("importWorkdirBranchToParent", () => {
+  it("imports new-mode branch into a fresh parent (no .git yet)", async () => {
+    const workdir = await tempDir("import-wd");
+    const root = await tempDir("import-root");
+    await initRepoWithCommit(workdir, "main", "hello.txt", "hi\n");
+
+    const result = await importWorkdirBranchToParent({ workdir, root });
+    assert.equal(result.imported, true, `outcome=${result.outcome}`);
+    assert.equal(result.branch, "main");
+    assert.equal(result.outcome, "checkout");
+
+    // Parent should now have main branch with the import file checked out.
+    const branches = await git(root, ["branch", "--list"]);
+    assert.match(branches, /main/);
+    const log = await git(root, ["log", "--oneline"]);
+    assert.match(log, /initial/);
+    const file = await readFile(join(root, "hello.txt"), "utf8");
+    assert.equal(file, "hi\n");
+  });
+
+  it("imports branch into a parent that already has its own commits", async () => {
+    const workdir = await tempDir("import-wd2");
+    const root = await tempDir("import-root2");
+    await initRepoWithCommit(root, "main", "parent.txt", "parent\n");
+    await initRepoWithCommit(workdir, "feature", "child.txt", "child\n");
+
+    const result = await importWorkdirBranchToParent({ workdir, root });
+    assert.equal(result.imported, true);
+    assert.equal(result.branch, "feature");
+    assert.equal(result.outcome, "ref-only");
+
+    // Parent's HEAD should still be on `main` with parent.txt; the
+    // imported branch lives in refs but isn't checked out.
+    const head = (await git(root, ["rev-parse", "--abbrev-ref", "HEAD"])).trim();
+    assert.equal(head, "main");
+    const branches = await git(root, ["branch", "--list"]);
+    assert.match(branches, /feature/);
+    const featureLog = await git(root, ["log", "--oneline", "feature"]);
+    assert.match(featureLog, /initial/);
+  });
+
+  it("is a no-op for an edit-mode worktree (branch already in parent)", async () => {
+    const root = await tempDir("import-edit-root");
+    const worktree = await tempDir("import-edit-wt");
+    // Set up the parent and create a linked worktree on a fresh branch.
+    await initRepoWithCommit(root, "main", "main.txt", "main\n");
+    // git worktree add requires the target path to not exist; remove it first.
+    const { rm } = await import("node:fs/promises");
+    await rm(worktree, { recursive: true, force: true });
+    await git(root, ["worktree", "add", "-b", "mill/test-branch", worktree, "HEAD"]);
+    await writeFile(join(worktree, "feature.txt"), "feature\n", "utf8");
+    await git(worktree, ["config", "user.email", "test@example.com"]);
+    await git(worktree, ["config", "user.name", "test"]);
+    await git(worktree, ["add", "-A"]);
+    await git(worktree, ["commit", "-m", "add feature"]);
+
+    const result = await importWorkdirBranchToParent({
+      workdir: worktree,
+      root,
+      branch: "mill/test-branch",
+    });
+    assert.equal(result.imported, true, `outcome=${result.outcome}`);
+    assert.equal(result.branch, "mill/test-branch");
+    assert.equal(result.outcome, "ref-only");
+
+    // Branch is reachable from the parent and points at the worktree's commit.
+    const branchLog = await git(root, ["log", "--oneline", "mill/test-branch"]);
+    assert.match(branchLog, /add feature/);
+  });
+
+  it("returns skip-no-branch when workdir has no resolvable branch", async () => {
+    const workdir = await tempDir("no-branch-wd");
+    const root = await tempDir("no-branch-root");
+    // workdir not a git repo at all — gitCurrentBranch returns null.
+    const result = await importWorkdirBranchToParent({ workdir, root });
+    assert.equal(result.imported, false);
+    assert.equal(result.outcome, "skip-no-branch");
   });
 });

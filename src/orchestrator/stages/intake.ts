@@ -19,7 +19,6 @@ export interface IntakeArgs {
   root: string;
   store: StateStore;
   mode: RunMode;
-  pr?: boolean;
 }
 
 export interface IntakeResult {
@@ -113,7 +112,6 @@ export async function intake(args: IntakeArgs): Promise<IntakeResult> {
       branch,
       baseBranch,
       baseSha,
-      pr: Boolean(args.pr),
     });
   }
 

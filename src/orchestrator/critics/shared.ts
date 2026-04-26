@@ -12,6 +12,7 @@ import { ZERO_USAGE } from "../../core/index.js";
 import { loadPrompt } from "../prompts.js";
 import { zodToJsonSchema } from "zod-to-json-schema";
 import { pickStructured, runClaude } from "../claude-cli.js";
+import { defaultSettingSources } from "../config.js";
 
 const CriticOutputSchema = z.object({
   findings: z.array(
@@ -79,7 +80,7 @@ export async function runCritic(args: RunCriticArgs): Promise<CriticResult> {
     systemPromptMode: "replace",
     cwd: ctx.paths.workdir,
     permissionMode: "bypassPermissions",
-    settingSources: ["project"],
+    settingSources: defaultSettingSources(),
     allowedTools: ["Read", "Glob", "Grep", "Bash"],
     disallowedTools: [
       "Edit",
@@ -96,6 +97,9 @@ export async function runCritic(args: RunCriticArgs): Promise<CriticResult> {
     // thousand-LOC project; 40 leaves room without giving the critic
     // license to wander.
     maxTurns: 40,
+    // Cost/usage for every critic at review iteration N rolls up into
+    // the single (run_id, "review", N) iteration row.
+    iteration,
   });
 
   const parsed = CriticOutputSchema.parse(pickStructured(res));

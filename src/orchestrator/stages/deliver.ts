@@ -1,6 +1,4 @@
-import { execFile } from "node:child_process";
 import { readFile, writeFile } from "node:fs/promises";
-import { promisify } from "node:util";
 import type {
   RunContext,
   StageResult,
@@ -14,12 +12,12 @@ import {
 } from "../../core/index.js";
 import { gitDiffStat } from "../git.js";
 import {
+  importWorkdirBranchToParent,
   promoteWorkdir,
   resolvePromoteMode,
+  type BranchImportResult,
   type PromoteResult,
 } from "../promote.js";
-
-const execFileP = promisify(execFile);
 
 export interface DeliverArgs {
   ctx: RunContext;
@@ -34,7 +32,6 @@ export interface DeliverArgs {
 interface WorktreeInfo {
   branch: string;
   baseBranch: string | null;
-  pr: boolean;
 }
 
 export async function deliver(args: DeliverArgs): Promise<StageResult> {
@@ -46,7 +43,6 @@ export async function deliver(args: DeliverArgs): Promise<StageResult> {
 
     const worktree = findWorktreeInfo(ctx);
     let diffStat = "";
-    let prUrl: string | null = null;
 
     if (ctx.mode === "edit" && worktree && worktree.baseBranch) {
       diffStat = await gitDiffStat(
@@ -59,14 +55,6 @@ export async function deliver(args: DeliverArgs): Promise<StageResult> {
       args.verifyPass &&
       args.unresolvedHighFindings.filter((f) => atLeast(f.severity, "HIGH"))
         .length === 0;
-
-    if (ctx.mode === "edit" && worktree && worktree.pr && passed) {
-      prUrl = await tryOpenPullRequest({
-        ctx,
-        branch: worktree.branch,
-        baseBranch: worktree.baseBranch,
-      });
-    }
 
     // New-mode promotion: copy the workdir contents up into the project
     // root so the result is "right there" instead of buried under
@@ -88,6 +76,36 @@ export async function deliver(args: DeliverArgs): Promise<StageResult> {
         const msg = err instanceof Error ? err.message : String(err);
         ctx.logger.warn("workdir promotion failed", { err: msg });
         ctx.store.appendEvent(ctx.runId, "deliver", "workdir_promote_failed", {
+          error: msg,
+        });
+      }
+    }
+
+    // Bring the workdir's branch into the parent repo for both modes.
+    // Edit mode: branch is already in the parent's refs (worktree shares
+    // the object DB), so this is effectively a no-op force-fetch — the
+    // intent is to verify and surface the branch. New mode: imports the
+    // workdir's independent history into the parent repo, init'ing
+    // `root/.git` if missing. Best-effort: failures are logged but never
+    // flip the run to failed.
+    let branchImport: BranchImportResult | null = null;
+    if (passed) {
+      try {
+        branchImport = await importWorkdirBranchToParent({
+          workdir: ctx.paths.workdir,
+          root: ctx.root,
+          branch: worktree?.branch ?? null,
+        });
+        ctx.store.appendEvent(
+          ctx.runId,
+          "deliver",
+          branchImport.imported ? "branch_imported" : "branch_import_skipped",
+          { ...branchImport, root: ctx.root },
+        );
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        ctx.logger.warn("branch import failed", { err: msg });
+        ctx.store.appendEvent(ctx.runId, "deliver", "branch_import_failed", {
           error: msg,
         });
       }
@@ -117,10 +135,11 @@ export async function deliver(args: DeliverArgs): Promise<StageResult> {
       workdir: ctx.paths.workdir,
       worktree,
       diffStat,
-      prUrl,
       promoteRoot: promoteResult?.promoted ? ctx.root : null,
       promoteSkipReason:
         promoteResult && !promoteResult.promoted ? promoteResult.reason : null,
+      branchImport,
+      root: ctx.root,
       // `deliver` is still marked `running` in the store here — finishStage
       // runs below so the updateRun + finishStage pair can share one
       // transaction. Patch the rendered row to reflect the terminal state
@@ -165,7 +184,7 @@ export async function deliver(args: DeliverArgs): Promise<StageResult> {
         artifact_path: ctx.paths.delivery,
       });
     });
-    return { ok: passed, data: { delivery: ctx.paths.delivery, passed, prUrl } };
+    return { ok: passed, data: { delivery: ctx.paths.delivery, passed } };
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     ctx.store.finishStage(ctx.runId, "deliver", {
@@ -187,13 +206,11 @@ function findWorktreeInfo(ctx: RunContext): WorktreeInfo | null {
         const p = JSON.parse(e.payload_json) as {
           branch?: unknown;
           baseBranch?: unknown;
-          pr?: unknown;
         };
         if (typeof p.branch === "string") {
           return {
             branch: p.branch,
             baseBranch: typeof p.baseBranch === "string" ? p.baseBranch : null,
-            pr: Boolean(p.pr),
           };
         }
       } catch {
@@ -214,62 +231,6 @@ async function readFirstLine(path: string): Promise<string> {
   }
 }
 
-async function tryOpenPullRequest(args: {
-  ctx: RunContext;
-  branch: string;
-  baseBranch: string | null;
-}): Promise<string | null> {
-  const { ctx, branch, baseBranch } = args;
-  try {
-    await execFileP("gh", ["--version"]);
-  } catch {
-    ctx.store.appendEvent(ctx.runId, "deliver", "pr_skipped", {
-      reason: "gh not on PATH",
-    });
-    return null;
-  }
-  try {
-    await execFileP("git", ["remote", "get-url", "origin"], {
-      cwd: ctx.paths.workdir,
-    });
-  } catch {
-    ctx.store.appendEvent(ctx.runId, "deliver", "pr_skipped", {
-      reason: "no origin remote",
-    });
-    return null;
-  }
-  try {
-    await execFileP("git", ["push", "-u", "origin", branch], {
-      cwd: ctx.paths.workdir,
-    });
-  } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    ctx.store.appendEvent(ctx.runId, "deliver", "pr_push_failed", {
-      branch,
-      error: msg,
-    });
-    return null;
-  }
-  try {
-    const title = `mill: run ${ctx.runId}`;
-    const prArgs = ["pr", "create", "--title", title, "--body-file", ctx.paths.delivery];
-    if (baseBranch) prArgs.push("--base", baseBranch);
-    prArgs.push("--head", branch);
-    const { stdout } = await execFileP("gh", prArgs, {
-      cwd: ctx.paths.workdir,
-    });
-    const url = stdout.trim().split("\n").pop() ?? "";
-    ctx.store.appendEvent(ctx.runId, "deliver", "pr_opened", { url, branch });
-    return url || null;
-  } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    ctx.store.appendEvent(ctx.runId, "deliver", "pr_create_failed", {
-      error: msg,
-    });
-    return null;
-  }
-}
-
 function renderDelivery(d: {
   runId: string;
   kind: string | null;
@@ -284,11 +245,12 @@ function renderDelivery(d: {
   workdir: string;
   worktree: WorktreeInfo | null;
   diffStat: string;
-  prUrl: string | null;
   // New-mode only: where the workdir was promoted to (parent root). Null
   // when promotion was skipped or didn't run.
   promoteRoot: string | null;
   promoteSkipReason: string | null;
+  branchImport: BranchImportResult | null;
+  root: string;
   stages: {
     name: string;
     status: string;
@@ -333,9 +295,16 @@ function renderDelivery(d: {
           workdir: d.workdir,
           runId: d.runId,
           diffStat: d.diffStat,
-          prUrl: d.prUrl,
+          branchImport: d.branchImport,
+          root: d.root,
         })
-      : "";
+      : d.branchImport && d.branchImport.imported && d.branchImport.branch
+        ? renderNewModeBranchSection({
+            branch: d.branchImport.branch,
+            outcome: d.branchImport.outcome,
+            root: d.root,
+          })
+        : "";
 
   const sections: string[] = [
     `# Delivery — ${d.runId}`,
@@ -383,22 +352,27 @@ function renderChangesSection(args: {
   workdir: string;
   runId: string;
   diffStat: string;
-  prUrl: string | null;
+  branchImport: BranchImportResult | null;
+  root: string;
 }): string {
-  const { worktree, workdir, runId, diffStat, prUrl } = args;
+  const { worktree, workdir, runId, diffStat, branchImport, root } = args;
   const base = worktree.baseBranch ?? "HEAD";
-  const review = `git diff ${base}..${worktree.branch}`;
-  const merge = `git merge ${worktree.branch}`;
-  const cleanup = `git worktree remove ${workdir} && git branch -D ${worktree.branch}`;
+  const review = `git -C ${root} diff ${base}..${worktree.branch}`;
+  const switchCmd = `git -C ${root} switch ${worktree.branch}`;
+  const merge = `git -C ${root} merge ${worktree.branch}`;
+  const cleanup = `git -C ${root} worktree remove ${workdir}`;
+  const importedNote = branchImport
+    ? branchImport.imported
+      ? `_Branch is on the parent repo at \`${root}\`._`
+      : `_Branch import skipped: ${branchImport.outcome}._`
+    : "";
   const lines: string[] = [
     `## Changes`,
     ``,
     `- **Branch**: \`${worktree.branch}\` (off \`${base}\`)`,
-    `- **Worktree**: \`${workdir}\``,
+    `- **Workdir**: \`${workdir}\``,
   ];
-  if (prUrl) {
-    lines.push(`- **Pull request**: ${prUrl}`);
-  }
+  if (importedNote) lines.push(``, importedNote);
   lines.push(``);
   lines.push(`### Diff summary`, ``, "```", diffStat || "(no diff)", "```", ``);
   lines.push(
@@ -407,12 +381,14 @@ function renderChangesSection(args: {
     review,
     "```",
     ``,
-    `### Merge`,
+    `### Switch & merge`,
     "```sh",
-    merge,
+    `${switchCmd}`,
+    `# or, from the base branch:`,
+    `${merge}`,
     "```",
     ``,
-    `### Cleanup`,
+    `### Cleanup workdir`,
     "```sh",
     cleanup,
     "```",
@@ -420,6 +396,36 @@ function renderChangesSection(args: {
   // runId is surfaced in the heading already; keep this function
   // self-contained so it can grow without re-threading ctx.
   void runId;
+  return lines.join("\n");
+}
+
+// New-mode equivalent of renderChangesSection. Edit mode walks off a
+// known base branch; new mode imported the workdir's independent
+// history with no prior base, so the section is simpler.
+function renderNewModeBranchSection(args: {
+  branch: string;
+  outcome: string;
+  root: string;
+}): string {
+  const { branch, outcome, root } = args;
+  const log = `git -C ${root} log --oneline ${branch}`;
+  const switchCmd = `git -C ${root} switch ${branch}`;
+  const lines: string[] = [
+    `## Changes`,
+    ``,
+    `- **Branch**: \`${branch}\` (imported into \`${root}\`)`,
+    `- **Import outcome**: ${outcome}`,
+    ``,
+    `### Browse history`,
+    "```sh",
+    log,
+    "```",
+    ``,
+    `### Switch`,
+    "```sh",
+    switchCmd,
+    "```",
+  ];
   return lines.join("\n");
 }
 

@@ -21,6 +21,18 @@
 
 import { cp, readFile, readdir, stat, writeFile } from "node:fs/promises";
 import { join } from "node:path";
+import {
+  gitBranchExists,
+  gitCurrentBranch,
+  gitFetchBranch,
+  gitHasHead,
+  gitInit,
+  gitIsRepo,
+} from "./git.js";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
+
+const execFileP = promisify(execFile);
 
 export interface PromoteArgs {
   workdir: string;
@@ -137,4 +149,107 @@ async function countFiles(path: string): Promise<number> {
     n += await countFiles(join(path, entry));
   }
   return n;
+}
+
+export interface BranchImportResult {
+  imported: boolean;
+  branch: string | null;
+  // What we did: "ref-only" (branch added to parent's refs but working
+  // tree unchanged), "checkout" (also checked out as the parent's HEAD
+  // because the parent had no commits), or "skip-<reason>".
+  outcome: string;
+}
+
+// After a successful run, make the workdir's branch (and its commits)
+// available on the parent repo at `root`. Two modes:
+//
+//  - **Edit mode**: the workdir is a `git worktree` of `root`, so the
+//    branch already lives in `root/.git/refs/heads/`. Fetch is still
+//    safe (force-updates the same ref to itself); the result is
+//    `imported: true, outcome: "ref-only"`.
+//
+//  - **New mode**: the workdir has its own independent `.git`. We init
+//    a `.git` at `root` if missing, then fetch the workdir's branch
+//    into the parent's refs. If the parent had no HEAD prior, also
+//    check out the branch so the working tree matches the imported
+//    history (relevant for `mill new` against an empty directory).
+//
+// Best-effort: caller logs failures and continues. Returns
+// `imported: false` with a reason string when nothing was done.
+export async function importWorkdirBranchToParent(args: {
+  workdir: string;
+  root: string;
+  branch?: string | null;
+}): Promise<BranchImportResult> {
+  const { workdir, root } = args;
+  // Resolve the source branch. Caller can pass it (edit mode knows from
+  // the worktree_created event); otherwise read it off the workdir's HEAD.
+  const branch = args.branch ?? (await gitCurrentBranch(workdir));
+  if (!branch) {
+    return { imported: false, branch: null, outcome: "skip-no-branch" };
+  }
+
+  // Ensure parent has a git repo. Reuse the harness `gitInit` so the
+  // mill identity + info/exclude are written consistently.
+  if (!(await gitIsRepo(root))) {
+    try {
+      await gitInit(root);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      return {
+        imported: false,
+        branch,
+        outcome: `skip-init-failed:${msg}`,
+      };
+    }
+  }
+
+  const hadHead = await gitHasHead(root);
+
+  // Edit-mode short-circuit: if the parent's repo already has the
+  // branch (worktrees share refs), there's nothing to fetch — git would
+  // refuse anyway because the branch is checked out in the linked
+  // worktree. Treat it as a successful no-op import.
+  if (await gitBranchExists(root, branch)) {
+    return { imported: true, branch, outcome: "ref-only" };
+  }
+
+  try {
+    await gitFetchBranch(root, workdir, branch);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    return {
+      imported: false,
+      branch,
+      outcome: `skip-fetch-failed:${msg}`,
+    };
+  }
+
+  // If the parent had no commits before the fetch, its HEAD points at
+  // an unborn branch (whatever `git init` chose). The fetch updated the
+  // ref but did not touch the working tree, so a `git reset --hard`
+  // pins it to the imported tip. If the parent already had its own
+  // commits, leave HEAD alone — overwriting the user's checkout would
+  // be surprising.
+  if (!hadHead) {
+    try {
+      // Set HEAD symbolically to the imported branch (covers the case
+      // where init chose a different default like `master`), then hard-
+      // reset the working tree to its tip.
+      await execFileP("git", ["symbolic-ref", "HEAD", `refs/heads/${branch}`], {
+        cwd: root,
+      });
+      await execFileP("git", ["reset", "--hard", branch], { cwd: root });
+      return { imported: true, branch, outcome: "checkout" };
+    } catch (err) {
+      // Fetch landed; just couldn't switch HEAD. Still a partial win.
+      const msg = err instanceof Error ? err.message : String(err);
+      return {
+        imported: true,
+        branch,
+        outcome: `ref-only:checkout-failed:${msg}`,
+      };
+    }
+  }
+  return { imported: true, branch, outcome: "ref-only" };
 }

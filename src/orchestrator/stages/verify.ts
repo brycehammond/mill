@@ -4,6 +4,7 @@ import type { RunContext, StageResult } from "../../core/index.js";
 import { loadPrompt } from "../prompts.js";
 import { zodToJsonSchema } from "zod-to-json-schema";
 import { pickStructured, runClaude } from "../claude-cli.js";
+import { defaultSettingSources } from "../config.js";
 
 const VerifyOutput = z.object({
   report_md: z.string().min(10),
@@ -54,10 +55,10 @@ export async function verify(ctx: RunContext): Promise<StageResult> {
       addDir: [ctx.paths.verifyDir],
       extraWriteDirs: [ctx.paths.verifyDir],
       allowedTools: ["Read", "Write", "Glob", "Grep", "Bash"],
-      settingSources: ["project"],
-      // UI verify needs Playwright etc. from the user's MCP config;
-      // pull MCPs without user hooks via inheritUserMcps.
-      inheritUserMcps: ctx.kind === "ui",
+      // Default user+project so Playwright/Stitch/etc. user MCPs (and any
+      // user skills/hooks) are visible. MILL_USER_HOOKS=off reverts to
+      // project-only isolation.
+      settingSources: defaultSettingSources(),
       jsonSchema: VerifyJsonSchema,
       maxTurns: 40,
     });

@@ -22,6 +22,7 @@ import {
 } from "../../core/index.js";
 import { loadPrompt } from "../prompts.js";
 import { pickStructured, runClaude } from "../claude-cli.js";
+import { defaultSettingSources } from "../config.js";
 
 const execFileP = promisify(execFile);
 
@@ -81,7 +82,7 @@ export async function decisions(args: DecisionsArgs): Promise<StageResult> {
       systemPrompt,
       cwd: ctx.paths.workdir,
       permissionMode: "bypassPermissions",
-      settingSources: ["project"],
+      settingSources: defaultSettingSources(),
       allowedTools: ["Read", "Glob", "Grep", "Bash"],
       disallowedTools: [
         "Edit",

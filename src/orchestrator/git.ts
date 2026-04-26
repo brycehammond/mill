@@ -98,3 +98,74 @@ export async function gitDiffStat(cwd: string, range: string): Promise<string> {
     return "";
   }
 }
+
+// Read the current branch name (HEAD's symbolic ref). Returns null on
+// detached HEAD or on a fresh repo with no commits — both of which mean
+// "no branch to import" for our purposes.
+export async function gitCurrentBranch(cwd: string): Promise<string | null> {
+  try {
+    const name = (await git(cwd, ["rev-parse", "--abbrev-ref", "HEAD"])).trim();
+    if (!name || name === "HEAD") return null;
+    return name;
+  } catch {
+    return null;
+  }
+}
+
+// Fetch <branch> from <fromPath> (a local path to another git repo or
+// linked worktree) into <cwd> as `refs/heads/<branch>`. Force-update so a
+// re-run that resumes a stage can overwrite a stale ref.
+//
+// `--update-head-ok` is required when the destination branch is also the
+// current worktree's HEAD (common for `mill new` against a fresh dir
+// where both the workdir and the just-init'd parent default to `main`).
+// Without this flag git refuses with "refusing to fetch into branch
+// '...' checked out at '...'".
+export async function gitFetchBranch(
+  cwd: string,
+  fromPath: string,
+  branch: string,
+): Promise<void> {
+  await git(cwd, [
+    "fetch",
+    "--update-head-ok",
+    fromPath,
+    `+${branch}:refs/heads/${branch}`,
+  ]);
+}
+
+// True iff refs/heads/<branch> exists in the repo at cwd.
+export async function gitBranchExists(
+  cwd: string,
+  branch: string,
+): Promise<boolean> {
+  try {
+    await git(cwd, ["rev-parse", "--verify", `refs/heads/${branch}`]);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// True when the repo at cwd has any commits on HEAD. New-init parent
+// repos report false here; we use that to decide whether to checkout the
+// imported branch into the working tree.
+export async function gitHasHead(cwd: string): Promise<boolean> {
+  try {
+    await git(cwd, ["rev-parse", "--verify", "HEAD"]);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+export async function gitIsRepo(cwd: string): Promise<boolean> {
+  try {
+    const out = (
+      await git(cwd, ["rev-parse", "--is-inside-work-tree"])
+    ).trim();
+    return out === "true";
+  } catch {
+    return false;
+  }
+}

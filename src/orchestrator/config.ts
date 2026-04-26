@@ -59,3 +59,17 @@ export function resolveProjectRoot(): string | null {
   if (process.env.MILL_ROOT) return resolve(process.env.MILL_ROOT);
   return findProjectRoot(process.cwd());
 }
+
+// Pick the `--setting-sources` list passed to in-run `claude` subprocesses.
+// Default `["user", "project"]` so the user's installed skills, hooks, and
+// status-line/output-style customizations fire inside the run — same as a
+// normal Claude Code session. `MILL_USER_HOOKS=off` reverts to project-only
+// isolation (e.g. for shared/CI environments where user-level Stop or
+// PostToolUse hooks would be inappropriate).
+export function defaultSettingSources(
+  env: NodeJS.ProcessEnv = process.env,
+): Array<"user" | "project" | "local"> {
+  const raw = (env.MILL_USER_HOOKS ?? "on").trim().toLowerCase();
+  if (raw === "off" || raw === "false" || raw === "0") return ["project"];
+  return ["user", "project"];
+}

@@ -20,6 +20,7 @@ import type { RunContext, StageResult } from "../../core/index.js";
 import { readProfile, readProfileSummary } from "../../core/index.js";
 import { loadPrompt } from "../prompts.js";
 import { pickStructured, runClaude } from "../claude-cli.js";
+import { defaultSettingSources } from "../config.js";
 import { gitCommitAll } from "../git.js";
 
 const Spec2TestsOutput = z.object({
@@ -102,7 +103,7 @@ export async function spec2tests(ctx: RunContext): Promise<StageResult> {
       systemPrompt,
       cwd: ctx.paths.workdir,
       permissionMode: "bypassPermissions",
-      settingSources: ["project"],
+      settingSources: defaultSettingSources(),
       allowedTools: ["Read", "Edit", "Write", "Glob", "Grep", "Bash"],
       jsonSchema: Spec2TestsJsonSchema,
       // Scaffolding a test runner is heavier than just writing tests;

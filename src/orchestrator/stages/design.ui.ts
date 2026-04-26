@@ -11,6 +11,7 @@ import {
 import { loadPrompt } from "../prompts.js";
 import { zodToJsonSchema } from "zod-to-json-schema";
 import { pickStructured, runClaude } from "../claude-cli.js";
+import { defaultSettingSources } from "../config.js";
 
 const UiDesignOutput = z.object({
   design_intent_md: z.string().min(20),
@@ -52,9 +53,9 @@ export async function designUi(ctx: RunContext): Promise<StageResult> {
     .join("\n\n");
 
   // Stitch MCP is expected to be configured in the user's global Claude
-  // settings. We pull it in via `inheritUserMcps` rather than
-  // `settingSources: ["user"]` so user-level hooks (Stop, PostToolUse,
-  // etc.) do NOT fire during mill stages — MCPs without hooks.
+  // settings. It comes in via the default `settingSources: ["user", "project"]`
+  // (which also enables the user's installed skills/hooks). Set
+  // MILL_USER_HOOKS=off if you need hook-isolation here.
   const allowedTools = [
     "mcp__stitch__generate_screen_from_text",
     "mcp__stitch__edit_screens",
@@ -76,8 +77,7 @@ export async function designUi(ctx: RunContext): Promise<StageResult> {
     stage: "design",
     prompt,
     systemPrompt,
-    settingSources: ["project"],
-    inheritUserMcps: true,
+    settingSources: defaultSettingSources(),
     permissionMode: "bypassPermissions",
     jsonSchema: UiDesignSchema,
     allowedTools,

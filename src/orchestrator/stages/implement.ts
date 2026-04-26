@@ -8,6 +8,7 @@ import {
 } from "../../core/index.js";
 import { loadPrompt } from "../prompts.js";
 import { runClaude } from "../claude-cli.js";
+import { defaultSettingSources } from "../config.js";
 import { gitCommitAll, gitCommitEmpty, gitInit, gitTag, gitHead } from "../git.js";
 import { pathExists } from "../../core/index.js";
 
@@ -20,6 +21,7 @@ export interface ImplementArgs {
 export async function implement(args: ImplementArgs): Promise<StageResult> {
   const { ctx, iteration, priorFindings } = args;
   ctx.store.startStage(ctx.runId, "implement");
+  ctx.store.startStageIteration(ctx.runId, "implement", iteration);
   try {
     // In edit mode the worktree was materialized at intake — `.git`
     // exists as a *file* (gitdir pointer), not a directory; `pathExists`
@@ -84,9 +86,10 @@ export async function implement(args: ImplementArgs): Promise<StageResult> {
       cwd: ctx.paths.workdir,
       permissionMode: "bypassPermissions",
       // Per-run sandbox (path + kill) lives in runs/<id>/.claude/settings.json
-      // which is picked up via settingSources: ['project']. UI builds also
-      // inherit user-global MCPs (Stitch).
-      settingSources: ctx.kind === "ui" ? ["user", "project"] : ["project"],
+      // which is picked up via settingSources. Default includes "user" so the
+      // user's installed skills/hooks (commit attribution suppression, etc.)
+      // fire inside the run; opt out with MILL_USER_HOOKS=off.
+      settingSources: defaultSettingSources(),
       allowedTools: [
         "Read",
         "Edit",
@@ -101,6 +104,7 @@ export async function implement(args: ImplementArgs): Promise<StageResult> {
       ],
       resume,
       maxTurns: 60,
+      iteration,
     });
 
     const msg = `impl: iter ${iteration}\n\n${truncate(res.text, 400)}`;
@@ -120,6 +124,10 @@ export async function implement(args: ImplementArgs): Promise<StageResult> {
       status: "completed",
       artifact_path: ctx.paths.workdir,
     });
+    ctx.store.finishStageIteration(ctx.runId, "implement", iteration, {
+      status: "completed",
+      artifact_path: ctx.paths.workdir,
+    });
     return {
       ok: true,
       cost: res.costUsd,
@@ -128,6 +136,10 @@ export async function implement(args: ImplementArgs): Promise<StageResult> {
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     ctx.store.finishStage(ctx.runId, "implement", {
+      status: "failed",
+      error: message,
+    });
+    ctx.store.finishStageIteration(ctx.runId, "implement", iteration, {
       status: "failed",
       error: message,
     });

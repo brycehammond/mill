@@ -64,9 +64,9 @@ mill new "TypeScript CLI that converts markdown to minified HTML"
 # Edit-mode run on an existing repo (auto-detected when the repo has
 # committed source). Names the branch from the requirement —
 # `mill/refactor-auth-middleware-xyzz` instead of an opaque run id —
-# and creates it via `git worktree add`. With `--pr`, deliver opens a
-# PR via `gh` once verify passes.
-mill new "refactor the auth middleware" --mode edit --pr
+# and creates it via `git worktree add`. The branch lands in the parent
+# repo's `git branch -a` after a clean delivery; review/merge yourself.
+mill new "refactor the auth middleware" --mode edit
 
 # Stop after a named stage so you can review before paying for the rest.
 # Resume with `mill run <id>` to continue.
@@ -102,9 +102,11 @@ which `spawn`s the `claude` binary with flags for that stage:
   iterations; each critic resumes its own session. IDs are stored in SQLite.
 - `--allowedTools` / `--disallowedTools` scope what each stage can do. The
   implementer gets full edit power inside its workdir; critics are read-only.
-- `--setting-sources project,user` tells Claude Code to pick up our per-run
-  `.claude/settings.json` (the sandbox hook) plus the user's global config
-  (MCP servers like Stitch / Playwright).
+- `--setting-sources user,project` tells Claude Code to pick up the user's
+  global config (skills like a `commit` skill that suppresses Claude
+  attribution, hooks, MCP servers like Stitch / Playwright) plus our per-run
+  `.claude/settings.json` (the sandbox hook). Set `MILL_USER_HOOKS=off` for
+  project-only isolation.
 
 **Per-run sandbox.** For every run, the harness writes
 `.mill/runs/<id>/.claude/settings.json` with a `PreToolUse` hook pointing at
@@ -125,11 +127,12 @@ enforce; cost numbers in the delivery report are tally-only.
 
 - **Edit mode**: the implementer commits onto a fresh
   `mill/<slug-from-requirement>-<short-id>` branch checked out via
-  `git worktree add` (in `stages/intake.ts`). After verify passes,
-  `deliver` opens a PR if `gh` is on `PATH` and `--pr` was set at
-  intake. The branch shows up in the parent repo's `git branch -a`
-  immediately — the per-run workdir at `.mill/runs/<id>/workdir/` is
-  just where the harness sandboxes file writes during the run.
+  `git worktree add` (in `stages/intake.ts`). After a clean delivery
+  the branch is in the parent repo's `git branch -a` — review with
+  `git diff <base>..<branch>`, then `git switch` or `git merge` it.
+  The per-run workdir at `.mill/runs/<id>/workdir/` is just where the
+  harness sandboxes file writes during the run; clean it up with
+  `git worktree remove <workdir>` when you're done.
 - **New mode**: the implementer builds a self-contained codebase
   inside `.mill/runs/<id>/workdir/` with its own git history. After a
   clean delivery (verify pass + zero unresolved HIGH+), `deliver`
@@ -139,7 +142,10 @@ enforce; cost numbers in the delivery report are tally-only.
   `.mill/runs/<id>/workdir/.git/` for cherry-picking); `.gitignore`
   is *merged* (workdir's language-specific rules + the parent's
   `/.mill/` rule both survive). Gated by `MILL_PROMOTE_NEW_WORKDIR`
-  (`auto` default refuses to clobber a populated parent root).
+  (`auto` default refuses to clobber a populated parent root). In
+  parallel, `deliver` also imports the workdir's branch into the
+  parent repo (init'ing `.git` if missing) so `git log` at the parent
+  shows the run's commits.
 
 ## Critics
 

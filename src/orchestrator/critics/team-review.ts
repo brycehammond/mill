@@ -40,6 +40,7 @@ import {
   runClaude,
   type AgentDef,
 } from "../claude-cli.js";
+import { defaultSettingSources } from "../config.js";
 
 const FindingSchema = z.object({
   severity: z.enum(["LOW", "MEDIUM", "HIGH", "CRITICAL"]),
@@ -164,7 +165,7 @@ export async function runTeamReview(args: TeamReviewArgs): Promise<TeamReviewOut
     agentsConfig,
     cwd: ctx.paths.workdir,
     permissionMode: "bypassPermissions",
-    settingSources: ["project"],
+    settingSources: defaultSettingSources(),
     allowedTools: LEAD_TOOLS,
     disallowedTools: LEAD_DISALLOWED,
     jsonSchema: TeamReviewJsonSchema,
@@ -173,6 +174,9 @@ export async function runTeamReview(args: TeamReviewArgs): Promise<TeamReviewOut
     // orchestration turns + three subagents' worth of work + optional
     // cross-critic chatter, all in one session.
     maxTurns: 80,
+    // The lead subprocess covers all three LLM critics for this review
+    // iteration, so its cost lands on the (review, iteration) row.
+    iteration,
   });
 
   const parsed = TeamReviewOutputSchema.parse(pickStructured(res));
