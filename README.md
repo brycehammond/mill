@@ -55,10 +55,17 @@ API key in your shell can't accidentally route billing through the API.
 
 ```sh
 # Start a new run. Prompts clarifying questions inline, then runs dark.
+# Stages stream their progress to stdout as they transition (▸ start,
+# ✓ ok, ✗ failed, ⊘ skipped) — close the terminal whenever; the run
+# keeps going if you started a worker (`mill new --detach`), or you
+# can resume an interrupted run with `mill run <id>`.
 mill new "TypeScript CLI that converts markdown to minified HTML"
 
 # Edit-mode run on an existing repo (auto-detected when the repo has
-# committed source). Creates a mill/<slug>-<short-id> branch via git worktree.
+# committed source). Names the branch from the requirement —
+# `mill/refactor-auth-middleware-xyzz` instead of an opaque run id —
+# and creates it via `git worktree add`. With `--pr`, deliver opens a
+# PR via `gh` once verify passes.
 mill new "refactor the auth middleware" --mode edit --pr
 
 # Stop after a named stage so you can review before paying for the rest.
@@ -114,6 +121,26 @@ subscription (the harness scrubs `ANTHROPIC_API_KEY` / `ANTHROPIC_AUTH_TOKEN`
 from the env handed to `claude`), so there is no per-run dollar cap to
 enforce; cost numbers in the delivery report are tally-only.
 
+**Where the result lands.**
+
+- **Edit mode**: the implementer commits onto a fresh
+  `mill/<slug-from-requirement>-<short-id>` branch checked out via
+  `git worktree add` (in `stages/intake.ts`). After verify passes,
+  `deliver` opens a PR if `gh` is on `PATH` and `--pr` was set at
+  intake. The branch shows up in the parent repo's `git branch -a`
+  immediately — the per-run workdir at `.mill/runs/<id>/workdir/` is
+  just where the harness sandboxes file writes during the run.
+- **New mode**: the implementer builds a self-contained codebase
+  inside `.mill/runs/<id>/workdir/` with its own git history. After a
+  clean delivery (verify pass + zero unresolved HIGH+), `deliver`
+  promotes the workdir contents up into the project root so the
+  result is "right there" instead of buried under `.mill/`. `.git/`
+  is skipped (the workdir's history stays accessible at
+  `.mill/runs/<id>/workdir/.git/` for cherry-picking); `.gitignore`
+  is *merged* (workdir's language-specific rules + the parent's
+  `/.mill/` rule both survive). Gated by `MILL_PROMOTE_NEW_WORKDIR`
+  (`auto` default refuses to clobber a populated parent root).
+
 ## Critics
 
 The review stage runs critics in parallel (`Promise.allSettled`) after each
@@ -127,7 +154,7 @@ remain, or when the current set is a subset of the previous iteration's
 | security | Injection, secret leaks, auth bypass, unsafe crypto | Claude (read-only) |
 | correctness | Bugs, wrong logic, off-by-one, races, missing edge cases | Claude (read-only) |
 | ux | Empty-state gaps, confusing copy, accessibility, error messaging | Claude (read-only) |
-| tests | Repo's real test command from `.mill/profile.json` — non-zero exit = HIGH | Subprocess (no LLM) |
+| tests | Resolved test command (set by `spec2tests` in new-mode runs, or from `.mill/profile.json` in edit-mode) — non-zero exit = HIGH | Subprocess (no LLM) |
 | adversarial *(opt-in)* | Second-opinion pass from an independent model | Codex CLI |
 
 All findings persist to SQLite with a canonical fingerprint
@@ -149,8 +176,8 @@ default; set `MILL_ADVERSARIAL_REVIEW=off` to disable, or `=on` to require it
 
 ## Cross-run memory
 
-Three files under `.mill/` feed future runs by being auto-injected into spec
-and design prompts:
+Files under `.mill/` feed future runs by being auto-injected into stage
+prompts or consulted by the orchestrator before it picks a prompt:
 
 - **`.mill/journal.md`** — one stanza per completed run. Activity log: what was
   asked, what shipped, cost. Written by the deliver stage.
@@ -160,6 +187,13 @@ and design prompts:
   criterion, or external constraint. A clean run produces zero entries.
 - **`.mill/profile.json`** — one-shot repo profile (language, test command,
   conventions). Written by `mill onboard`, refreshed with `mill onboard --refresh`.
+- **`.mill/stitch.json`** — Stitch project URL + originating run id.
+  Written by `design.ui` after a successful UI design. Edit-mode UI runs
+  that find this file load `prompts/design-ui-edit.md` instead of
+  `prompts/design-ui.md` and reuse the project via `edit_screens`
+  rather than calling `create_project` each time. Stale URLs are
+  recovered automatically (the edit prompt instructs the model to fall
+  back to `create_project` if `get_project` returns not-found).
 
 Plus the **findings ledger** — aggregated across runs from the `findings`
 SQLite table. Shown by `mill findings`, and the top recurring entries are
@@ -172,6 +206,7 @@ keep getting flagged on this repo.
 | decisions.md | What design debates have we already resolved? | Post-deliver, only for non-obvious trade-offs |
 | ledger (SQLite) | What bugs keep recurring? | Every review stage |
 | profile.json | What is this repo? (language, test cmd) | `mill onboard` |
+| stitch.json | Which Stitch project should we keep editing? | Every successful UI design |
 
 ## Layout
 
@@ -200,9 +235,10 @@ src/prompts/*.md                    # stage + critic system prompts, iterable
 
 .mill/                                # per-project state (gitignored)
 ├── project.json                    # project marker (written by mill init)
-├── mill.db                 # SQLite: runs, stages, findings, sessions
+├── mill.db                         # SQLite: runs, stages, findings, sessions
 ├── journal.md | decisions.md       # cross-run memory
 ├── profile.json                    # repo profile (mill onboard)
+├── stitch.json                     # Stitch project ref (UI runs)
 └── runs/<id>/                      # per-run artifacts
     ├── .claude/settings.json       # sandbox hook config
     ├── KILLED                      # (sentinel; present if `mill kill`ed)
@@ -220,8 +256,10 @@ See `.env.example`. Relevant knobs:
 
 | Var | Default | Purpose |
 |---|---|---|
-| `MILL_TIMEOUT_SEC_PER_RUN` | 3600 | Wall-clock cap per run |
-| `MILL_TIMEOUT_SEC_PER_STAGE` | 600 | Wall-clock cap per stage |
+| `MILL_TIMEOUT_SEC_PER_RUN` | 14400 | Wall-clock cap per run (4h) |
+| `MILL_TIMEOUT_SEC_PER_STAGE` | 600 | Wall-clock cap per stage (default; overridden below) |
+| `MILL_TIMEOUT_SEC_IMPLEMENT` | 7200 | Wall-clock cap for the implement stage (2h — TDD builds are 100+ tool calls) |
+| `MILL_TIMEOUT_SEC_VERIFY` | 1800 | Wall-clock cap for verify (30m — end-to-end checks take a while) |
 | `MILL_MAX_REVIEW_ITERS` | 3 | implement ⇄ review loop cap |
 | `MILL_MAX_CONCURRENT_RUNS` | 2 | Worker concurrency |
 | `MILL_MODEL` | (claude default) | Pass to every `claude` invocation |
@@ -229,7 +267,39 @@ See `.env.example`. Relevant knobs:
 | `MILL_ADVERSARIAL_REVIEW` | auto | `auto` \| `on` \| `off` — optional Codex critic |
 | `MILL_TESTS_CRITIC` | auto | `auto` \| `on` \| `off` — mechanical test critic |
 | `MILL_SPEC2TESTS` | auto | `auto` \| `on` \| `off` — generate test scaffolds from spec |
+| `MILL_AGENT_TEAMS` | auto | `auto` \| `on` \| `off` — review critics share one `claude` subprocess via parallel Agent subagents |
+| `MILL_PROMOTE_NEW_WORKDIR` | auto | `auto` \| `on` \| `off` — copy a clean new-mode workdir up into the project root after delivery (`auto` skips when the parent has user content beyond `{.git, .gitignore, .mill}`) |
+| `MILL_USER_MCP_CONFIG` | (both `~/.claude/settings.json` and `~/.claude.json`) | Single explicit JSON file to source user-level MCPs from when stages pass `inheritUserMcps: true` |
 | `MILL_CODEX_COMPANION` | (auto-discover) | Absolute path to `codex-companion.mjs` |
+
+## Hacking on mill
+
+```sh
+npm run typecheck    # tsc --noEmit
+npm test             # node --test under tsx, src/**/*.test.ts (~70 cases)
+npm run build        # tsc + cp -r src/prompts dist/prompts
+```
+
+`npm test` runs Node's built-in test runner under `tsx` with no extra
+deps. Coverage is intentionally pure-function-shaped — the harness
+`spawn`s `claude`, so end-to-end tests would burn live subscription
+tokens. Today's suites pin: cost tally, severity ordering + finding
+fingerprint, store round-trip via `:memory:`, JSON / markdown
+extractors, retry-with-hint guards (including the terminal-subtype
+guard), `shouldStopReviewLoop`, slug derivation, workdir promotion
+safety, the live-progress ticker, and the Stitch project ref. When
+adding a new pure helper or load-bearing invariant, drop a
+colocated `*.test.ts` next to it.
+
+`npm run build`'s `cp -r src/prompts dist/prompts` fails if
+`dist/prompts` already exists (macOS `cp` copies *into* rather than
+replacing). Always `npm run clean && npm run build` for a full build.
+Prompts are loaded at runtime from `src/prompts/` under `tsx`, so you
+can iterate on prompt wording in dev without rebuilding.
+
+CLAUDE.md in this repo is the contributor handbook — read it before
+making invasive changes (especially around `pipeline.ts`, `claude-cli.ts`,
+or the per-run sandbox).
 
 ## License
 
