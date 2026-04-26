@@ -123,13 +123,22 @@ Management state (DB, journal, decisions, profile, stitch) all moved to
 ## Web UI
 
 Once the daemon is running, the same port serves a small React SPA at
-`http://127.0.0.1:7333/`. Four screens cover the CLI's surface:
+`http://127.0.0.1:7333/`. Five screens cover the CLI's surface:
 
 - **Dashboard** — cross-project rollup: today's cost, MTD cost, runs
   in flight, per-project cards, top recurring findings.
 - **Project view** (`/projects/:id`) — start a new run from a textarea
   (with the same clarification questions the CLI asks), browse the
-  project's runs, and see its scoped findings ledger.
+  project's runs, and see its scoped findings ledger. A "view report →"
+  link in the header opens the project report below.
+- **Project report** (`/projects/:id/report`) — read-only audit surface
+  consolidating everything mill knows about a project: lifetime
+  aggregates (total cost, success rate, avg duration, token totals),
+  cost-by-month bars, per-stage rollups (cost / completion / duration),
+  the full uncapped runs history, inline stage + findings detail for
+  the most recent runs, the project's findings ledger, and the rendered
+  markdown of `journal.md`, `decisions.md`, and `profile.md` plus the
+  Stitch project ref.
 - **Run view** (`/runs/:id`) — live SSE-streamed activity feed, stage
   timeline, kill button, per-stage cost breakdown. Reconnects use the
   browser's native `Last-Event-ID` replay so no frames are dropped on
