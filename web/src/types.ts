@@ -10,7 +10,17 @@ export type RunStatus =
   | "running"
   | "completed"
   | "failed"
-  | "killed";
+  | "killed"
+  | "paused_budget"
+  | "awaiting_approval";
+
+export type Phase3EventKind =
+  | "budget_warning_80"
+  | "budget_exceeded"
+  | "approval_required"
+  | "approval_granted"
+  | "approval_rejected"
+  | "webhook_disabled";
 export type RunMode = "new" | "edit";
 export type CriticName =
   | "security"
@@ -60,6 +70,8 @@ export interface Run {
   requirement_path: string;
   spec_path: string | null;
   test_command: string | null;
+  awaiting_approval_at_stage: StageName | null;
+  failure_reason: string | null;
   total_cost_usd: number;
   total_input_tokens: number;
   total_cache_creation_tokens: number;
@@ -132,22 +144,55 @@ export interface SuppressedEntry {
   note: string | null;
 }
 
+export interface DashboardProject {
+  id: string;
+  name: string;
+  root_path: string;
+  cost_today_usd: number;
+  cost_mtd_usd: number;
+  in_flight_runs: number;
+  last_delivery_ts: number | null;
+  last_run_status: RunStatus | null;
+  // Phase 3 (optional — backend may or may not have this field yet).
+  monthly_budget_usd?: number | null;
+  budget_state?: "ok" | "warning_80" | "paused" | null;
+}
+
 export interface Dashboard {
   cost_today_usd: number;
   cost_mtd_usd: number;
   runs_in_flight: number;
   project_count: number;
-  projects: Array<{
-    id: string;
-    name: string;
-    root_path: string;
-    cost_today_usd: number;
-    cost_mtd_usd: number;
-    in_flight_runs: number;
-    last_delivery_ts: number | null;
-    last_run_status: RunStatus | null;
-  }>;
+  // Optional Phase 3 field; falls back to count of awaiting_approval runs.
+  pending_approvals?: number;
+  projects: DashboardProject[];
   top_recurring_findings: LedgerEntry[];
+}
+
+export interface SessionInfo {
+  ok: boolean;
+  actor: string;
+}
+
+export interface ProjectGates {
+  stages: StageName[];
+}
+
+export interface WebhookRow {
+  id: string;
+  project_id: string;
+  url: string;
+  events: string[];
+  enabled: boolean;
+  consecutive_failures: number;
+  created_at: number;
+  secret_set: boolean;
+}
+
+export interface ResumeBudgetError {
+  error: string;
+  currentSpend?: number;
+  budget?: number;
 }
 
 export interface WireEvent {

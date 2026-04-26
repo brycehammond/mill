@@ -63,6 +63,9 @@ function colorRunStatus(s: RunStatus): string {
     case "failed":
     case "killed":
       return red(s);
+    case "paused_budget":
+    case "awaiting_approval":
+      return cyan(s);
     default:
       return s;
   }
@@ -142,8 +145,8 @@ function visibleWidth(s: string): number {
   return s.replace(/\x1b\[[0-9;]*m/g, "").length;
 }
 
-// Top-level commands. Subcommand trees (`project`, `daemon`) dispatch
-// inside their own handlers.
+// Top-level commands. Subcommand trees (`project`, `daemon`, `auth`)
+// dispatch inside their own handlers.
 type Cmd =
   | "new"
   | "run"
@@ -157,6 +160,10 @@ type Cmd =
   | "findings"
   | "project"
   | "daemon"
+  | "auth"
+  | "approve"
+  | "reject"
+  | "resume"
   | "help";
 
 async function main() {
@@ -189,6 +196,14 @@ async function main() {
         return await cmdProject(rest);
       case "daemon":
         return await cmdDaemon(rest);
+      case "auth":
+        return await cmdAuth(rest);
+      case "approve":
+        return await cmdApprove(rest);
+      case "reject":
+        return await cmdReject(rest);
+      case "resume":
+        return await cmdResume(rest);
       case "help":
       default:
         printHelp();
@@ -231,8 +246,14 @@ function printHelp() {
       "",
       h("Daemon"),
       `  ${c("mill daemon start")} [--port N] [--host H] [--foreground]   start the daemon`,
+      `  ${c("                  ")} [--bind loopback|lan|all] [--insecure] [--cert P --key P]`,
       `  ${c("mill daemon stop")}                                          stop the daemon (SIGTERM, drains)`,
       `  ${c("mill daemon status")}                                        running on host:port (pid)`,
+      "",
+      h("Auth"),
+      `  ${c("mill auth init")}                       generate a token at ~/.mill/auth.token`,
+      `  ${c("mill auth show")}                       print the configured token`,
+      `  ${c("mill auth rotate")}                     replace the token; invalidates UI sessions`,
       "",
       h("Projects"),
       `  ${c("mill project add")} [<path>]            register a git repo (default: cwd)`,
@@ -342,6 +363,10 @@ async function cmdProject(argv: string[]) {
     case "rm":
     case "remove":
       return await projectRm(rest);
+    case "gates":
+      return await projectGates(rest);
+    case "webhooks":
+      return await projectWebhooks(rest);
     case undefined:
     case "help":
     case "-h":
@@ -355,6 +380,211 @@ async function cmdProject(argv: string[]) {
   }
 }
 
+async function projectGates(argv: string[]) {
+  const [sub, ...rest] = argv;
+  switch (sub) {
+    case "set":
+      return await projectGatesSet(rest);
+    case "clear":
+      return await projectGatesClear(rest);
+    case "ls":
+    case "list":
+    case undefined:
+      return await projectGatesLs(rest);
+    default:
+      console.error(`mill project gates: unknown subcommand "${sub}"`);
+      console.error(
+        `  usage: mill project gates set <project> <stage[,stage...]>`,
+      );
+      console.error(`         mill project gates clear <project>`);
+      console.error(`         mill project gates ls <project>`);
+      process.exitCode = 2;
+  }
+}
+
+async function projectGatesLs(argv: string[]) {
+  const ident = argv[0];
+  if (!ident) {
+    console.error("mill project gates ls: project required");
+    process.exitCode = 2;
+    return;
+  }
+  const client = new DaemonClient();
+  const project = await client.getProject(ident);
+  const out = await client.getProjectGates(project.id);
+  if (out.stages.length === 0) {
+    console.log(dim(`no approval gates set for ${project.name}`));
+    return;
+  }
+  console.log(`${bold("approval gates")} for ${project.name}:`);
+  for (const s of out.stages) {
+    console.log(`  ${cyan(s)}`);
+  }
+}
+
+async function projectGatesSet(argv: string[]) {
+  const ident = argv[0];
+  const stagesArg = argv[1];
+  if (!ident || !stagesArg) {
+    console.error(
+      "mill project gates set: usage: mill project gates set <project> <stage[,stage...]>",
+    );
+    process.exitCode = 2;
+    return;
+  }
+  const stages = stagesArg
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean);
+  if (stages.length === 0) {
+    console.error("mill project gates set: at least one stage is required");
+    process.exitCode = 2;
+    return;
+  }
+  const client = new DaemonClient();
+  const project = await client.getProject(ident);
+  const out = await client.setProjectGates(project.id, stages);
+  console.log(
+    `${green("✓")} approval gates updated for ${bold(project.name)}: ${
+      out.stages.join(", ") || dim("(none)")
+    }`,
+  );
+}
+
+async function projectGatesClear(argv: string[]) {
+  const ident = argv[0];
+  if (!ident) {
+    console.error("mill project gates clear: project required");
+    process.exitCode = 2;
+    return;
+  }
+  const client = new DaemonClient();
+  const project = await client.getProject(ident);
+  await client.clearProjectGates(project.id);
+  console.log(`${green("✓")} cleared approval gates for ${bold(project.name)}`);
+}
+
+async function projectWebhooks(argv: string[]) {
+  const [sub, ...rest] = argv;
+  switch (sub) {
+    case "add":
+      return await projectWebhooksAdd(rest);
+    case "ls":
+    case "list":
+      return await projectWebhooksLs(rest);
+    case "rm":
+    case "remove":
+      return await projectWebhooksRm(rest);
+    default:
+      console.error(`mill project webhooks: unknown subcommand "${sub ?? ""}"`);
+      console.error(
+        "  usage: mill project webhooks add <project> --url <url> --events <list> --secret <token>",
+      );
+      console.error("         mill project webhooks ls <project>");
+      console.error("         mill project webhooks rm <id>");
+      process.exitCode = 2;
+  }
+}
+
+async function projectWebhooksAdd(argv: string[]) {
+  const { values, positionals } = parseArgs({
+    args: argv,
+    allowPositionals: true,
+    options: {
+      url: { type: "string" },
+      events: { type: "string" },
+      secret: { type: "string" },
+    },
+  });
+  const ident = positionals[0];
+  if (!ident) {
+    console.error(
+      "mill project webhooks add: usage: mill project webhooks add <project> --url <url> --events <list> --secret <token>",
+    );
+    process.exitCode = 2;
+    return;
+  }
+  if (!values.url) {
+    console.error("mill project webhooks add: --url is required");
+    process.exitCode = 2;
+    return;
+  }
+  if (!values.events) {
+    console.error("mill project webhooks add: --events is required");
+    process.exitCode = 2;
+    return;
+  }
+  if (!values.secret) {
+    console.error("mill project webhooks add: --secret is required");
+    process.exitCode = 2;
+    return;
+  }
+  const events = values.events
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean);
+  if (events.length === 0) {
+    console.error("mill project webhooks add: --events must list at least one event");
+    process.exitCode = 2;
+    return;
+  }
+  const client = new DaemonClient();
+  const project = await client.getProject(ident);
+  const out = await client.createWebhook(project.id, {
+    url: values.url,
+    events,
+    secret: values.secret,
+  });
+  console.log(
+    `${green("✓")} added webhook for ${bold(project.name)} ${dim(`(${out.id})`)}`,
+  );
+  console.log(`  ${dim("url:")}    ${out.url}`);
+  console.log(`  ${dim("events:")} ${out.events.join(", ")}`);
+}
+
+async function projectWebhooksLs(argv: string[]) {
+  const ident = argv[0];
+  if (!ident) {
+    console.error("mill project webhooks ls: project required");
+    process.exitCode = 2;
+    return;
+  }
+  const client = new DaemonClient();
+  const project = await client.getProject(ident);
+  const entries = await client.listWebhooks(project.id);
+  if (entries.length === 0) {
+    console.log(dim(`no webhooks configured for ${project.name}`));
+    return;
+  }
+  const header = [
+    dim("id"),
+    dim("url"),
+    dim("events"),
+    dim("enabled"),
+    dim("fails"),
+  ];
+  const rows = entries.map((e) => [
+    e.id,
+    e.url,
+    e.events.join(","),
+    e.enabled ? green("yes") : red("no"),
+    String(e.consecutive_failures),
+  ]);
+  console.log(renderTable([header, ...rows], { alignRight: new Set([4]) }));
+}
+
+async function projectWebhooksRm(argv: string[]) {
+  const id = argv[0];
+  if (!id) {
+    console.error("mill project webhooks rm: webhook id required");
+    process.exitCode = 2;
+    return;
+  }
+  const client = new DaemonClient();
+  await client.deleteWebhook(id);
+  console.log(`${green("✓")} removed webhook ${bold(id)}`);
+}
+
 function printProjectHelp() {
   console.log(
     [
@@ -364,6 +594,8 @@ function printProjectHelp() {
       `  ${cyan("mill project ls")}  [--all]                  list projects + cost rollup`,
       `  ${cyan("mill project show")} <id>                    detailed view of one project`,
       `  ${cyan("mill project rm")} <id> [--yes]              deregister (history kept)`,
+      `  ${cyan("mill project gates")} {set|clear|ls} <project>  approval gates per stage`,
+      `  ${cyan("mill project webhooks")} {add|ls|rm} ...        outbound webhook subscriptions`,
     ].join("\n"),
   );
 }
@@ -596,6 +828,12 @@ async function daemonStart(argv: string[]) {
       foreground: { type: "boolean", default: false },
       "no-ui": { type: "boolean", default: false },
       open: { type: "boolean", default: false },
+      // Phase 3 bind / TLS flags. Forwarded to the daemon child via
+      // argv (parsed in src/daemon/index.ts).
+      bind: { type: "string" },
+      insecure: { type: "boolean", default: false },
+      cert: { type: "string" },
+      key: { type: "string" },
     },
   });
 
@@ -608,6 +846,13 @@ async function daemonStart(argv: string[]) {
   if (values.port) env.MILL_DAEMON_PORT = values.port;
   if (values.host) env.MILL_DAEMON_HOST = values.host;
   if (values["no-ui"]) env.MILL_NO_UI = "1";
+
+  // Forward bind / TLS flags to the daemon child via argv.
+  const passthrough: string[] = [];
+  if (values.bind) passthrough.push("--bind", values.bind);
+  if (values.insecure) passthrough.push("--insecure");
+  if (values.cert) passthrough.push("--cert", values.cert);
+  if (values.key) passthrough.push("--key", values.key);
 
   // Fast-fail if a daemon is already up on the configured bind. The
   // daemon entrypoint also guards via the pidfile, but doing it here
@@ -635,7 +880,8 @@ async function daemonStart(argv: string[]) {
     if (env.MILL_DAEMON_HOST) process.env.MILL_DAEMON_HOST = env.MILL_DAEMON_HOST;
     await new Promise<void>((res, rej) => {
       const cmd = entry.kind === "node" ? process.execPath : entry.cmd;
-      const args = entry.kind === "node" ? [entry.path] : entry.args;
+      const baseArgs = entry.kind === "node" ? [entry.path] : entry.args;
+      const args = [...baseArgs, ...passthrough];
       const child = spawn(cmd, args, {
         stdio: "inherit",
         env,
@@ -656,7 +902,8 @@ async function daemonStart(argv: string[]) {
   // CLI invocation. Poll the pidfile + /healthz so the user sees a
   // clean "running on host:port" line before we return.
   const cmd = entry.kind === "node" ? process.execPath : entry.cmd;
-  const args = entry.kind === "node" ? [entry.path] : entry.args;
+  const baseArgs = entry.kind === "node" ? [entry.path] : entry.args;
+  const args = [...baseArgs, ...passthrough];
   const child = spawn(cmd, args, {
     detached: true,
     stdio: "ignore",
@@ -835,6 +1082,136 @@ async function pollUntil(
     await sleep(opts.intervalMs);
   }
   return false;
+}
+
+// ---------- mill auth ----------
+
+async function cmdAuth(argv: string[]) {
+  const [sub, ...rest] = argv;
+  switch (sub) {
+    case "init":
+      return await authInit(rest);
+    case "show":
+      return await authShow(rest);
+    case "rotate":
+      return await authRotate(rest);
+    case undefined:
+    case "help":
+    case "-h":
+    case "--help":
+      printAuthHelp();
+      return;
+    default:
+      console.error(`mill auth: unknown subcommand "${sub}"`);
+      printAuthHelp();
+      process.exitCode = 2;
+  }
+}
+
+function printAuthHelp() {
+  console.log(
+    [
+      `${bold("mill auth")} — daemon authentication`,
+      ``,
+      `  ${cyan("mill auth init")}     generate a token at ~/.mill/auth.token (mode 0600)`,
+      `  ${cyan("mill auth show")}     print the configured token`,
+      `  ${cyan("mill auth rotate")}   replace the token; invalidates all UI sessions`,
+      ``,
+      dim(
+        "After init, export MILL_AUTH_TOKEN=\"$(cat ~/.mill/auth.token)\" in your shell rc.",
+      ),
+      dim(
+        "The CLI auto-reads the file when MILL_AUTH_TOKEN is unset, so the export is",
+      ),
+      dim("optional but recommended for scripts."),
+    ].join("\n"),
+  );
+}
+
+async function authInit(_argv: string[]) {
+  const { initAuthToken, authTokenPath } = await import("./daemon/auth.js");
+  const file = authTokenPath();
+  if (existsSync(file)) {
+    console.error(
+      `${red("mill auth:")} token already exists at ${file}. ` +
+        `Run \`mill auth rotate\` to replace it.`,
+    );
+    process.exitCode = 1;
+    return;
+  }
+  const result = await initAuthToken();
+  console.log(`${green("✓")} wrote ${bold(result.path)} ${dim("(mode 0600)")}`);
+  console.log("");
+  console.log(`  ${result.token}`);
+  console.log("");
+  console.log(
+    dim(
+      "Add to your shell rc:\n" +
+        `  export MILL_AUTH_TOKEN="$(cat ${result.path})"`,
+    ),
+  );
+  if (await isDaemonLive()) {
+    console.log(
+      dim(
+        "\nDaemon is currently running — restart it to pick up the new token:\n" +
+          "  mill daemon stop && mill daemon start",
+      ),
+    );
+  }
+}
+
+async function authShow(_argv: string[]) {
+  const { readAuthToken } = await import("./daemon/auth.js");
+  const { path, token } = readAuthToken();
+  if (!token) {
+    console.error(
+      `${red("mill auth:")} no token at ${path}. Run \`mill auth init\` first.`,
+    );
+    process.exitCode = 1;
+    return;
+  }
+  console.log(token);
+}
+
+async function authRotate(_argv: string[]) {
+  const { rotateAuthToken } = await import("./daemon/auth.js");
+  const result = await rotateAuthToken();
+  console.log(`${green("✓")} rotated token at ${bold(result.path)}`);
+  console.log("");
+  console.log(`  ${result.token}`);
+  console.log("");
+  // Invalidate every existing UI session so a stolen cookie can't outlive
+  // the rotated token. CLI reads the central DB directly. When the daemon
+  // is up it'll re-read the token on its next auth request via env/file.
+  try {
+    const store = openCentralStoreReadOnly();
+    try {
+      store.deleteAllAuthSessions();
+      console.log(dim("· invalidated all UI sessions (forced re-login)"));
+    } finally {
+      store.close();
+    }
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error(`${yellow("warn:")} could not invalidate sessions: ${msg}`);
+  }
+  if (await isDaemonLive()) {
+    console.log(
+      dim(
+        "\nRestart the daemon to pick up the new token:\n" +
+          "  mill daemon stop && mill daemon start",
+      ),
+    );
+  }
+}
+
+async function isDaemonLive(): Promise<boolean> {
+  try {
+    const client = new DaemonClient();
+    return await client.isLive();
+  } catch {
+    return false;
+  }
 }
 
 // ---------- mill new ----------
@@ -1414,12 +1791,18 @@ function renderRunHeader(run: RunRow, store: StateStore) {
   console.log(`${bold("run")} ${bold(run.id)}`);
   const project =
     run.project_id ? store.getProject(run.project_id) : null;
+  const statusCell =
+    run.status === "awaiting_approval" && run.awaiting_approval_at_stage
+      ? `${colorRunStatus(run.status)} ${dim(`(at ${run.awaiting_approval_at_stage})`)}`
+      : run.status === "failed" && run.failure_reason
+        ? `${colorRunStatus(run.status)} ${dim(`(${run.failure_reason})`)}`
+        : colorRunStatus(run.status);
   const rows: string[][] = [
     [
       dim("  project"),
       project ? `${project.name} ${dim(project.id)}` : dim("—"),
     ],
-    [dim("  status"), colorRunStatus(run.status)],
+    [dim("  status"), statusCell],
     [dim("  mode"), run.mode ?? "new"],
     [dim("  kind"), run.kind ?? "—"],
     [dim("  cost"), fmtCost(run.total_cost_usd)],
@@ -1430,6 +1813,21 @@ function renderRunHeader(run: RunRow, store: StateStore) {
     [dim("  created"), dim(relTime(run.created_at))],
   ];
   console.log(renderTable(rows));
+  if (run.status === "awaiting_approval") {
+    console.log(
+      dim(
+        `\n  ${bold("→")} approve: ${cyan(`mill approve ${run.id}`)}` +
+          ` or reject: ${cyan(`mill reject ${run.id} --note "..."`)}`,
+      ),
+    );
+  } else if (run.status === "paused_budget") {
+    console.log(
+      dim(
+        `\n  ${bold("→")} resume: ${cyan(`mill resume ${run.id}`)}` +
+          ` (project must be back under monthly budget)`,
+      ),
+    );
+  }
 }
 
 function renderStageTable(
@@ -1869,6 +2267,71 @@ async function cmdKill(argv: string[]) {
   console.log(`${red("✗")} kill sentinel written for ${bold(runId)}`);
   console.log(dim(`  ${out.killed_path}`));
   console.log(dim("  run stops on the next tool call inside the claude subprocess."));
+}
+
+// ---------- mill approve / reject / resume ----------
+
+async function cmdApprove(argv: string[]) {
+  const { values, positionals } = parseArgs({
+    args: argv,
+    allowPositionals: true,
+    options: {
+      note: { type: "string" },
+    },
+  });
+  const runId = positionals[0];
+  if (!runId) {
+    console.error("mill approve: run-id required");
+    process.exitCode = 2;
+    return;
+  }
+  const client = new DaemonClient();
+  const out = await client.approveRun(runId, values.note);
+  console.log(
+    `${green("✓")} approved ${bold(runId)} → status ${colorRunStatus(out.status)}`,
+  );
+  if (values.note) console.log(dim(`  note: ${values.note}`));
+}
+
+async function cmdReject(argv: string[]) {
+  const { values, positionals } = parseArgs({
+    args: argv,
+    allowPositionals: true,
+    options: {
+      note: { type: "string" },
+    },
+  });
+  const runId = positionals[0];
+  if (!runId) {
+    console.error("mill reject: run-id required");
+    process.exitCode = 2;
+    return;
+  }
+  if (!values.note) {
+    console.error("mill reject: --note \"<reason>\" is required");
+    process.exitCode = 2;
+    return;
+  }
+  const client = new DaemonClient();
+  const out = await client.rejectRun(runId, values.note);
+  console.log(
+    `${red("✗")} rejected ${bold(runId)} → status ${colorRunStatus(out.status)}`,
+  );
+  console.log(dim(`  note: ${values.note}`));
+}
+
+async function cmdResume(argv: string[]) {
+  const runId = argv[0];
+  if (!runId) {
+    console.error("mill resume: run-id required");
+    process.exitCode = 2;
+    return;
+  }
+  const client = new DaemonClient();
+  const out = await client.resumeRun(runId);
+  console.log(
+    `${green("→")} resumed ${bold(runId)} → status ${colorRunStatus(out.status)}`,
+  );
 }
 
 function compactEvent(ts: number, stage: string, kind: string, payload: unknown): string {

@@ -1,6 +1,8 @@
 import { existsSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { mkdir } from "node:fs/promises";
 import { dirname } from "node:path";
+import { createServer as createHttpsServer } from "node:https";
+import { parseArgs } from "node:util";
 import { serve } from "@hono/node-server";
 import {
   daemonPidPath,
@@ -11,6 +13,15 @@ import {
 import { loadGlobalConfig } from "../orchestrator/config.js";
 import { startRunLoop } from "./run-loop.js";
 import { buildServer } from "./server.js";
+import { startNotifyWorker } from "./notify.js";
+import { isAuthEnabled } from "./auth.js";
+import {
+  parseBindMode,
+  readTlsMaterial,
+  validateBind,
+  BindConfigError,
+  type ValidatedBind,
+} from "./bind.js";
 
 // Daemon entrypoint. Wires the Hono server + cross-project run loop into
 // one process bound to 127.0.0.1 by default. SIGTERM/SIGINT semantics:
@@ -18,11 +29,79 @@ import { buildServer } from "./server.js";
 //     accepting new HTTP connections, wait for in-flight runs to drain.
 //   - second signal: abort active runs via their AbortControllers and
 //     exit non-zero immediately.
+//
+// Phase 3 adds --bind <loopback|lan|all>, --insecure, --cert, --key
+// flags. The bind validator is the single source of truth for the
+// "non-loopback requires auth" / "non-loopback requires HTTPS or
+// --insecure" rules.
+
+interface DaemonFlags {
+  bind: string | undefined;
+  insecure: boolean;
+  cert: string | undefined;
+  key: string | undefined;
+}
+
+function parseDaemonFlags(): DaemonFlags {
+  // parseArgs is forgiving of unknown flags via strict: false so the
+  // entrypoint stays compatible with future additions without code
+  // changes here.
+  const { values } = parseArgs({
+    args: process.argv.slice(2),
+    allowPositionals: true,
+    strict: false,
+    options: {
+      bind: { type: "string" },
+      insecure: { type: "boolean" },
+      cert: { type: "string" },
+      key: { type: "string" },
+    },
+  });
+  return {
+    bind: values.bind as string | undefined,
+    insecure: !!values.insecure,
+    cert: values.cert as string | undefined,
+    key: values.key as string | undefined,
+  };
+}
 
 async function main(): Promise<void> {
+  const flags = parseDaemonFlags();
   const config = loadGlobalConfig();
   await ensureMillRoot();
   await mkdir(dirname(config.dbPath), { recursive: true });
+
+  // Bind validation (Phase 3 / AC-3 + AC-4). Refuse non-loopback bind
+  // without auth; refuse non-loopback over plain HTTP without --insecure
+  // unless TLS material is supplied. Runs before SQLite open + pidfile
+  // write so a misconfigured invocation leaves no stale state behind.
+  const mode = parseBindMode(flags.bind);
+  if (mode === null) {
+    process.stderr.write(
+      `mill daemon: --bind must be loopback|lan|all, got "${flags.bind}"\n`,
+    );
+    process.exit(2);
+  }
+
+  let bind: ValidatedBind;
+  try {
+    bind = validateBind(
+      {
+        mode,
+        authConfigured: isAuthEnabled(),
+        certPath: flags.cert,
+        keyPath: flags.key,
+        insecure: flags.insecure,
+      },
+      config.daemonHost,
+    );
+  } catch (err) {
+    if (err instanceof BindConfigError) {
+      process.stderr.write(`mill daemon: ${err.message}\n`);
+      process.exit(2);
+    }
+    throw err;
+  }
 
   // Pidfile guard: a stale pidfile (process gone) is fine to overwrite;
   // a live one means another daemon is already running and we should
@@ -53,26 +132,46 @@ async function main(): Promise<void> {
   // env, and MILL_DEV=1 is the dev workflow that runs Vite separately.
   const serveUi =
     process.env.MILL_NO_UI !== "1" && process.env.MILL_DEV !== "1";
-  const app = buildServer({ store, config, serveUi });
+  // Cookies omit `Secure` when we are NOT serving HTTPS. Browsers only
+  // accept Secure cookies over TLS, so on plain HTTP (loopback default,
+  // or non-loopback with --insecure) we drop the attribute.
+  const insecureCookies = bind.tls === null;
+  const app = buildServer({ store, config, serveUi, insecureCookies });
   const runLoop = startRunLoop({ store, config });
+  // Webhook notify worker. Subscribes to the in-process event bus and
+  // fans out matching events to per-project webhook subscriptions. No
+  // durability — see Phase 3 plan's architectural decision 7.
+  const notify = startNotifyWorker({
+    store,
+    publicUrl: config.publicUrl,
+  });
 
   // Bind first; if the port is taken we want to fail before writing
   // the pidfile (so a future start sees no stale state).
-  const server = await listenLoopback({
+  const server = await listen({
     app,
-    host: config.daemonHost,
+    hostname: bind.hostname,
     port: config.daemonPort,
+    tls: bind.tls
+      ? readTlsMaterial(bind.tls.certPath, bind.tls.keyPath)
+      : null,
   });
 
   writeFileSync(pidPath, `${process.pid}\n`, "utf8");
   writeFileSync(portPath, `${config.daemonPort}\n`, "utf8");
+  const scheme = bind.tls ? "https" : "http";
+  const securityNote = bind.tls
+    ? "tls"
+    : bind.insecure && !bind.isLoopback
+      ? "plain HTTP (--insecure)"
+      : "plain HTTP";
   process.stderr.write(
-    `mill daemon: listening on ${config.daemonHost}:${config.daemonPort} ` +
-      `(pid ${process.pid}, db ${config.dbPath})\n`,
+    `mill daemon: listening on ${bind.hostname}:${config.daemonPort} ` +
+      `(${bind.mode}, ${securityNote}, pid ${process.pid}, db ${config.dbPath})\n`,
   );
   if (serveUi) {
     process.stderr.write(
-      `mill daemon: web UI at http://${config.daemonHost}:${config.daemonPort}/\n`,
+      `mill daemon: web UI at ${scheme}://${bind.hostname}:${config.daemonPort}/\n`,
     );
   }
 
@@ -97,6 +196,7 @@ async function main(): Promise<void> {
           `Send ${signal} again to abort.\n`,
       );
       runLoop.stop();
+      notify.stop();
       // Stop accepting new HTTP connections; existing requests still
       // complete. Hono on @hono/node-server returns the underlying
       // http.Server.
@@ -138,35 +238,42 @@ async function main(): Promise<void> {
   process.on("SIGTERM", (sig) => void shutdown(sig));
 }
 
-async function listenLoopback(args: {
+interface ListenArgs {
   app: import("hono").Hono;
-  host: string;
+  hostname: string;
   port: number;
-}): Promise<{ close: () => void }> {
+  tls: { cert: string; key: string } | null;
+}
+
+async function listen(args: ListenArgs): Promise<{ close: () => void }> {
   // serve() returns the http.Server synchronously and only emits
   // "listening" / "error" once the bind resolves. Wrap so EADDRINUSE
   // becomes a clear stderr message rather than an unhandled "error" event.
   return new Promise((resolve, reject) => {
     let settled = false;
-    const server = serve(
-      {
-        fetch: args.app.fetch,
-        hostname: args.host,
-        port: args.port,
-      },
-      () => {
-        if (settled) return;
-        settled = true;
-        resolve(server as unknown as { close: () => void });
-      },
-    );
+    const opts: Parameters<typeof serve>[0] = {
+      fetch: args.app.fetch,
+      hostname: args.hostname,
+      port: args.port,
+    };
+    if (args.tls) {
+      // Hand off to https.createServer with the supplied cert/key. The
+      // adapter still wires Hono's fetch into the request pipeline.
+      opts.createServer = createHttpsServer;
+      opts.serverOptions = { cert: args.tls.cert, key: args.tls.key };
+    }
+    const server = serve(opts, () => {
+      if (settled) return;
+      settled = true;
+      resolve(server as unknown as { close: () => void });
+    });
     (server as unknown as NodeJS.EventEmitter).on("error", (err: Error) => {
       if (settled) return;
       settled = true;
       const code = (err as Error & { code?: string }).code;
       if (code === "EADDRINUSE") {
         process.stderr.write(
-          `mill daemon: port ${args.port} on ${args.host} is already in use. ` +
+          `mill daemon: port ${args.port} on ${args.hostname} is already in use. ` +
             `Override with MILL_DAEMON_PORT=<n> or stop the other process.\n`,
         );
       } else {
@@ -192,7 +299,7 @@ function isProcessAlive(pid: number): boolean {
 
 main().catch((err) => {
   if (err instanceof Error && (err as Error & { code?: string }).code === "EADDRINUSE") {
-    // Already logged inside listenLoopback; just exit non-zero.
+    // Already logged inside listen(); just exit non-zero.
     process.exit(1);
   }
   process.stderr.write(

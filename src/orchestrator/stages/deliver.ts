@@ -184,6 +184,30 @@ export async function deliver(args: DeliverArgs): Promise<StageResult> {
         artifact_path: ctx.paths.delivery,
       });
     });
+    // Phase 3: emit a terminal event after the status flip lands so
+    // notify.ts (and any other bus subscriber) can fan out webhooks.
+    // The transaction above already committed the row update; this is
+    // a separate INSERT and a bus publish. Failures here must not flip
+    // the run back to failed — the delivery already succeeded.
+    try {
+      ctx.store.appendEvent(
+        ctx.runId,
+        "deliver",
+        passed ? "run_completed" : "run_failed",
+        {
+          run_id: ctx.runId,
+          summary: passed
+            ? "Run completed successfully"
+            : "Run failed at delivery",
+          unresolved_high_count: args.unresolvedHighFindings.length,
+          verify_pass: args.verifyPass,
+        },
+      );
+    } catch (err) {
+      ctx.logger.warn("terminal event publish failed", {
+        err: err instanceof Error ? err.message : String(err),
+      });
+    }
     return { ok: passed, data: { delivery: ctx.paths.delivery, passed } };
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);

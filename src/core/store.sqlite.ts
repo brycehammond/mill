@@ -2,12 +2,14 @@ import Database from "better-sqlite3";
 import { dirname } from "node:path";
 import { mkdirSync } from "node:fs";
 import type {
+  AuthSessionRow,
   Clarifications,
   CriticName,
   DisplayStageRow,
   EventRow,
   FindingRow,
   ProjectRow,
+  ProjectWebhookRow,
   RunMode,
   RunRow,
   RunStatus,
@@ -136,6 +138,44 @@ CREATE TABLE IF NOT EXISTS sessions (
   updated_at INTEGER NOT NULL,
   PRIMARY KEY (run_id, stage)
 );
+
+-- Phase 3: cookie-backed UI sessions. Distinct from sessions (which
+-- holds per-run-stage claude session ids). Timestamps are unix-ms.
+CREATE TABLE IF NOT EXISTS auth_sessions (
+  id TEXT PRIMARY KEY,
+  actor TEXT NOT NULL,
+  created_at INTEGER NOT NULL,
+  last_seen_at INTEGER NOT NULL,
+  expires_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS auth_sessions_expires ON auth_sessions (expires_at);
+
+-- Phase 3: per-project list of stages that pause a run for human
+-- approval before they start. A row means "pause runs in this project
+-- after the named stage completes; require explicit approval for the
+-- next stage to begin."
+CREATE TABLE IF NOT EXISTS project_approval_gates (
+  project_id TEXT NOT NULL,
+  stage_name TEXT NOT NULL,
+  PRIMARY KEY (project_id, stage_name),
+  FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE
+);
+
+-- Phase 3: outbound webhook subscriptions, scoped per project. The
+-- notify worker fans out events to enabled rows whose event_filter
+-- contains the event name.
+CREATE TABLE IF NOT EXISTS project_webhooks (
+  id TEXT PRIMARY KEY,
+  project_id TEXT NOT NULL,
+  url TEXT NOT NULL,
+  event_filter TEXT NOT NULL,
+  secret TEXT NOT NULL,
+  enabled INTEGER NOT NULL DEFAULT 1,
+  consecutive_failures INTEGER NOT NULL DEFAULT 0,
+  created_at INTEGER NOT NULL,
+  FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS project_webhooks_project ON project_webhooks (project_id);
 `;
 
 function toTokenDelta(n: number | undefined): number {
@@ -189,6 +229,17 @@ export class SqliteStateStore implements StateStore {
       ["stages", "cache_read_tokens", "INTEGER NOT NULL DEFAULT 0"],
       ["stages", "output_tokens", "INTEGER NOT NULL DEFAULT 0"],
       ["findings", "fingerprint", "TEXT NOT NULL DEFAULT ''"],
+      // Phase 3: gate the next-stage and persist a failure reason so a
+      // rejected / budget-paused run is distinguishable from a generic
+      // error in the audit trail. Both are nullable; existing rows
+      // backfill to NULL which is the right default.
+      ["runs", "awaiting_approval_at_stage", "TEXT"],
+      ["runs", "failure_reason", "TEXT"],
+      // Phase 3: who caused this event. Backfilled to 'mill' for
+      // pre-Phase-3 rows by the migration below; the column itself
+      // defaults to 'mill' so any direct INSERT that omits it still
+      // gets a sane value.
+      ["events", "actor", "TEXT NOT NULL DEFAULT 'mill'"],
     ];
     for (const [table, column, spec] of cols) {
       try {
@@ -280,7 +331,16 @@ export class SqliteStateStore implements StateStore {
   updateRun(
     id: string,
     patch: Partial<
-      Pick<RunRow, "status" | "kind" | "spec_path" | "test_command" | "total_cost_usd">
+      Pick<
+        RunRow,
+        | "status"
+        | "kind"
+        | "spec_path"
+        | "test_command"
+        | "total_cost_usd"
+        | "awaiting_approval_at_stage"
+        | "failure_reason"
+      >
     >,
   ): void {
     const keys = Object.keys(patch) as (keyof typeof patch)[];
@@ -729,14 +789,20 @@ export class SqliteStateStore implements StateStore {
     return out;
   }
 
-  appendEvent(runId: string, stage: StageName, kind: string, payload: unknown): void {
+  appendEvent(
+    runId: string,
+    stage: StageName,
+    kind: string,
+    payload: unknown,
+    actor: string = "mill",
+  ): void {
     const ts = Date.now();
     const payloadJson = JSON.stringify(payload ?? null);
     const info = this.db
       .prepare(
-        `INSERT INTO events (run_id, stage, ts, kind, payload_json) VALUES (?, ?, ?, ?, ?)`,
+        `INSERT INTO events (run_id, stage, ts, kind, payload_json, actor) VALUES (?, ?, ?, ?, ?, ?)`,
       )
-      .run(runId, stage, ts, kind, payloadJson);
+      .run(runId, stage, ts, kind, payloadJson, actor);
     // Fanout to in-process subscribers (SSE) only after the INSERT
     // succeeds — a thrown prepare/run keeps the bus untouched. The id
     // is the autoincrement assigned by SQLite, surfaced as
@@ -748,6 +814,7 @@ export class SqliteStateStore implements StateStore {
       stage,
       ts,
       kind,
+      actor,
       payload_json: payloadJson,
     });
   }
@@ -958,4 +1025,268 @@ export class SqliteStateStore implements StateStore {
     if (!row) return null;
     return { sessionId: row.session_id, totalCostUsd: row.total_cost_usd };
   }
+
+  // ---- Phase 3: auth sessions ----
+
+  createAuthSession(row: {
+    id: string;
+    actor: string;
+    created_at?: number;
+    last_seen_at?: number;
+    expires_at: number;
+  }): AuthSessionRow {
+    const now = Date.now();
+    const created = row.created_at ?? now;
+    const lastSeen = row.last_seen_at ?? created;
+    this.db
+      .prepare(
+        `INSERT INTO auth_sessions (id, actor, created_at, last_seen_at, expires_at)
+         VALUES (?, ?, ?, ?, ?)`,
+      )
+      .run(row.id, row.actor, created, lastSeen, row.expires_at);
+    return {
+      id: row.id,
+      actor: row.actor,
+      created_at: created,
+      last_seen_at: lastSeen,
+      expires_at: row.expires_at,
+    };
+  }
+
+  findAuthSession(id: string): AuthSessionRow | null {
+    const r = this.db
+      .prepare(`SELECT * FROM auth_sessions WHERE id = ?`)
+      .get(id) as AuthSessionRow | undefined;
+    if (!r) return null;
+    if (r.expires_at <= Date.now()) return null;
+    return r;
+  }
+
+  touchAuthSession(id: string, newExpiresAt: number): AuthSessionRow | null {
+    const existing = this.findAuthSession(id);
+    if (!existing) return null;
+    const now = Date.now();
+    this.db
+      .prepare(
+        `UPDATE auth_sessions SET last_seen_at = ?, expires_at = ? WHERE id = ?`,
+      )
+      .run(now, newExpiresAt, id);
+    return {
+      ...existing,
+      last_seen_at: now,
+      expires_at: newExpiresAt,
+    };
+  }
+
+  deleteAuthSession(id: string): void {
+    this.db.prepare(`DELETE FROM auth_sessions WHERE id = ?`).run(id);
+  }
+
+  deleteAllAuthSessions(): void {
+    this.db.prepare(`DELETE FROM auth_sessions`).run();
+  }
+
+  deleteExpiredAuthSessions(now: number = Date.now()): number {
+    const info = this.db
+      .prepare(`DELETE FROM auth_sessions WHERE expires_at <= ?`)
+      .run(now);
+    return Number(info.changes);
+  }
+
+  // ---- Phase 3: approval gates ----
+
+  setProjectGates(projectId: string, stages: StageName[]): void {
+    // Full-replace semantics. Wrapped in a transaction so the table is
+    // never observed half-empty by a concurrent reader.
+    const del = this.db.prepare(
+      `DELETE FROM project_approval_gates WHERE project_id = ?`,
+    );
+    const ins = this.db.prepare(
+      `INSERT OR IGNORE INTO project_approval_gates (project_id, stage_name) VALUES (?, ?)`,
+    );
+    const txn = this.db.transaction((items: StageName[]) => {
+      del.run(projectId);
+      for (const s of items) ins.run(projectId, s);
+    });
+    txn(stages);
+  }
+
+  clearProjectGates(projectId: string): void {
+    this.db
+      .prepare(`DELETE FROM project_approval_gates WHERE project_id = ?`)
+      .run(projectId);
+  }
+
+  listProjectGates(projectId: string): StageName[] {
+    const rows = this.db
+      .prepare(
+        `SELECT stage_name FROM project_approval_gates WHERE project_id = ? ORDER BY stage_name`,
+      )
+      .all(projectId) as { stage_name: string }[];
+    return rows.map((r) => r.stage_name as StageName);
+  }
+
+  // ---- Phase 3: webhooks ----
+
+  createWebhook(row: {
+    id: string;
+    project_id: string;
+    url: string;
+    event_filter: string;
+    secret: string;
+    enabled?: boolean;
+    created_at?: number;
+  }): ProjectWebhookRow {
+    const createdAt = row.created_at ?? Date.now();
+    const enabled = row.enabled === false ? 0 : 1;
+    this.db
+      .prepare(
+        `INSERT INTO project_webhooks
+           (id, project_id, url, event_filter, secret, enabled, consecutive_failures, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, 0, ?)`,
+      )
+      .run(
+        row.id,
+        row.project_id,
+        row.url,
+        row.event_filter,
+        row.secret,
+        enabled,
+        createdAt,
+      );
+    const got = this.getWebhook(row.id);
+    if (!got) {
+      throw new Error(
+        `createWebhook: insert succeeded but row not found for id=${row.id}`,
+      );
+    }
+    return got;
+  }
+
+  listWebhooksByProject(projectId: string): ProjectWebhookRow[] {
+    const rows = this.db
+      .prepare(
+        `SELECT * FROM project_webhooks WHERE project_id = ? ORDER BY created_at DESC`,
+      )
+      .all(projectId) as RawWebhookRow[];
+    return rows.map(toWebhookRow);
+  }
+
+  listWebhooksByEvent(
+    projectId: string,
+    eventName: string,
+  ): ProjectWebhookRow[] {
+    // event_filter is a comma-separated list. Filter in JS — the table is
+    // tiny per project (handful of rows) so a SUBSTR-based SQL match
+    // would be fragile (substring collisions like "run.completed" vs
+    // "run.completed_async") for negligible perf gain.
+    const all = this.db
+      .prepare(
+        `SELECT * FROM project_webhooks WHERE project_id = ? AND enabled = 1`,
+      )
+      .all(projectId) as RawWebhookRow[];
+    return all
+      .filter((r) => parseEventFilter(r.event_filter).has(eventName))
+      .map(toWebhookRow);
+  }
+
+  getWebhook(id: string): ProjectWebhookRow | null {
+    const r = this.db
+      .prepare(`SELECT * FROM project_webhooks WHERE id = ?`)
+      .get(id) as RawWebhookRow | undefined;
+    return r ? toWebhookRow(r) : null;
+  }
+
+  deleteWebhook(id: string): void {
+    this.db.prepare(`DELETE FROM project_webhooks WHERE id = ?`).run(id);
+  }
+
+  incWebhookFailures(id: string): number {
+    this.db
+      .prepare(
+        `UPDATE project_webhooks SET consecutive_failures = consecutive_failures + 1 WHERE id = ?`,
+      )
+      .run(id);
+    const r = this.db
+      .prepare(`SELECT consecutive_failures FROM project_webhooks WHERE id = ?`)
+      .get(id) as { consecutive_failures: number } | undefined;
+    return r ? r.consecutive_failures : 0;
+  }
+
+  resetWebhookFailures(id: string): void {
+    this.db
+      .prepare(`UPDATE project_webhooks SET consecutive_failures = 0 WHERE id = ?`)
+      .run(id);
+  }
+
+  disableWebhook(id: string): void {
+    this.db
+      .prepare(`UPDATE project_webhooks SET enabled = 0 WHERE id = ?`)
+      .run(id);
+  }
+
+  // Test-only escape hatch: hard-delete the project row so the FK
+  // ON DELETE CASCADE on dependent tables fires. Production code uses
+  // removeProject (soft delete via removed_at). Lives in the production
+  // store rather than reaching into private state from tests.
+  hardDeleteProjectForTest(id: string): void {
+    this.db.prepare(`DELETE FROM projects WHERE id = ?`).run(id);
+  }
+
+  // Test-only escape hatch: drop the events.actor column so a subsequent
+  // init() exercises the migrateColumns ADD COLUMN path on a "pre-Phase-3"
+  // DB. SQLite 3.35+ supports DROP COLUMN.
+  simulateLegacyEventsSchemaForTest(): void {
+    this.db.prepare(`ALTER TABLE events DROP COLUMN actor`).run();
+  }
+
+  // Test-only escape hatch: insert a raw event row without the actor
+  // column. Used in tandem with simulateLegacyEventsSchemaForTest to
+  // verify that migrateColumns backfills 'mill' onto pre-existing rows.
+  insertRawEventForTest(
+    runId: string,
+    stage: string,
+    ts: number,
+    kind: string,
+    payloadJson: string,
+  ): void {
+    this.db
+      .prepare(
+        `INSERT INTO events (run_id, stage, ts, kind, payload_json) VALUES (?, ?, ?, ?, ?)`,
+      )
+      .run(runId, stage, ts, kind, payloadJson);
+  }
+}
+
+interface RawWebhookRow {
+  id: string;
+  project_id: string;
+  url: string;
+  event_filter: string;
+  secret: string;
+  enabled: number;
+  consecutive_failures: number;
+  created_at: number;
+}
+
+function toWebhookRow(r: RawWebhookRow): ProjectWebhookRow {
+  return {
+    id: r.id,
+    project_id: r.project_id,
+    url: r.url,
+    event_filter: r.event_filter,
+    secret: r.secret,
+    enabled: r.enabled === 1,
+    consecutive_failures: r.consecutive_failures,
+    created_at: r.created_at,
+  };
+}
+
+function parseEventFilter(filter: string): Set<string> {
+  return new Set(
+    filter
+      .split(",")
+      .map((s) => s.trim())
+      .filter((s) => s.length > 0),
+  );
 }

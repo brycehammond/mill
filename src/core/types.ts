@@ -54,7 +54,31 @@ export type RunStatus =
   | "running"
   | "completed"
   | "failed"
-  | "killed";
+  | "killed"
+  // Phase 3: graceful pause at a stage boundary because the project's
+  // monthly_budget_usd was crossed mid-stage. Resumable via
+  // POST /api/v1/runs/:id/resume once the project is back under budget.
+  | "paused_budget"
+  // Phase 3: graceful pause at a stage boundary because the next stage
+  // is listed in `project_approval_gates`. Resumable via approve/reject.
+  | "awaiting_approval";
+
+// Phase 3 event kinds. These are string literals carried in events.kind;
+// listing them here keeps the names canonical across the daemon, the
+// pipeline, the webhook worker, and the UI. Existing kinds (stage_started,
+// stage_completed, branch_imported, remediation, etc.) are not enumerated
+// and remain free-form strings.
+export type Phase3EventKind =
+  | "budget_warning_80"
+  | "budget_exceeded"
+  | "approval_required"
+  | "approval_granted"
+  | "approval_rejected"
+  | "webhook_disabled";
+
+// Reason a run landed in `failed` status. Stored on `runs.failure_reason`.
+// Free-form string column; these are the canonical values today.
+export type RunFailureReason = "rejected" | "budget" | "error";
 
 export type StageStatus =
   | "pending"
@@ -122,6 +146,13 @@ export interface RunRow {
   // scaffolds or re-uses a runner. Tests critic prefers this over the
   // project profile. Null when spec2tests didn't run / couldn't.
   test_command: string | null;
+  // Phase 3: name of the next stage that is gated by an approval rule.
+  // Set when status transitions to `awaiting_approval`; cleared on
+  // approve / reject / resume.
+  awaiting_approval_at_stage: StageName | null;
+  // Phase 3: why the run is in `failed` status. Free-form string today;
+  // canonical values are RunFailureReason ("rejected" | "budget" | "error").
+  failure_reason: string | null;
   total_cost_usd: number;
   total_input_tokens: number;
   total_cache_creation_tokens: number;
@@ -195,7 +226,39 @@ export interface EventRow {
   stage: StageName;
   ts: number;
   kind: string;
+  // Phase 3: who caused this event. Stage events use 'mill'; user-driven
+  // events (approve / reject / kill / project add / etc.) carry the
+  // authenticated session's user identifier (or `MILL_USER` when running
+  // unauthenticated locally).
+  actor: string;
   payload_json: string;
+}
+
+// Phase 3: cookie-backed UI session. The auth.ts module stores HMAC-of-id
+// in the cookie itself; this row is the durable record. `actor` is the
+// free-form name the user typed at login (or the deployment's `MILL_USER`
+// fallback); it lands on user-driven events for audit.
+export interface AuthSessionRow {
+  id: string;
+  actor: string;
+  created_at: number;
+  last_seen_at: number;
+  expires_at: number;
+}
+
+// Phase 3: outbound webhook subscription, scoped to a single project.
+// `event_filter` is a comma-separated list of event names ("run.completed",
+// "finding.high", etc.). `enabled = 0` disables delivery without deleting
+// the row (auto-set after consecutive_failures crosses the threshold).
+export interface ProjectWebhookRow {
+  id: string;
+  project_id: string;
+  url: string;
+  event_filter: string;
+  secret: string;
+  enabled: boolean;
+  consecutive_failures: number;
+  created_at: number;
 }
 
 export interface FindingRow {
@@ -364,6 +427,8 @@ export interface StateStore {
       | "mode"
       | "test_command"
       | "project_id"
+      | "awaiting_approval_at_stage"
+      | "failure_reason"
     > & {
       spec_path?: string | null;
       mode?: RunMode;
@@ -375,7 +440,16 @@ export interface StateStore {
   updateRun(
     id: string,
     patch: Partial<
-      Pick<RunRow, "status" | "kind" | "spec_path" | "test_command" | "total_cost_usd">
+      Pick<
+        RunRow,
+        | "status"
+        | "kind"
+        | "spec_path"
+        | "test_command"
+        | "total_cost_usd"
+        | "awaiting_approval_at_stage"
+        | "failure_reason"
+      >
     >,
   ): void;
   setRunProjectId(id: string, projectId: string): void;
@@ -438,7 +512,15 @@ export interface StateStore {
   // otherwise the cumulative row unchanged. Sorted chronologically.
   listDisplayStages(runId: string): DisplayStageRow[];
 
-  appendEvent(runId: string, stage: StageName, kind: string, payload: unknown): void;
+  // `actor` defaults to 'mill'. Pass an explicit identifier for user-
+  // driven events (kill, approve, reject, resume, project add/rm, etc.).
+  appendEvent(
+    runId: string,
+    stage: StageName,
+    kind: string,
+    payload: unknown,
+    actor?: string,
+  ): void;
   tailEvents(runId: string, afterId?: number, limit?: number): EventRow[];
 
   insertFinding(row: Omit<FindingRow, "id" | "fingerprint">): void;
@@ -457,6 +539,60 @@ export interface StateStore {
 
   saveClarifications(runId: string, c: Clarifications): void;
   getClarifications(runId: string): Clarifications | null;
+
+  // ---- Phase 3: auth sessions ----
+  // Cookie-backed UI sessions. The Bearer-token path on CLI requests does
+  // not touch this table. Stored under `auth_sessions` to avoid colliding
+  // with the existing per-run-stage `sessions` table.
+  createAuthSession(row: {
+    id: string;
+    actor: string;
+    created_at?: number;
+    last_seen_at?: number;
+    expires_at: number;
+  }): AuthSessionRow;
+  // Returns null when not found OR when the row is past its expires_at.
+  // Expired rows stay on disk until deleteExpiredSessions sweeps them.
+  findAuthSession(id: string): AuthSessionRow | null;
+  // Slide expiry: bump last_seen_at and (optionally) push expires_at out.
+  // Returns the updated row or null if the session no longer exists / is
+  // already expired.
+  touchAuthSession(id: string, newExpiresAt: number): AuthSessionRow | null;
+  deleteAuthSession(id: string): void;
+  deleteAllAuthSessions(): void;
+  deleteExpiredAuthSessions(now?: number): number;
+
+  // ---- Phase 3: approval gates ----
+  // Per-project list of stage names; a row means "pause runs in this
+  // project after the named stage completes; require explicit approval to
+  // continue." setProjectGates is a full replace; clearProjectGates wipes
+  // all rows for the project. listProjectGates returns the stage names.
+  setProjectGates(projectId: string, stages: StageName[]): void;
+  clearProjectGates(projectId: string): void;
+  listProjectGates(projectId: string): StageName[];
+
+  // ---- Phase 3: webhooks ----
+  createWebhook(row: {
+    id: string;
+    project_id: string;
+    url: string;
+    event_filter: string;
+    secret: string;
+    enabled?: boolean;
+    created_at?: number;
+  }): ProjectWebhookRow;
+  listWebhooksByProject(projectId: string): ProjectWebhookRow[];
+  // Subset of listWebhooksByProject filtered to enabled rows whose
+  // event_filter contains the given event name. Used by the notify
+  // worker on every event publish.
+  listWebhooksByEvent(projectId: string, eventName: string): ProjectWebhookRow[];
+  getWebhook(id: string): ProjectWebhookRow | null;
+  deleteWebhook(id: string): void;
+  // Increment / read consecutive_failures atomically. Returns the new
+  // count so the worker can decide whether to disable the webhook.
+  incWebhookFailures(id: string): number;
+  resetWebhookFailures(id: string): void;
+  disableWebhook(id: string): void;
 
   // Session slot is logical: stage name, or a sub-key like `review:security`.
   saveSession(

@@ -1,21 +1,49 @@
 import { Layout } from "./components/Layout.js";
 import { RouterProvider, match, useRoute } from "./router.js";
 import { DashboardScreen } from "./screens/dashboard.js";
+import { LoginScreen } from "./screens/login.js";
 import { ProjectScreen } from "./screens/project.js";
 import { RunScreen } from "./screens/run.js";
 import { FindingsScreen } from "./screens/findings.js";
 
 function Routes() {
   const { path } = useRoute();
+  if (path === "/login") return <LoginScreen />;
   if (path === "/" || path === "") {
-    return <DashboardScreen />;
+    return (
+      <Layout>
+        <DashboardScreen />
+      </Layout>
+    );
   }
   const project = match("/projects/:id", path);
-  if (project) return <ProjectScreen projectId={project.id!} />;
+  if (project) {
+    return (
+      <Layout>
+        <ProjectScreen projectId={project.id!} />
+      </Layout>
+    );
+  }
   const run = match("/runs/:id", path);
-  if (run) return <RunScreen runId={run.id!} />;
-  if (path === "/findings") return <FindingsScreen />;
-  return <NotFound path={path} />;
+  if (run) {
+    return (
+      <Layout>
+        <RunScreen runId={run.id!} />
+      </Layout>
+    );
+  }
+  if (path === "/findings") {
+    return (
+      <Layout>
+        <FindingsScreen />
+      </Layout>
+    );
+  }
+  return (
+    <Layout>
+      <NotFound path={path} />
+    </Layout>
+  );
 }
 
 function NotFound({ path }: { path: string }) {
@@ -35,9 +63,7 @@ function NotFound({ path }: { path: string }) {
 export function App() {
   return (
     <RouterProvider>
-      <Layout>
-        <Routes />
-      </Layout>
+      <Routes />
     </RouterProvider>
   );
 }

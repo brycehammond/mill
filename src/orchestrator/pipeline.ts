@@ -3,6 +3,7 @@ import {
   atLeast,
   KilledError,
   killedSentinelExists,
+  STAGE_ORDER,
 } from "../core/index.js";
 import { buildContext } from "./context.js";
 import { loadConfig, type MillConfig } from "./config.js";
@@ -15,6 +16,24 @@ import { review, shouldStopReviewLoop } from "./stages/review.js";
 import { verify } from "./stages/verify.js";
 import { deliver } from "./stages/deliver.js";
 import { decisions } from "./stages/decisions.js";
+
+// Phase 3: paired with KilledError, two more graceful-pause signals
+// that unwind the pipeline at a stage boundary without flipping the run
+// to `failed`. The pipeline catches both at the top level and leaves the
+// run in its paused state — resumable via approve/resume.
+export class BudgetPausedError extends Error {
+  constructor(runId: string) {
+    super(`run ${runId} paused: monthly budget exceeded`);
+    this.name = "BudgetPausedError";
+  }
+}
+
+export class ApprovalRequiredError extends Error {
+  constructor(runId: string, public readonly atStage: StageName) {
+    super(`run ${runId} awaiting approval before stage ${atStage}`);
+    this.name = "ApprovalRequiredError";
+  }
+}
 
 export interface RunPipelineArgs {
   runId: string;
@@ -65,7 +84,7 @@ export async function runPipeline(args: RunPipelineArgs): Promise<PipelineResult
     // 1. spec
     if (needsStage(ctx, "spec")) {
       const r = await spec(ctx);
-      throwIfKilledOrBroken(ctx, r, "spec");
+      enforceBetweenStages(ctx, r, "spec", "spec");
     }
     {
       const planned = plannedStop("spec");
@@ -78,7 +97,7 @@ export async function runPipeline(args: RunPipelineArgs): Promise<PipelineResult
       const run = ctx.store.getRun(ctx.runId);
       ctx.kind = run?.kind ?? ctx.kind;
       const r = await design(ctx);
-      throwIfKilledOrBroken(ctx, r, "design");
+      enforceBetweenStages(ctx, r, "design", "design");
     }
     {
       const planned = plannedStop("design");
@@ -89,7 +108,7 @@ export async function runPipeline(args: RunPipelineArgs): Promise<PipelineResult
     if (needsStage(ctx, "spec2tests")) {
       if (await shouldRunSpec2Tests(ctx)) {
         const r = await spec2tests(ctx);
-        throwIfKilledOrBroken(ctx, r, "spec2tests");
+        enforceBetweenStages(ctx, r, "spec2tests", "spec2tests");
       } else {
         ctx.store.finishStage(ctx.runId, "spec2tests", {
           status: "skipped",
@@ -143,7 +162,11 @@ export async function runPipeline(args: RunPipelineArgs): Promise<PipelineResult
           iteration,
           priorFindings: previousHigh,
         });
-        throwIfKilledOrBroken(ctx, implResult, `implement-${iteration}`);
+        // Inside the iteration loop we only check kill / fail / budget,
+        // not approval gates. Gating between implement#N and review#N
+        // (or between iterations) doesn't fit the user-facing model —
+        // the gate at "review" fires once after the loop exits.
+        enforceBetweenStages(ctx, implResult, `implement-${iteration}`);
       }
 
       const revRow = ctx.store.getStageIteration(
@@ -154,7 +177,7 @@ export async function runPipeline(args: RunPipelineArgs): Promise<PipelineResult
       let revResult: Awaited<ReturnType<typeof review>>;
       if (!revRow || revRow.status !== "completed") {
         revResult = await review({ ctx, iteration });
-        throwIfKilledOrBroken(ctx, revResult, `review-${iteration}`);
+        enforceBetweenStages(ctx, revResult, `review-${iteration}`);
       } else {
         revResult = rebuildReviewResultFromFindings(ctx, iteration);
       }
@@ -179,9 +202,20 @@ export async function runPipeline(args: RunPipelineArgs): Promise<PipelineResult
       previousHigh = currentHigh;
     }
 
+    // Boundary check between the review loop and verify. `review` is
+    // the just-completed stage; the gate would be on the next stage
+    // (`verify`). The result we pass is always-ok because we only
+    // arrive here from a clean loop exit.
+    enforceBetweenStages(
+      ctx,
+      { ok: true },
+      `review-${iteration}-loop-end`,
+      "review",
+    );
+
     // 4. verify
     const verifyResult = await verify(ctx);
-    if (killedSentinelExists(ctx.paths.killed)) throw new KilledError(ctx.runId);
+    enforceBetweenStages(ctx, verifyResult, "verify", "verify");
 
     // 5. deliver
     await deliver({
@@ -219,6 +253,18 @@ export async function runPipeline(args: RunPipelineArgs): Promise<PipelineResult
     if (err instanceof KilledError) {
       ctx.store.updateRun(ctx.runId, { status: "killed" });
       ctx.logger.warn("pipeline killed", { reason: err.message });
+      // Phase 3: emit a terminal event so the notify worker fans out
+      // a run.killed webhook. Failures here must not change the run
+      // status — the kill already happened.
+      try {
+        ctx.store.appendEvent(ctx.runId, "deliver", "run_killed", {
+          run_id: ctx.runId,
+          summary: "Run killed by user",
+          reason: err.message,
+        });
+      } catch {
+        // ignore
+      }
       return {
         runId: ctx.runId,
         status: "killed",
@@ -227,9 +273,50 @@ export async function runPipeline(args: RunPipelineArgs): Promise<PipelineResult
         durationMs,
       };
     }
+    if (err instanceof BudgetPausedError) {
+      // Already flipped to paused_budget by the inflight check. Don't
+      // overwrite with `failed`. The run row is its own source of truth.
+      ctx.logger.warn("pipeline paused (budget)", { reason: err.message });
+      return {
+        runId: ctx.runId,
+        status: "planned",
+        reason: err.message,
+        costUsd,
+        durationMs,
+      };
+    }
+    if (err instanceof ApprovalRequiredError) {
+      // Already flipped to awaiting_approval by enforceBetweenStages.
+      ctx.logger.info("pipeline paused (approval required)", {
+        atStage: err.atStage,
+      });
+      return {
+        runId: ctx.runId,
+        status: "planned",
+        reason: err.message,
+        costUsd,
+        durationMs,
+      };
+    }
     const msg = err instanceof Error ? err.message : String(err);
-    ctx.store.updateRun(ctx.runId, { status: "failed" });
+    ctx.store.updateRun(ctx.runId, {
+      status: "failed",
+      failure_reason: "error",
+    });
     ctx.logger.error("pipeline failed", { err: msg });
+    // Phase 3: emit a terminal failure event for the notify worker.
+    // Pipeline crashes that don't reach deliver land here; the deliver
+    // stage emits its own terminal event when it's the source of the
+    // failure, so the audit trail covers both paths.
+    try {
+      ctx.store.appendEvent(ctx.runId, "deliver", "run_failed", {
+        run_id: ctx.runId,
+        summary: "Run failed",
+        reason: msg,
+      });
+    } catch {
+      // ignore
+    }
     return {
       runId: ctx.runId,
       status: "failed",
@@ -242,10 +329,21 @@ export async function runPipeline(args: RunPipelineArgs): Promise<PipelineResult
   }
 }
 
-function throwIfKilledOrBroken(
+// Stage-boundary check. Three pause/abort signals follow the same shape:
+//   - KILLED sentinel (hard, terminal — KilledError)
+//   - paused_budget (graceful, resumable — BudgetPausedError)
+//   - awaiting_approval (graceful, resumable — ApprovalRequiredError)
+// Checks fire AFTER finishStage so the just-completed row is durable.
+// `justCompleted` is the stage whose finishStage we just observed; the
+// gate check looks at the project's gates for the NEXT non-iteration
+// stage. Pass it in for major pipeline transitions; omit it (or pass
+// undefined) for iteration-internal boundaries (e.g. between implement
+// and review of the same iteration) where gating doesn't make sense.
+function enforceBetweenStages(
   ctx: RunContext,
   r: StageResult,
   label: string,
+  justCompleted?: StageName,
 ): void {
   if (killedSentinelExists(ctx.paths.killed)) {
     throw new KilledError(ctx.runId);
@@ -253,6 +351,42 @@ function throwIfKilledOrBroken(
   if (!r.ok) {
     throw new Error(`${label} failed: ${r.error ?? "unknown"}`);
   }
+  // Phase 3: budget pause check. The inflight check inside claude-cli
+  // already flipped runs.status to paused_budget when the cap crossed
+  // mid-stage. We only need to read it here and unwind cleanly.
+  const run = ctx.store.getRun(ctx.runId);
+  if (run?.status === "paused_budget") {
+    throw new BudgetPausedError(ctx.runId);
+  }
+  // Phase 3: approval-gate check. Look up the next pipeline stage in
+  // STAGE_ORDER and ask the project whether it's gated.
+  if (justCompleted) {
+    const nextStage = nextPipelineStage(justCompleted);
+    if (nextStage) {
+      const gates = ctx.store.listProjectGates(ctx.projectId);
+      if (gates.includes(nextStage)) {
+        ctx.store.updateRun(ctx.runId, {
+          status: "awaiting_approval",
+          awaiting_approval_at_stage: nextStage,
+        });
+        ctx.store.appendEvent(ctx.runId, justCompleted, "approval_required", {
+          next_stage: nextStage,
+          completed_stage: justCompleted,
+        });
+        throw new ApprovalRequiredError(ctx.runId, nextStage);
+      }
+    }
+  }
+}
+
+// Find the next stage after `current` in STAGE_ORDER. Returns null when
+// `current` is the last stage. The order in types.ts already excludes
+// the iteration-internal review/implement repeats; this is purely a
+// lookup, not a state-aware traversal.
+function nextPipelineStage(current: StageName): StageName | null {
+  const i = STAGE_ORDER.indexOf(current);
+  if (i < 0 || i >= STAGE_ORDER.length - 1) return null;
+  return STAGE_ORDER[i + 1] ?? null;
 }
 
 // Highest iteration number that has any persisted findings. Kept as a

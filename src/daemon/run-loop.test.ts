@@ -22,6 +22,7 @@ function makeConfig(maxConcurrentRuns: number): GlobalMillConfig {
     timeoutSecPerStage: 30,
     timeoutSecPerStageOverrides: {},
     model: undefined,
+    publicUrl: undefined,
   };
 }
 

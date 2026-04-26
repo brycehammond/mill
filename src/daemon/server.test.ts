@@ -52,6 +52,7 @@ function buildHarness(): Harness {
     timeoutSecPerStage: 30,
     timeoutSecPerStageOverrides: {},
     model: undefined,
+    publicUrl: undefined,
   };
   // Stub deps: tests exercise routes without calling `claude`.
   // intake creates a real run row + workdir; clarify just persists a
@@ -853,6 +854,336 @@ describe("daemon server", () => {
     // Filtered by a different project id — empty.
     const empty = await fetchJson(h.app, "GET", "/findings?project=other-id");
     assert.equal((empty.body as { entries: unknown[] }).entries.length, 0);
+    await h.cleanup();
+  });
+
+  // ---- Phase 3: budget pre-flight + approve/reject/resume + gates ----
+
+  it("POST /projects/:id/runs returns 402 when over monthly budget", async () => {
+    h = buildHarness();
+    const created = await fetchJson(h.app, "POST", "/projects", {
+      root_path: repo,
+      monthly_budget_usd: 1,
+    });
+    const projectId = (created.body as { project: { id: string } }).project.id;
+    // Manually push the project's spend over the cap by creating a
+    // priced run row. listRuns sums total_cost_usd irrespective of status.
+    const r1 = await fetchJson(h.app, "POST", `/projects/${projectId}/runs`, {
+      requirement: "first run",
+      all_defaults: true,
+    });
+    const r1Id = (r1.body as { run_id: string }).run_id;
+    h.store.addRunCost(r1Id, 1.5);
+
+    const res = await fetchJson(h.app, "POST", `/projects/${projectId}/runs`, {
+      requirement: "second run",
+      all_defaults: true,
+    });
+    assert.equal(res.status, 402);
+    const body = res.body as {
+      error: string;
+      current_spend_usd: number;
+      monthly_budget_usd: number;
+    };
+    assert.equal(body.monthly_budget_usd, 1);
+    assert.ok(body.current_spend_usd >= 1.5);
+    assert.match(body.error, /budget/);
+    await h.cleanup();
+  });
+
+  it("PUT/GET/DELETE /api/v1/projects/:id/gates round-trips", async () => {
+    h = buildHarness();
+    const created = await fetchJson(h.app, "POST", "/projects", {
+      root_path: repo,
+    });
+    const projectId = (created.body as { project: { id: string } }).project.id;
+
+    const ls0 = await fetchJson(
+      h.app,
+      "GET",
+      `/api/v1/projects/${projectId}/gates`,
+    );
+    assert.equal(ls0.status, 200);
+    assert.deepEqual((ls0.body as { stages: string[] }).stages, []);
+
+    const set = await fetchJson(
+      h.app,
+      "PUT",
+      `/api/v1/projects/${projectId}/gates`,
+      { stages: ["design", "verify"] },
+    );
+    assert.equal(set.status, 200);
+    assert.deepEqual(
+      (set.body as { stages: string[] }).stages,
+      ["design", "verify"],
+    );
+
+    const ls1 = await fetchJson(
+      h.app,
+      "GET",
+      `/api/v1/projects/${projectId}/gates`,
+    );
+    assert.deepEqual(
+      (ls1.body as { stages: string[] }).stages.sort(),
+      ["design", "verify"].sort(),
+    );
+
+    const cleared = await fetchJson(
+      h.app,
+      "DELETE",
+      `/api/v1/projects/${projectId}/gates`,
+    );
+    assert.equal(cleared.status, 200);
+    assert.deepEqual((cleared.body as { stages: string[] }).stages, []);
+    await h.cleanup();
+  });
+
+  it("PUT /api/v1/projects/:id/gates 400s on unknown stage names", async () => {
+    h = buildHarness();
+    const created = await fetchJson(h.app, "POST", "/projects", {
+      root_path: repo,
+    });
+    const projectId = (created.body as { project: { id: string } }).project.id;
+    const res = await fetchJson(
+      h.app,
+      "PUT",
+      `/api/v1/projects/${projectId}/gates`,
+      { stages: ["bogus"] },
+    );
+    assert.equal(res.status, 400);
+    await h.cleanup();
+  });
+
+  it("POST /api/v1/runs/:id/approve flips awaiting_approval to running", async () => {
+    h = buildHarness();
+    const created = await fetchJson(h.app, "POST", "/projects", {
+      root_path: repo,
+    });
+    const projectId = (created.body as { project: { id: string } }).project.id;
+    const r = await fetchJson(h.app, "POST", `/projects/${projectId}/runs`, {
+      requirement: "x",
+      all_defaults: true,
+    });
+    const runId = (r.body as { run_id: string }).run_id;
+    h.store.updateRun(runId, {
+      status: "awaiting_approval",
+      awaiting_approval_at_stage: "implement",
+    });
+
+    const res = await fetchJson(h.app, "POST", `/api/v1/runs/${runId}/approve`, {
+      note: "looks good",
+    });
+    assert.equal(res.status, 200);
+    const updated = h.store.getRun(runId);
+    assert.equal(updated?.status, "running");
+    assert.equal(updated?.awaiting_approval_at_stage, null);
+    const events = h.store.tailEvents(runId, 0, 100);
+    const granted = events.find((e) => e.kind === "approval_granted");
+    assert.ok(granted, "approval_granted event should be appended");
+    await h.cleanup();
+  });
+
+  it("POST /api/v1/runs/:id/approve 409s when run is not awaiting_approval", async () => {
+    h = buildHarness();
+    const created = await fetchJson(h.app, "POST", "/projects", {
+      root_path: repo,
+    });
+    const projectId = (created.body as { project: { id: string } }).project.id;
+    const r = await fetchJson(h.app, "POST", `/projects/${projectId}/runs`, {
+      requirement: "x",
+      all_defaults: true,
+    });
+    const runId = (r.body as { run_id: string }).run_id;
+    // Default status after all_defaults is "running".
+    const res = await fetchJson(h.app, "POST", `/api/v1/runs/${runId}/approve`, {});
+    assert.equal(res.status, 409);
+    await h.cleanup();
+  });
+
+  it("POST /api/v1/runs/:id/reject requires a note and marks failed", async () => {
+    h = buildHarness();
+    const created = await fetchJson(h.app, "POST", "/projects", {
+      root_path: repo,
+    });
+    const projectId = (created.body as { project: { id: string } }).project.id;
+    const r = await fetchJson(h.app, "POST", `/projects/${projectId}/runs`, {
+      requirement: "x",
+      all_defaults: true,
+    });
+    const runId = (r.body as { run_id: string }).run_id;
+    h.store.updateRun(runId, {
+      status: "awaiting_approval",
+      awaiting_approval_at_stage: "implement",
+    });
+
+    // Note required.
+    const noNote = await fetchJson(h.app, "POST", `/api/v1/runs/${runId}/reject`, {});
+    assert.equal(noNote.status, 400);
+
+    const ok = await fetchJson(h.app, "POST", `/api/v1/runs/${runId}/reject`, {
+      note: "bad spec",
+    });
+    assert.equal(ok.status, 200);
+    const updated = h.store.getRun(runId);
+    assert.equal(updated?.status, "failed");
+    assert.equal(updated?.failure_reason, "rejected");
+    const events = h.store.tailEvents(runId, 0, 100);
+    assert.ok(events.some((e) => e.kind === "approval_rejected"));
+    await h.cleanup();
+  });
+
+  it("POST /runs/:id/resume on paused_budget over budget returns 402", async () => {
+    h = buildHarness();
+    const created = await fetchJson(h.app, "POST", "/projects", {
+      root_path: repo,
+      monthly_budget_usd: 1,
+    });
+    const projectId = (created.body as { project: { id: string } }).project.id;
+    const r = await fetchJson(h.app, "POST", `/projects/${projectId}/runs`, {
+      requirement: "x",
+      all_defaults: true,
+    });
+    const runId = (r.body as { run_id: string }).run_id;
+    h.store.addRunCost(runId, 5);
+    h.store.updateRun(runId, { status: "paused_budget" });
+
+    const res = await fetchJson(h.app, "POST", `/runs/${runId}/resume`);
+    assert.equal(res.status, 402);
+    assert.equal(h.store.getRun(runId)?.status, "paused_budget");
+    await h.cleanup();
+  });
+
+  it("POST /runs/:id/resume on paused_budget under budget transitions to running", async () => {
+    h = buildHarness();
+    const created = await fetchJson(h.app, "POST", "/projects", {
+      root_path: repo,
+      monthly_budget_usd: 100,
+    });
+    const projectId = (created.body as { project: { id: string } }).project.id;
+    const r = await fetchJson(h.app, "POST", `/projects/${projectId}/runs`, {
+      requirement: "x",
+      all_defaults: true,
+    });
+    const runId = (r.body as { run_id: string }).run_id;
+    h.store.addRunCost(runId, 5);
+    h.store.updateRun(runId, { status: "paused_budget" });
+
+    const res = await fetchJson(h.app, "POST", `/runs/${runId}/resume`);
+    assert.equal(res.status, 200);
+    assert.equal(h.store.getRun(runId)?.status, "running");
+    await h.cleanup();
+  });
+
+  it("POST /runs/:id/resume 409s when status is awaiting_approval", async () => {
+    h = buildHarness();
+    const created = await fetchJson(h.app, "POST", "/projects", {
+      root_path: repo,
+    });
+    const projectId = (created.body as { project: { id: string } }).project.id;
+    const r = await fetchJson(h.app, "POST", `/projects/${projectId}/runs`, {
+      requirement: "x",
+      all_defaults: true,
+    });
+    const runId = (r.body as { run_id: string }).run_id;
+    h.store.updateRun(runId, { status: "awaiting_approval" });
+
+    const res = await fetchJson(h.app, "POST", `/runs/${runId}/resume`);
+    assert.equal(res.status, 409);
+    await h.cleanup();
+  });
+
+  it("POST /api/v1/projects/:id/webhooks 400s when secret is missing", async () => {
+    h = buildHarness();
+    const created = await fetchJson(h.app, "POST", "/projects", {
+      root_path: repo,
+    });
+    const projectId = (created.body as { project: { id: string } }).project.id;
+    const res = await fetchJson(
+      h.app,
+      "POST",
+      `/api/v1/projects/${projectId}/webhooks`,
+      {
+        url: "http://hooks.example/x",
+        events: ["run.completed"],
+      },
+    );
+    assert.equal(res.status, 400);
+    assert.match((res.body as { error: string }).error, /secret/);
+    await h.cleanup();
+  });
+
+  it("POST /api/v1/projects/:id/webhooks 400s on unknown event names", async () => {
+    h = buildHarness();
+    const created = await fetchJson(h.app, "POST", "/projects", {
+      root_path: repo,
+    });
+    const projectId = (created.body as { project: { id: string } }).project.id;
+    const res = await fetchJson(
+      h.app,
+      "POST",
+      `/api/v1/projects/${projectId}/webhooks`,
+      {
+        url: "http://hooks.example/x",
+        events: ["totally.fake"],
+        secret: "s",
+      },
+    );
+    assert.equal(res.status, 400);
+    await h.cleanup();
+  });
+
+  it("POST/GET/DELETE /api/v1/.../webhooks round-trips", async () => {
+    h = buildHarness();
+    const created = await fetchJson(h.app, "POST", "/projects", {
+      root_path: repo,
+    });
+    const projectId = (created.body as { project: { id: string } }).project.id;
+    const post = await fetchJson(
+      h.app,
+      "POST",
+      `/api/v1/projects/${projectId}/webhooks`,
+      {
+        url: "http://hooks.example/run",
+        events: ["run.completed", "finding.high"],
+        secret: "topsecret",
+      },
+    );
+    assert.equal(post.status, 200);
+    const created_w = post.body as {
+      id: string;
+      events: string[];
+      secret_set: boolean;
+    };
+    assert.ok(created_w.id);
+    assert.deepEqual(created_w.events, ["run.completed", "finding.high"]);
+    assert.equal(created_w.secret_set, true);
+
+    const ls = await fetchJson(
+      h.app,
+      "GET",
+      `/api/v1/projects/${projectId}/webhooks`,
+    );
+    const list = ls.body as { entries: Array<{ id: string }> };
+    assert.equal(list.entries.length, 1);
+    // Server response never echoes the secret string.
+    assert.ok(!("secret" in list.entries[0]!));
+
+    const del = await fetchJson(
+      h.app,
+      "DELETE",
+      `/api/v1/webhooks/${created_w.id}`,
+    );
+    assert.equal(del.status, 200);
+
+    const lsAfter = await fetchJson(
+      h.app,
+      "GET",
+      `/api/v1/projects/${projectId}/webhooks`,
+    );
+    assert.equal(
+      (lsAfter.body as { entries: unknown[] }).entries.length,
+      0,
+    );
     await h.cleanup();
   });
 });

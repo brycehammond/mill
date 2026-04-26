@@ -28,6 +28,10 @@ export interface GlobalMillConfig {
   timeoutSecPerStage: number;
   timeoutSecPerStageOverrides: Partial<Record<StageName, number>>;
   model: string | undefined;
+  // Phase 3: absolute base URL of the UI as exposed to the outside
+  // world. Used by the webhook notify worker to compose the run-detail
+  // link in delivered payloads. Unset (default) means "omit url field".
+  publicUrl: string | undefined;
 }
 
 // Project-scoped config: global pieces plus the currently-selected
@@ -86,6 +90,7 @@ export function loadGlobalConfig(): GlobalMillConfig {
       verify: numEnv("MILL_TIMEOUT_SEC_VERIFY", 1800),
     },
     model: process.env.MILL_MODEL || undefined,
+    publicUrl: process.env.MILL_PUBLIC_URL?.trim() || undefined,
   };
 }
 

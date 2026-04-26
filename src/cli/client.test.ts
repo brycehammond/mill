@@ -71,6 +71,7 @@ function fakeConfig(port: number): GlobalMillConfig {
     timeoutSecPerStage: 100,
     timeoutSecPerStageOverrides: {},
     model: undefined,
+    publicUrl: undefined,
   };
 }
 

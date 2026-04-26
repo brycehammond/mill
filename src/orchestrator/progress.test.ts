@@ -49,6 +49,8 @@ function fakeStore(): FakeStore {
       requirement_path: "/x",
       spec_path: null,
       test_command: null,
+      awaiting_approval_at_stage: null,
+      failure_reason: null,
       total_cost_usd: 0,
       total_input_tokens: 0,
       total_cache_creation_tokens: 0,

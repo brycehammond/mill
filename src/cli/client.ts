@@ -14,7 +14,10 @@
 // typed `DaemonNotRunningError` whose message tells the user how to
 // start it. CLI surface translates that to a clean stderr line.
 
+import { existsSync, readFileSync } from "node:fs";
+import { join } from "node:path";
 import { loadGlobalConfig, type GlobalMillConfig } from "../orchestrator/index.js";
+import { millRoot } from "../core/index.js";
 import type {
   Clarifications,
   DisplayStageRow,
@@ -123,22 +126,64 @@ export interface FindingsFilters {
   includeSuppressed?: boolean;
 }
 
+// Phase 3 webhook list/create response. The daemon never echoes the
+// secret — clients see `secret_set` and the user retains the original
+// secret value out-of-band (printed on `mill project webhooks add`).
+export interface WebhookSummary {
+  id: string;
+  project_id: string;
+  url: string;
+  events: string[];
+  secret_set: boolean;
+  enabled: boolean;
+  consecutive_failures: number;
+  created_at: number;
+}
+
 // Allow tests to inject a fetch implementation (a tiny in-process
 // server, or a stub). `globalThis.fetch` is the default — Node 22 ships
 // it natively, no node-fetch dep needed.
 export interface DaemonClientOptions {
   config?: GlobalMillConfig;
   fetchImpl?: typeof globalThis.fetch;
+  // Phase 3: explicit auth token override. When unset, the client
+  // resolves MILL_AUTH_TOKEN from env first, then falls back to the
+  // on-disk file at ~/.mill/auth.token (mode 0600, written by
+  // `mill auth init`). This mirrors what the `claude` CLI does.
+  authToken?: string | null;
+}
+
+// Resolve the bearer token the client will attach to every request.
+// `MILL_AUTH_TOKEN` env wins; otherwise we try `~/.mill/auth.token`.
+// Returns null when neither is available — the daemon's auth middleware
+// is no-op in that case (auth opt-in, AC-17), so a missing token isn't
+// itself an error.
+export function resolveClientAuthToken(
+  env: NodeJS.ProcessEnv = process.env,
+): string | null {
+  const fromEnv = env.MILL_AUTH_TOKEN;
+  if (fromEnv && fromEnv.trim()) return fromEnv.trim();
+  const file = join(millRoot(env), "auth.token");
+  if (!existsSync(file)) return null;
+  try {
+    const raw = readFileSync(file, "utf8").trim();
+    return raw.length > 0 ? raw : null;
+  } catch {
+    return null;
+  }
 }
 
 export class DaemonClient {
   private readonly base: string;
   private readonly doFetch: typeof globalThis.fetch;
+  private readonly authToken: string | null;
 
   constructor(opts: DaemonClientOptions = {}) {
     const config = opts.config ?? loadGlobalConfig();
     this.base = `http://${config.daemonHost}:${config.daemonPort}`;
     this.doFetch = opts.fetchImpl ?? globalThis.fetch.bind(globalThis);
+    this.authToken =
+      opts.authToken !== undefined ? opts.authToken : resolveClientAuthToken();
   }
 
   // ----- liveness -----
@@ -208,10 +253,65 @@ export class DaemonClient {
     );
   }
 
-  async resumeRun(runId: string): Promise<{ run_id: string; status: RunStatus }> {
-    return this.request<{ run_id: string; status: RunStatus }>(
+  async resumeRun(
+    runId: string,
+  ): Promise<{ run_id: string; status: RunStatus; run?: RunRow }> {
+    return this.request<{ run_id: string; status: RunStatus; run?: RunRow }>(
       "POST",
       `/runs/${encodeURIComponent(runId)}/resume`,
+    );
+  }
+
+  async approveRun(
+    runId: string,
+    note?: string,
+  ): Promise<{ run_id: string; status: RunStatus; run?: RunRow }> {
+    return this.request<{ run_id: string; status: RunStatus; run?: RunRow }>(
+      "POST",
+      `/api/v1/runs/${encodeURIComponent(runId)}/approve`,
+      { note: note ?? "" },
+    );
+  }
+
+  async rejectRun(
+    runId: string,
+    note: string,
+  ): Promise<{ run_id: string; status: RunStatus; run?: RunRow }> {
+    return this.request<{ run_id: string; status: RunStatus; run?: RunRow }>(
+      "POST",
+      `/api/v1/runs/${encodeURIComponent(runId)}/reject`,
+      { note },
+    );
+  }
+
+  // ----- project gates -----
+
+  async getProjectGates(
+    projectId: string,
+  ): Promise<{ project_id: string; stages: string[] }> {
+    return this.request<{ project_id: string; stages: string[] }>(
+      "GET",
+      `/api/v1/projects/${encodeURIComponent(projectId)}/gates`,
+    );
+  }
+
+  async setProjectGates(
+    projectId: string,
+    stages: string[],
+  ): Promise<{ project_id: string; stages: string[] }> {
+    return this.request<{ project_id: string; stages: string[] }>(
+      "PUT",
+      `/api/v1/projects/${encodeURIComponent(projectId)}/gates`,
+      { stages },
+    );
+  }
+
+  async clearProjectGates(
+    projectId: string,
+  ): Promise<{ project_id: string; stages: string[] }> {
+    return this.request<{ project_id: string; stages: string[] }>(
+      "DELETE",
+      `/api/v1/projects/${encodeURIComponent(projectId)}/gates`,
     );
   }
 
@@ -253,6 +353,34 @@ export class DaemonClient {
     return wrapped.events;
   }
 
+  // ----- webhooks (Phase 3) -----
+
+  async createWebhook(
+    projectId: string,
+    body: { url: string; events: string[]; secret: string },
+  ): Promise<WebhookSummary> {
+    return this.request<WebhookSummary>(
+      "POST",
+      `/api/v1/projects/${encodeURIComponent(projectId)}/webhooks`,
+      body,
+    );
+  }
+
+  async listWebhooks(projectId: string): Promise<WebhookSummary[]> {
+    const wrapped = await this.request<{ entries: WebhookSummary[] }>(
+      "GET",
+      `/api/v1/projects/${encodeURIComponent(projectId)}/webhooks`,
+    );
+    return wrapped.entries;
+  }
+
+  async deleteWebhook(id: string): Promise<{ id: string; removed: boolean }> {
+    return this.request<{ id: string; removed: boolean }>(
+      "DELETE",
+      `/api/v1/webhooks/${encodeURIComponent(id)}`,
+    );
+  }
+
   // ----- findings -----
 
   async getFindings(filters: FindingsFilters = {}): Promise<LedgerEntry[]> {
@@ -277,10 +405,13 @@ export class DaemonClient {
     body?: unknown,
   ): Promise<T> {
     let res: Response;
+    const headers: Record<string, string> = {};
+    if (body !== undefined) headers["content-type"] = "application/json";
+    if (this.authToken) headers["authorization"] = `Bearer ${this.authToken}`;
     try {
       res = await this.doFetch(`${this.base}${path}`, {
         method,
-        headers: body !== undefined ? { "content-type": "application/json" } : {},
+        headers,
         body: body !== undefined ? JSON.stringify(body) : undefined,
       });
     } catch (err) {

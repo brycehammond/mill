@@ -139,10 +139,21 @@ Once the daemon is running, the same port serves a small React SPA at
   the central DB and the same fingerprints disappear from
   `mill findings`.
 
-The bind is loopback-only and there's no auth — anyone who can run the
-CLI on this host can already drive mill. Treat it like the Hono API:
-fine for solo / shared-laptop use, not appropriate for shared servers
-without a reverse proxy that adds auth.
+By default the daemon binds loopback with no auth — fine for solo /
+shared-laptop use. To expose it beyond this host (LAN, public via a
+reverse proxy, or to share the UI with collaborators) configure auth
+and a non-loopback bind:
+
+```sh
+mill auth init                                  # writes ~/.mill/auth.token (0600), prints once
+export MILL_AUTH_TOKEN="$(cat ~/.mill/auth.token)"
+mill daemon start --bind lan --cert ./fullchain.pem --key ./privkey.pem
+# or, behind a reverse proxy that terminates TLS:
+mill daemon start --bind lan --insecure
+```
+
+See **Auth and bind modes** below for the full story (rotation, session
+cookies, --bind values, HTTPS guidance).
 
 ### Hacking on the UI
 
@@ -162,6 +173,151 @@ the daemon, so HMR keeps working while the API calls go to the real
 server. `npm run build` at the repo root builds both the daemon JS
 (`dist/`) and the UI bundle (`dist/web/`); the npm artifact ships
 both.
+
+## Auth and bind modes
+
+mill defaults to no auth on loopback (Phase 1–2 behavior is preserved
+verbatim — set nothing and nothing changes). Opt in once you need to
+share the daemon with others or expose it on a network.
+
+### Token
+
+```sh
+mill auth init        # generates a 32-byte token, writes ~/.mill/auth.token (mode 0600), prints once
+mill auth show        # prints the stored token
+mill auth rotate      # generates a new token AND invalidates every existing UI session (forced re-login)
+```
+
+`MILL_AUTH_TOKEN` in the env wins over the file. The CLI client reads
+either source automatically and attaches `Authorization: Bearer <token>`
+to every daemon request. With auth configured, every `/api/v1/*` route
+returns 401 without a valid bearer or `mill_session` cookie. Comparison
+is `crypto.timingSafeEqual` (constant-time).
+
+### Bind modes
+
+```sh
+mill daemon start --bind loopback         # default — 127.0.0.1
+mill daemon start --bind lan              # primary LAN IPv4 (auth required)
+mill daemon start --bind all              # 0.0.0.0       (auth required)
+```
+
+Non-loopback binds **refuse to start** without `MILL_AUTH_TOKEN`. They
+also require either TLS (`--cert <path> --key <path>`) or an explicit
+`--insecure` opt-in (intended for "I'm behind a reverse proxy that
+terminates TLS").
+
+### HTTPS
+
+Two paths, in order of preference:
+
+1. **Reverse proxy** (recommended). Run mill on loopback (or `--bind
+   lan --insecure` on a private network) and let Caddy / Cloudflare
+   Tunnel / nginx / Traefik terminate TLS. Cleaner cert lifecycle,
+   easier rotation, and the proxy can add headers / rate limits.
+   Example with Caddy:
+   ```
+   mill.example.com {
+     reverse_proxy 127.0.0.1:7333
+   }
+   ```
+2. **Embedded TLS** (`--cert / --key`). Useful when you really do want
+   one process and not two. mill does not provision certs — bring your
+   own (Let's Encrypt, mkcert for LAN dev, etc.).
+
+### Web UI sessions
+
+Visiting the UI without a `mill_session` cookie redirects to a login
+screen. Submit the token plus a free-form actor name (your email,
+"on-call", whatever — it's recorded as the actor on every approval /
+rejection / kill / webhook config you make). On success you get an
+`HttpOnly Secure SameSite=Strict` cookie valid for
+`MILL_SESSION_LIFETIME_DAYS` (default 30) with sliding expiry on every
+authenticated request. Logout clears both the cookie and the DB row;
+`mill auth rotate` invalidates every active session at once.
+
+When `MILL_AUTH_TOKEN` is unset the UI loads without a login screen
+and the daemon serves `/api/v1/*` openly (Phase 1–2 contract).
+
+## Per-project budget caps
+
+Each project can carry a soft monthly USD cap (`projects.monthly_budget_usd`,
+set when registering or via `mill project show <id>` plus the daemon
+API). Computation: sum of `runs.total_cost_usd` for runs created in the
+current calendar month UTC. Behavior:
+
+- **Pre-flight.** Starting a new run when the project is already over
+  budget returns HTTP 402 with the current spend and cap. The CLI
+  surfaces this inline.
+- **In-flight.** When a stage's cost delta crosses the cap, the run is
+  marked `paused_budget` at the next stage boundary (no mid-stage
+  interrupts — that's the kill path's job). The pipeline persists state
+  cleanly via `BudgetPausedError`. The cap may overshoot by one stage;
+  this is intentional.
+- **Soft warning.** Crossing 80% of the cap emits a single
+  `budget_warning_80` event per project per month (idempotent). The UI
+  dashboard renders a yellow chip; webhooks fire on `budget.warning_80`.
+- **Resume.** `mill resume <run-id>` (or the UI's Resume button) tries
+  to continue. Returns 402 again if you're still over; succeeds after a
+  cap raise or once the calendar month rolls over.
+
+Caps are independent of `MILL_TIMEOUT_SEC_*` (those are wall-clock).
+
+## Approval gates
+
+Park runs at named stage boundaries for human review.
+
+```sh
+mill project gates set <project> design,implement   # pause after design AND after implement
+mill project gates ls <project>
+mill project gates clear <project>
+```
+
+A gated stage's completion sets `runs.status = awaiting_approval` and
+`runs.awaiting_approval_at_stage = <next stage>`, persists an
+`approval_required` event, and unwinds via `ApprovalRequiredError`. The
+next stage doesn't start until you act:
+
+```sh
+mill approve <run-id> [--note "..."]   # resume from the next stage
+mill reject  <run-id> --note "why"     # mark failed with reason=rejected
+mill resume  <run-id>                   # for paused_budget; same path used for retries after a cap raise
+```
+
+The same actions are available on the run view in the UI as Approve /
+Reject buttons (with a required-note modal on reject) plus a Resume
+button on `paused_budget` runs. Approve/reject events carry the
+authenticated actor and an optional note — that's the audit trail.
+
+## Webhooks
+
+Outbound notifications, per-project, signed.
+
+```sh
+mill project webhooks add <project> --url https://hooks.example.com/mill --events run.completed,run.failed,finding.high --secret "$(openssl rand -hex 16)"
+mill project webhooks ls <project>
+mill project webhooks rm <webhook-id>
+```
+
+Supported events: `run.completed`, `run.failed`, `run.killed`,
+`finding.high`, `approval.required`, `budget.warning_80`,
+`budget.exceeded`. Each delivery POSTs JSON
+`{event, ts, run_id?, project_id, project_name, summary, url?}` (the
+`url` field is included when `MILL_PUBLIC_URL` is set so receivers can
+deep-link back to a run) with header
+`X-Mill-Signature: sha256=<hmac_hex>` over the raw body using your
+secret. Secrets are required at creation time (the daemon refuses
+unsigned hooks).
+
+Delivery is best-effort:
+
+- 5s timeout per attempt.
+- 3 retries with 1s / 5s / 30s backoff.
+- After **10 consecutive failures** the webhook is auto-disabled
+  (`enabled = 0`) and a `webhook_disabled` event is emitted for the
+  project.
+
+A slow / failing webhook URL never blocks run progress.
 
 ## How it works
 
@@ -354,8 +510,11 @@ See `.env.example`. Relevant knobs:
 | `MILL_MAX_CONCURRENT_RUNS` | 2 | Daemon's global cap (sum across all projects) |
 | `MILL_MODEL` | (claude default) | Pass to every `claude` invocation |
 | `MILL_HOME` | `~/.mill` | Central state root (DB + per-project state) |
-| `MILL_DAEMON_HOST` | `127.0.0.1` | Daemon HTTP bind host (loopback only) |
+| `MILL_DAEMON_HOST` | `127.0.0.1` | Daemon HTTP bind host (overridden by `--bind`) |
 | `MILL_DAEMON_PORT` | `7333` | Daemon HTTP bind port |
+| `MILL_AUTH_TOKEN` | (unset) | Bearer token. Unset = no auth. Required for non-loopback `--bind`. Generate with `mill auth init`. |
+| `MILL_SESSION_LIFETIME_DAYS` | `30` | UI cookie lifetime (sliding) |
+| `MILL_PUBLIC_URL` | (unset) | Externally-reachable daemon URL embedded in webhook payloads' `url` field |
 | `MILL_ADVERSARIAL_REVIEW` | auto | `auto` \| `on` \| `off` — optional Codex critic |
 | `MILL_TESTS_CRITIC` | auto | `auto` \| `on` \| `off` — mechanical test critic |
 | `MILL_SPEC2TESTS` | auto | `auto` \| `on` \| `off` — generate test scaffolds from spec |

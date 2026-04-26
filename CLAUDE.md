@@ -39,6 +39,32 @@ The UI itself lives at `web/` as a separate package (not a workspace — its dep
 
 Dev workflow: `MILL_DEV=1 mill daemon start --foreground` (UI off) + `cd web && npm run dev` (Vite at :5173 with HMR, proxying `/api`, `/healthz`, `/projects`, `/runs`, `/findings` to the daemon).
 
+## Phase 3 (auth, bind, budget, approvals, webhooks)
+
+Phase 3 makes mill safe to expose beyond a single user's laptop. Phase 1–2 contract is preserved verbatim — set nothing and the daemon still binds loopback with no auth. The pieces below activate when their respective env vars / DB rows are populated.
+
+- **Auth lives in `src/daemon/auth.ts`.** `MILL_AUTH_TOKEN` (or the contents of `~/.mill/auth.token` written by `mill auth init`) gates `/api/v1/*` via a Hono middleware. Bypass list: `/api/v1/auth/session*` and `/api/v1/health`. Comparison is `crypto.timingSafeEqual` over equal-length buffers (length mismatch → constant-time false). UI sessions are DB-backed (`auth_sessions` table — **not** `sessions`, which was already taken by per-stage claude-session storage); cookie name is `mill_session`, attributes `HttpOnly + SameSite=Strict + Path=/ + Max-Age=lifetime`, plus `Secure` unless the daemon was started with `BuildServerArgs.insecureCookies` (set when bind has no TLS, so cookies still work over plain HTTP through a TLS-terminating proxy). `getActor(c)` is the canonical helper for "who did this" — call it for every user-driven `appendEvent`. `mill auth rotate` calls `deleteAllAuthSessions()` directly on the central DB so a rotation forces re-login everywhere (Q1 lean).
+
+- **Bind lives in `src/daemon/bind.ts`.** `--bind <loopback|lan|all>` plus `--insecure` and `--cert/--key`. `validateBind` refuses non-loopback without `MILL_AUTH_TOKEN` and without either TLS or `--insecure` (the latter is "I'm behind a TLS-terminating proxy"). LAN IP comes from `os.networkInterfaces()` filtered to non-internal IPv4. TLS goes through `node:https.createServer` via `@hono/node-server`'s `createServer` option.
+
+- **Pipeline state machine has three peer error classes:** `KilledError` (existing, hard interrupt), `BudgetPausedError` (graceful, resumable), `ApprovalRequiredError` (graceful, resumable). All three unwind via `enforceBetweenStages` (renamed from `throwIfKilledOrBroken`) at stage boundaries — never mid-stage. The catch block in `pipeline.ts` discriminates on `instanceof` and leaves the run row in its paused state instead of flipping to `failed`. Adding a fourth class follows the same pattern.
+
+- **Budget lives in `src/daemon/budget.ts`.** Calendar month UTC (`Date.UTC(...)`), no timezone surprises. `checkPreflight` returns `{ok: false, status: 402}` on overage; `checkInflight` is called from `claude-cli.ts` after each `addStageCost` (kept out of the store layer to avoid daemon→core→daemon cycles). 80%-warning idempotency is enforced by querying `events` for an existing `budget_warning_80` in the current month before emitting. The threshold re-arms when the month rolls over because the query is month-scoped.
+
+- **Webhook delivery lives in `src/daemon/notify.ts`.** It's an in-process queue subscribing to the global event bus on daemon startup (same pattern as `src/daemon/sse.ts` — both fanout from `appendEvent`). The bus uses snake_case kinds (`budget_warning_80`, `approval_required`, …); the wire payload uses dot-notation (`budget.warning_80`, `approval.required`, …). Mapping is in notify.ts and is the only place the two naming conventions touch — keep it that way. Best-effort: 5s timeout per attempt, 3 retries with 1s/5s/30s backoff, auto-disable after 10 consecutive failures (writes a `webhook_disabled` event via `appendEvent` directly — don't recurse into notify). Webhook secrets are required at creation time (Q6) and never returned in API responses (`secret_set: true` instead).
+
+- **Actors and audit trail.** `events.actor` is `'mill'` for stage-emitted events, the authenticated session's actor for UI actions, and `MILL_USER` (or git's `user.email`) for CLI mutations. `appendEvent(runId, stage, kind, payload, actor?)` — actor is the 5th, optional argument; default is `'mill'`. New stage-call sites should NOT pass it; new user-action sites MUST.
+
+- **New schema** (additive only — Phase 1–2 DBs upgrade in place): `events.actor TEXT NOT NULL DEFAULT 'mill'` (existing rows backfill via SQLite's default), `runs.awaiting_approval_at_stage TEXT NULL`, `runs.failure_reason TEXT NULL` (canonical: `"rejected" | "budget" | "error"`), `auth_sessions`, `project_approval_gates` ((project_id, stage_name) PK with FK CASCADE), `project_webhooks`. Foundation also exposed `Phase3EventKind` in `core/types.ts` as the canonical name list — add new event kinds there.
+
+- **Crash recovery.** Runs in `paused_budget` or `awaiting_approval` survive daemon restart (the row IS the state — SQLite gives this for free). The pipeline driver does NOT auto-resume them: explicit user action (`mill approve / resume / reject`, the UI buttons) or a budget rollover plus user-initiated resume is required.
+
+- **Gotchas.**
+  - `MILL_AUTH_TOKEN` does NOT affect outbound webhooks — that's a separate HMAC secret per webhook row.
+  - Login endpoint returns 400 (not 401) when auth is unconfigured so the SPA can detect "no auth" without false positives.
+  - `removeProject` is a soft delete — webhook and gate rows survive a soft-removed project. The FK CASCADE only fires on hard delete (use `hardDeleteProjectForTest` in tests).
+  - Webhook delivery uses snake_case event kinds at the bus layer (matching the store) and dot-notation in the wire payload. UI consumers see whichever the API surfaces (snake on event rows; dot on incoming webhook bodies).
+
 ## Commands
 
 ```sh

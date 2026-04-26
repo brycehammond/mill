@@ -173,6 +173,32 @@ export async function review(args: ReviewArgs): Promise<StageResult & { data: Re
 
     const highFindings = findings.filter((f) => atLeast(f.severity, "HIGH"));
 
+    // Phase 3: emit a `finding_high` event for each HIGH+ finding that
+    // is NEW this iteration (not seen in any prior iteration of the
+    // same run). The notify worker fans these out as `finding.high`
+    // webhooks. Re-occurring fingerprints from earlier iterations don't
+    // re-fire — humans only want to know once per fingerprint per run.
+    try {
+      const priorFingerprints = priorIterationFingerprints(ctx, iteration);
+      for (const f of highFindings) {
+        const fp = findingFingerprint(f);
+        if (priorFingerprints.has(fp)) continue;
+        ctx.store.appendEvent(ctx.runId, "review", "finding_high", {
+          run_id: ctx.runId,
+          iteration,
+          critic: f.critic,
+          severity: f.severity,
+          title: f.title,
+          fingerprint: fp,
+          summary: `[${f.severity}] ${f.critic}: ${f.title}`,
+        });
+      }
+    } catch (err) {
+      ctx.logger.warn("finding_high event emit failed", {
+        err: err instanceof Error ? err.message : String(err),
+      });
+    }
+
     // Per-critic cost/usage/findings are already committed (cost/usage via
     // runClaude's incremental persistence, findings via runCritic's
     // transaction). This just finalizes the stage row.
@@ -230,6 +256,25 @@ export async function review(args: ReviewArgs): Promise<StageResult & { data: Re
       },
     };
   }
+}
+
+// Returns the set of HIGH+ finding fingerprints recorded in this run
+// in any iteration *before* `currentIteration`. Used by the
+// finding_high event emitter so a fingerprint that recurs across
+// iterations only fires its webhook once per run.
+function priorIterationFingerprints(
+  ctx: RunContext,
+  currentIteration: number,
+): Set<string> {
+  const out = new Set<string>();
+  if (currentIteration <= 1) return out;
+  const all = ctx.store.listFindings(ctx.runId);
+  for (const f of all) {
+    if (f.iteration >= currentIteration) continue;
+    if (!atLeast(f.severity, "HIGH")) continue;
+    out.add(f.fingerprint);
+  }
+  return out;
 }
 
 // Termination rule: stop the implement⇄review loop when any of:

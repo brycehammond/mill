@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { writeFile } from "node:fs/promises";
 import { Hono } from "hono";
 import {
@@ -5,21 +6,39 @@ import {
   ensureRunDirs,
   resolveProjectByIdentifier,
   runPaths,
+  STAGE_ORDER,
   type CriticName,
   type LedgerEntry,
   type ProjectRow,
+  type ProjectWebhookRow,
   type RunMode,
   type RunRow,
   type RunStatus,
   type Severity,
+  type StageName,
   type StateStore,
 } from "../core/index.js";
+import { SUPPORTED_WEBHOOK_EVENTS } from "./notify.js";
 import { intake, recordAnswers } from "../orchestrator/index.js";
 import { buildContext } from "../orchestrator/context.js";
 import { clarify } from "../orchestrator/stages/clarify.js";
 import type { GlobalMillConfig } from "../orchestrator/config.js";
 import { buildSseHandler } from "./sse.js";
 import { buildStaticHandler } from "./static.js";
+import {
+  buildAuthMiddleware,
+  buildClearSessionCookie,
+  buildSessionCookie,
+  constantTimeEqual,
+  generateSessionId,
+  getActor,
+  isAuthEnabled,
+  parseCookies,
+  resolveAuthToken,
+  sessionLifetimeMs,
+  SESSION_COOKIE_NAME,
+} from "./auth.js";
+import { checkPreflight } from "./budget.js";
 
 // Minimal HTTP API the CLI talks to. All routes are JSON, loopback-only;
 // no auth, no CORS. Schemas are validated by hand (no Zod) to keep the
@@ -36,6 +55,15 @@ export interface BuildServerArgs {
   // When true (default in production), serve the built UI bundle from
   // dist/web/ at non-API paths. Disabled by --no-ui or MILL_DEV.
   serveUi?: boolean;
+  // Phase 3: cookies issued from the login endpoint omit the `Secure`
+  // attribute when the daemon is serving plain HTTP, so loopback / dev
+  // browsers still accept them. Set true when binding HTTPS or when the
+  // user passed --insecure on a non-loopback bind that they accept the
+  // risk of (the cookie is still HttpOnly + SameSite=Strict).
+  insecureCookies?: boolean;
+  // Test seam: override the auth env that the middleware and login
+  // endpoints read. Defaults to process.env.
+  authEnv?: NodeJS.ProcessEnv;
 }
 
 export interface ServerDeps {
@@ -54,7 +82,7 @@ const REAL_DEPS: ServerDeps = {
 
 // Handlers throw HttpError(status, message) to signal non-200 responses;
 // uncaught Errors become 500. The wrapper keeps each route body compact.
-type ContentfulStatus = 200 | 400 | 404 | 409 | 500;
+type ContentfulStatus = 200 | 400 | 401 | 402 | 404 | 409 | 500;
 
 class HttpError extends Error {
   constructor(public readonly status: ContentfulStatus, message: string) {
@@ -69,6 +97,8 @@ function httpError(status: ContentfulStatus, message: string): never {
 export function buildServer(args: BuildServerArgs): Hono {
   const { store, config } = args;
   const deps = args.deps ?? REAL_DEPS;
+  const authEnv = args.authEnv ?? process.env;
+  const insecureCookies = !!args.insecureCookies;
   const app = new Hono();
   const startedAt = Date.now();
 
@@ -80,6 +110,12 @@ export function buildServer(args: BuildServerArgs): Hono {
     return c.json({ error: message }, 500);
   });
 
+  // Phase 3 auth middleware. No-op when MILL_AUTH_TOKEN is unset and
+  // ~/.mill/auth.token is missing — see auth.ts. Mounted before any
+  // route so it runs first; specific routes (healthz, /api/v1/auth/*)
+  // are bypassed inside the middleware itself.
+  app.use("*", buildAuthMiddleware({ store, env: authEnv }));
+
   app.get("/healthz", (c) =>
     c.json({
       ok: true,
@@ -87,8 +123,74 @@ export function buildServer(args: BuildServerArgs): Hono {
       uptime_s: Math.floor((Date.now() - startedAt) / 1000),
       port: config.daemonPort,
       host: config.daemonHost,
+      auth_required: isAuthEnabled({ env: authEnv }),
     }),
   );
+
+  // ---- /api/v1/auth/* (login / logout) ----
+  // These two routes are exempt from auth middleware via the bypass
+  // list (so the UI can render the login screen and POST to it without
+  // a session cookie).
+
+  app.post("/api/v1/auth/session", async (c) => {
+    const body = await readJsonBody(c);
+    const token = stringField(body, "token");
+    if (!token) httpError(400, "token is required");
+    const configured = resolveAuthToken({ env: authEnv });
+    if (!configured) {
+      // AC-1: with auth disabled the login endpoint is a no-op.
+      // We surface a 400 so the UI can detect "no auth configured" and
+      // skip the login screen entirely on the next page load.
+      httpError(400, "auth is not configured on this daemon");
+    }
+    if (!constantTimeEqual(token, configured)) {
+      httpError(401, "invalid token");
+    }
+    // The actor name is what shows up on audit events. We accept a
+    // free-form string from the login form; if blank, fall back to the
+    // operator's MILL_USER env, then to "user" as a last-ditch label.
+    const requested = stringField(body, "actor");
+    const actor =
+      (requested && requested.trim()) ||
+      (authEnv.MILL_USER && authEnv.MILL_USER.trim()) ||
+      "user";
+
+    const sessionId = generateSessionId();
+    const lifetimeMs = sessionLifetimeMs(authEnv);
+    const expiresAt = Date.now() + lifetimeMs;
+    store.createAuthSession({
+      id: sessionId,
+      actor,
+      expires_at: expiresAt,
+    });
+    c.header(
+      "Set-Cookie",
+      buildSessionCookie(sessionId, {
+        insecure: insecureCookies,
+        maxAgeMs: lifetimeMs,
+      }),
+    );
+    return c.json({ ok: true, actor, expires_at: expiresAt });
+  });
+
+  app.post("/api/v1/auth/session/delete", (c) => {
+    const cookies = parseCookies(c.req.header("cookie"));
+    const sid = cookies[SESSION_COOKIE_NAME];
+    if (sid) store.deleteAuthSession(sid);
+    c.header(
+      "Set-Cookie",
+      buildClearSessionCookie({ insecure: insecureCookies }),
+    );
+    return c.body(null, 204);
+  });
+
+  // Identity probe: lets the UI ask "who am I, is auth on?" without
+  // listing data. Auth-required when auth is on; bypass when off.
+  app.get("/api/v1/auth/me", (c) => {
+    const enabled = isAuthEnabled({ env: authEnv });
+    if (!enabled) return c.json({ auth_required: false, actor: getActor(c) });
+    return c.json({ auth_required: true, actor: getActor(c) });
+  });
 
   // ---- projects ----
 
@@ -153,6 +255,21 @@ export function buildServer(args: BuildServerArgs): Hono {
     const mode = parseMode(rawMode);
     if (mode === "invalid") {
       httpError(400, `mode must be one of new|edit, got ${rawMode}`);
+    }
+
+    // Phase 3: monthly budget pre-flight. Reject up-front if the project
+    // is already over its cap — no point spending intake/clarify cost on
+    // a run that would pause at the first stage boundary anyway.
+    const pre = checkPreflight(store, project.id);
+    if (!pre.ok) {
+      return c.json(
+        {
+          error: pre.reason,
+          current_spend_usd: pre.currentSpend,
+          monthly_budget_usd: pre.budget,
+        },
+        402,
+      );
     }
 
     // Run the existing intake flow against the project's repo.
@@ -289,10 +406,35 @@ export function buildServer(args: BuildServerArgs): Hono {
         `run ${runId} is awaiting clarifications — submit answers via POST /runs/:id/clarifications`,
       );
     }
-    // queued or running → flip to running so the run loop picks it up
-    // on the next poll. Idempotent: a row already running stays running.
+    if (run.status === "awaiting_approval") {
+      httpError(
+        409,
+        `run ${runId} is awaiting approval — use POST /api/v1/runs/:id/approve or /reject`,
+      );
+    }
+    // Phase 3: paused_budget runs can resume only when the project is
+    // back under budget (cap raised, or new month rolled over).
+    if (run.status === "paused_budget" && run.project_id) {
+      const pre = checkPreflight(store, run.project_id);
+      if (!pre.ok) {
+        return c.json(
+          {
+            error: pre.reason,
+            current_spend_usd: pre.currentSpend,
+            monthly_budget_usd: pre.budget,
+          },
+          402,
+        );
+      }
+    }
+    // queued, running, paused_budget → flip to running so the run loop
+    // picks it up. Idempotent: a row already running stays running.
     store.updateRun(runId, { status: "running" });
-    return c.json({ run_id: runId, status: "running" });
+    return c.json({
+      run_id: runId,
+      status: "running",
+      run: store.getRun(runId),
+    });
   });
 
   app.post("/runs/:id/kill", async (c) => {
@@ -317,6 +459,111 @@ export function buildServer(args: BuildServerArgs): Hono {
     );
     store.updateRun(runId, { status: "killed" });
     return c.json({ run_id: runId, killed_path: paths.killed, status: "killed" });
+  });
+
+  // ---- Phase 3: approve / reject ----
+  // Both endpoints flip an awaiting_approval run forward; approve clears
+  // the gate and re-enqueues, reject terminates with failure_reason.
+  // Actor comes from the auth session (or `mill` when auth is off and
+  // no override is set on the request context).
+
+  app.post("/api/v1/runs/:id/approve", async (c) => {
+    const runId = c.req.param("id");
+    const run = store.getRun(runId);
+    if (!run) httpError(404, `run not found: ${runId}`);
+    if (run.status !== "awaiting_approval") {
+      httpError(
+        409,
+        `run ${runId} is not awaiting approval (status=${run.status})`,
+      );
+    }
+    const body = await readJsonBody(c);
+    const note = stringField(body, "note");
+    const actor = getActor(c) ?? "mill";
+    const atStage: StageName =
+      run.awaiting_approval_at_stage ?? "deliver";
+    store.appendEvent(
+      runId,
+      atStage,
+      "approval_granted",
+      { note: note ?? null, gate_stage: run.awaiting_approval_at_stage },
+      actor,
+    );
+    store.updateRun(runId, {
+      status: "running",
+      awaiting_approval_at_stage: null,
+    });
+    return c.json({ run_id: runId, status: "running", run: store.getRun(runId) });
+  });
+
+  app.post("/api/v1/runs/:id/reject", async (c) => {
+    const runId = c.req.param("id");
+    const run = store.getRun(runId);
+    if (!run) httpError(404, `run not found: ${runId}`);
+    if (run.status !== "awaiting_approval") {
+      httpError(
+        409,
+        `run ${runId} is not awaiting approval (status=${run.status})`,
+      );
+    }
+    const body = await readJsonBody(c);
+    const note = stringField(body, "note");
+    if (!note) httpError(400, "note is required when rejecting a run");
+    const actor = getActor(c) ?? "mill";
+    const atStage: StageName =
+      run.awaiting_approval_at_stage ?? "deliver";
+    store.appendEvent(
+      runId,
+      atStage,
+      "approval_rejected",
+      { note, gate_stage: run.awaiting_approval_at_stage },
+      actor,
+    );
+    store.updateRun(runId, {
+      status: "failed",
+      failure_reason: "rejected",
+      awaiting_approval_at_stage: null,
+    });
+    return c.json({ run_id: runId, status: "failed", run: store.getRun(runId) });
+  });
+
+  // ---- Phase 3: project approval gates CRUD ----
+
+  app.get("/api/v1/projects/:id/gates", (c) => {
+    const id = c.req.param("id");
+    const project = resolveProjectByIdentifier(store, id);
+    if (!project) httpError(404, `project not found: ${id}`);
+    const stages = store.listProjectGates(project.id);
+    return c.json({ project_id: project.id, stages });
+  });
+
+  app.put("/api/v1/projects/:id/gates", async (c) => {
+    const id = c.req.param("id");
+    const project = resolveProjectByIdentifier(store, id);
+    if (!project) httpError(404, `project not found: ${id}`);
+    const body = await readJsonBody(c);
+    const raw = body.stages;
+    if (!Array.isArray(raw)) {
+      httpError(400, "stages must be an array of stage names");
+    }
+    const validNames = new Set<string>(STAGE_ORDER);
+    const stages: StageName[] = [];
+    for (const s of raw) {
+      if (typeof s !== "string" || !validNames.has(s)) {
+        httpError(400, `invalid stage name: ${String(s)}`);
+      }
+      stages.push(s as StageName);
+    }
+    store.setProjectGates(project.id, stages);
+    return c.json({ project_id: project.id, stages });
+  });
+
+  app.delete("/api/v1/projects/:id/gates", (c) => {
+    const id = c.req.param("id");
+    const project = resolveProjectByIdentifier(store, id);
+    if (!project) httpError(404, `project not found: ${id}`);
+    store.clearProjectGates(project.id);
+    return c.json({ project_id: project.id, stages: [] });
   });
 
   app.get("/findings", (c) => {
@@ -383,6 +630,66 @@ export function buildServer(args: BuildServerArgs): Hono {
     if (!fingerprint) httpError(400, "fingerprint required");
     store.unsuppressFingerprint(fingerprint);
     return c.json({ fingerprint, suppressed: false });
+  });
+
+  // ---- /api/v1 webhooks (Phase 3) ----
+  // CRUD for outbound webhooks. The notify worker reads from the same
+  // table on every published event. Auth middleware applies — these
+  // routes have no public-read carve-out.
+
+  app.post("/api/v1/projects/:id/webhooks", async (c) => {
+    const id = c.req.param("id");
+    const project = resolveProjectByIdentifier(store, id);
+    if (!project) httpError(404, `project not found: ${id}`);
+    if (project.removed_at !== null) {
+      httpError(400, `project ${project.id} is removed`);
+    }
+    const body = await readJsonBody(c);
+    const url = stringField(body, "url");
+    if (!url) httpError(400, "url is required");
+    if (!/^https?:\/\//i.test(url)) {
+      httpError(400, "url must start with http:// or https://");
+    }
+    const events = parseEventList(body);
+    if (!events) {
+      httpError(
+        400,
+        "events must be a non-empty array of supported event names " +
+          `(${[...SUPPORTED_WEBHOOK_EVENTS].sort().join(", ")})`,
+      );
+    }
+    // Per Phase 3 architectural decision (Q6 lean): require a secret on
+    // creation. Every webhook signs its payload — there's no "unsigned"
+    // path. Client errors before insert are 400 so the user can fix and
+    // retry; we don't auto-generate a secret because rotating it later
+    // requires a delete + re-create anyway.
+    const secret = stringField(body, "secret");
+    if (!secret) httpError(400, "secret is required");
+
+    const row = store.createWebhook({
+      id: randomUUID(),
+      project_id: project.id,
+      url,
+      event_filter: events.join(","),
+      secret,
+    });
+    return c.json(toWebhookResponse(row));
+  });
+
+  app.get("/api/v1/projects/:id/webhooks", (c) => {
+    const id = c.req.param("id");
+    const project = resolveProjectByIdentifier(store, id);
+    if (!project) httpError(404, `project not found: ${id}`);
+    const rows = store.listWebhooksByProject(project.id);
+    return c.json({ entries: rows.map(toWebhookResponse) });
+  });
+
+  app.delete("/api/v1/webhooks/:id", (c) => {
+    const id = c.req.param("id");
+    const w = store.getWebhook(id);
+    if (!w) httpError(404, `webhook not found: ${id}`);
+    store.deleteWebhook(id);
+    return c.json({ id, removed: true });
   });
 
   // Static UI lives last so API routes always match first. The static
@@ -634,4 +941,59 @@ function intField(body: Record<string, unknown>, key: string): number | null {
 function boolField(body: Record<string, unknown>, key: string): boolean {
   const v = body[key];
   return v === true || v === "true" || v === 1;
+}
+
+// Validates a webhook body's `events` field. Accepts a non-empty array
+// of strings, all of which must be in SUPPORTED_WEBHOOK_EVENTS. Returns
+// the deduped, validated list, or null on any validation failure (the
+// route layer turns null into HTTP 400). Comma-separated strings are
+// also accepted to keep the CLI ergonomic.
+function parseEventList(body: Record<string, unknown>): string[] | null {
+  const raw = body["events"];
+  let items: string[];
+  if (Array.isArray(raw)) {
+    items = raw
+      .filter((v): v is string => typeof v === "string" && !!v.trim())
+      .map((s) => s.trim());
+  } else if (typeof raw === "string") {
+    items = raw
+      .split(",")
+      .map((s) => s.trim())
+      .filter((s) => s.length > 0);
+  } else {
+    return null;
+  }
+  if (items.length === 0) return null;
+  for (const ev of items) {
+    if (!SUPPORTED_WEBHOOK_EVENTS.has(ev)) return null;
+  }
+  return Array.from(new Set(items));
+}
+
+// Strips the secret from a webhook row before returning it to clients;
+// callers see `secret_set: true/false` instead. The secret only flows
+// in on creation (POST body) and out to the notify worker via the DB.
+function toWebhookResponse(row: ProjectWebhookRow): {
+  id: string;
+  project_id: string;
+  url: string;
+  events: string[];
+  secret_set: boolean;
+  enabled: boolean;
+  consecutive_failures: number;
+  created_at: number;
+} {
+  return {
+    id: row.id,
+    project_id: row.project_id,
+    url: row.url,
+    events: row.event_filter
+      .split(",")
+      .map((s) => s.trim())
+      .filter((s) => s.length > 0),
+    secret_set: !!row.secret,
+    enabled: row.enabled,
+    consecutive_failures: row.consecutive_failures,
+    created_at: row.created_at,
+  };
 }

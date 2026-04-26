@@ -14,6 +14,7 @@ import type {
   TokenUsage,
 } from "../core/index.js";
 import { KilledError, killedSentinelExists, ZERO_USAGE } from "../core/index.js";
+import { checkInflight as checkBudgetInflight } from "../daemon/budget.js";
 
 // Resolve paths to JSON files containing user-level MCP servers.
 // `--mcp-config <path>` loads only the `mcpServers` key from the file —
@@ -395,6 +396,17 @@ export async function runClaude(args: RunClaudeArgs): Promise<RunClaudeResult> {
         }
         ctx.costs.addCost(stage, costDelta);
         persistedCostUsd += costDelta;
+        // Phase 3: monthly budget enforcement. Best-effort — a budget
+        // read failure cannot lose the cost write that just landed. The
+        // pipeline driver does the actual unwind at the next stage
+        // boundary by observing runs.status === 'paused_budget'.
+        try {
+          checkBudgetInflight(ctx.store, ctx.projectId, ctx.runId, stage);
+        } catch (err) {
+          ctx.logger.warn("budget inflight check failed", {
+            err: String(err),
+          });
+        }
       }
       if (
         turnUsage.input +

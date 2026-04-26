@@ -15,12 +15,15 @@ import type { EventRow } from "./types.js";
 const bus = new EventEmitter();
 bus.setMaxListeners(0);
 
+const ALL_CHANNEL = "run:*";
+
 function channel(runId: string): string {
   return `run:${runId}`;
 }
 
 export function publishRunEvent(row: EventRow): void {
   bus.emit(channel(row.run_id), row);
+  bus.emit(ALL_CHANNEL, row);
 }
 
 export type RunEventListener = (row: EventRow) => void;
@@ -36,6 +39,16 @@ export function subscribeToRunEvents(
   bus.on(ch, listener);
   return () => {
     bus.off(ch, listener);
+  };
+}
+
+// Subscribe to every published event (across all runs). Used by the
+// webhook notify worker which fans out to per-project subscriptions
+// based on event kind, not run id. Returns the unsubscribe function.
+export function subscribeToAllEvents(listener: RunEventListener): () => void {
+  bus.on(ALL_CHANNEL, listener);
+  return () => {
+    bus.off(ALL_CHANNEL, listener);
   };
 }
 

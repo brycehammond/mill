@@ -15,6 +15,16 @@ const RUN_STYLES: Record<RunStatus, { cls: string; glyph: string; label: string 
   completed: { cls: "bg-emerald-900/60 text-emerald-200", glyph: "✓", label: "completed" },
   failed: { cls: "bg-rose-900/60 text-rose-200", glyph: "✕", label: "failed" },
   killed: { cls: "bg-rose-900/60 text-rose-300", glyph: "■", label: "killed" },
+  paused_budget: {
+    cls: "bg-amber-900/60 text-amber-200",
+    glyph: "$",
+    label: "paused (budget)",
+  },
+  awaiting_approval: {
+    cls: "bg-violet-900/60 text-violet-200",
+    glyph: "⏸",
+    label: "awaiting approval",
+  },
 };
 
 export function RunStatusBadge({ status }: { status: RunStatus }) {

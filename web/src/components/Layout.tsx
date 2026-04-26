@@ -1,4 +1,6 @@
 import type { ReactNode } from "react";
+import { useMutation } from "@tanstack/react-query";
+import { api } from "../api.js";
 import { useRoute } from "../router.js";
 
 // App shell: top bar with brand + nav, content area below. Mobile nav
@@ -13,7 +15,7 @@ export function Layout({ children }: { children: ReactNode }) {
         {children}
       </main>
       <footer className="px-4 sm:px-6 py-3 text-xs text-ink-300 border-t border-ink-700">
-        mill · loopback only · no auth
+        mill
       </footer>
     </div>
   );
@@ -23,6 +25,16 @@ function Header() {
   const { path } = useRoute();
   const isActive = (prefix: string): boolean =>
     prefix === "/" ? path === "/" : path.startsWith(prefix);
+  // Logout posts to /api/v1/auth/session/delete and then navigates to
+  // /login. We tolerate failure (auth might be off) by always landing
+  // on /login on completion — the next nav will redirect home if the
+  // dashboard returns 200 without a session.
+  const logout = useMutation({
+    mutationFn: () => api.logout(),
+    onSettled: () => {
+      window.location.assign("/login");
+    },
+  });
   return (
     <header className="border-b border-ink-700 bg-ink-800">
       <div className="max-w-6xl mx-auto px-4 sm:px-6 py-3 flex items-center gap-6">
@@ -40,6 +52,15 @@ function Header() {
             findings
           </NavLink>
         </nav>
+        <button
+          type="button"
+          onClick={() => logout.mutate()}
+          disabled={logout.isPending}
+          className="ml-auto text-xs text-ink-300 hover:text-ink-100 font-mono px-2 py-1"
+          title="sign out"
+        >
+          {logout.isPending ? "…" : "sign out"}
+        </button>
       </div>
     </header>
   );
