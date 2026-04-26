@@ -31,10 +31,11 @@
 //  - Output goes to stdout via process.stdout.write — caller controls
 //    when console output happens around it.
 
-import type {
-  StageRow,
-  StageStatus,
-  StateStore,
+import {
+  atLeast,
+  type StageRow,
+  type StageStatus,
+  type StateStore,
 } from "../core/index.js";
 
 export type Color = (s: string) => string;
@@ -113,6 +114,24 @@ export function startStageProgressTicker(
       const start = s.started_at ?? Date.now();
       const end = s.finished_at ?? Date.now();
       const elapsed = Math.max(0, end - start);
+
+      // Special case: `deliver` always finishes its own stage row as
+      // `completed` (the stage executed fine), but the *run* row gets
+      // flipped to `failed` when there are unresolved HIGH+ findings
+      // — the "delivered with open issues" path. A plain ✓ would lie
+      // about the pipeline outcome. Surface it here so the user
+      // doesn't have to wait for the final summary to learn the run
+      // didn't ship cleanly.
+      if (s.name === "deliver" && s.status === "completed") {
+        const unresolved = countUnresolvedHighIfFailed(store, runId);
+        if (unresolved !== null) {
+          const noun = unresolved === 1 ? "finding" : "findings";
+          return (
+            `${yellow("⚠")} ${s.name} ${dim("·")} ${fmtDurationMs(elapsed)} ${dim("·")} ${fmtCost(s.cost_usd)} ${dim("·")} ${yellow(`${unresolved} unresolved HIGH+ ${noun}`)}\n`
+          );
+        }
+      }
+
       const marker = s.status === "completed" ? green("✓") : red("✗");
       const errSuffix =
         s.status === "failed" && s.error
@@ -160,4 +179,34 @@ export function startStageProgressTicker(
 
 function truncate(s: string, n: number): string {
   return s.length <= n ? s : s.slice(0, n - 1) + "…";
+}
+
+// Returns the count of unresolved HIGH+ findings if (and only if) the
+// run's row says it shipped failed. Returns null when the run shipped
+// clean (the caller renders the normal ✓). Null on any DB read error
+// — defensive: a transient query failure shouldn't degrade an
+// otherwise correct progress display.
+function countUnresolvedHighIfFailed(
+  store: StateStore,
+  runId: string,
+): number | null {
+  let runStatus: string | undefined;
+  try {
+    runStatus = store.getRun(runId)?.status;
+  } catch {
+    return null;
+  }
+  if (runStatus !== "failed") return null;
+  let findings: ReturnType<StateStore["listFindings"]>;
+  try {
+    findings = store.listFindings(runId);
+  } catch {
+    return 0;
+  }
+  if (findings.length === 0) return 0;
+  let maxIter = 0;
+  for (const f of findings) if (f.iteration > maxIter) maxIter = f.iteration;
+  return findings.filter(
+    (f) => f.iteration === maxIter && atLeast(f.severity, "HIGH"),
+  ).length;
 }
