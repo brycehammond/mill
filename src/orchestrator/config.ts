@@ -1,20 +1,46 @@
-import { resolve } from "node:path";
-import { findProjectRoot, type StageName } from "../core/index.js";
+import { mkdirSync } from "node:fs";
+import { dirname, resolve } from "node:path";
+import {
+  centralDbPath,
+  millRoot,
+  openStore,
+  projectStateDir,
+  resolveProjectByIdentifier,
+  resolveProjectFromCwd,
+  type ProjectRow,
+  type StageName,
+  type StateStore,
+} from "../core/index.js";
 
-export interface MillConfig {
-  // Project root: the directory containing `.mill/`. Every command that
-  // touches state is scoped to this root. `mill init` creates it;
-  // `loadConfig()` refuses to return without one.
-  root: string;
-  timeoutSecPerRun: number;
-  timeoutSecPerStage: number;
-  // Per-stage overrides. Stages not listed inherit timeoutSecPerStage.
-  // implement/verify default to 1800s because they genuinely write a lot
-  // of code; everyone else is fine at 600s.
-  timeoutSecPerStageOverrides: Partial<Record<StageName, number>>;
+export interface GlobalMillConfig {
+  // Central state root (`~/.mill/`, override via `MILL_HOME`).
+  millHome: string;
+  // Central SQLite database (`<millHome>/mill.db`).
+  dbPath: string;
+  // Daemon localhost bind. The CLI client also reads these to talk to
+  // a running daemon. Loopback only — no remote access in Phase 1.
+  daemonHost: string;
+  daemonPort: number;
+  // Run-execution caps shared across all projects served by the daemon.
   maxConcurrentRuns: number;
   maxReviewIters: number;
+  timeoutSecPerRun: number;
+  timeoutSecPerStage: number;
+  timeoutSecPerStageOverrides: Partial<Record<StageName, number>>;
   model: string | undefined;
+}
+
+// Project-scoped config: global pieces plus the currently-selected
+// project's root/stateDir/projectId. Returned by `loadConfig()` for
+// CLI commands that operate on a single project.
+export interface MillConfig extends GlobalMillConfig {
+  project: ProjectRow;
+  projectId: string;
+  // Project repo root (= project.root_path). Where workdirs live and
+  // git operates. Distinct from `stateDir`.
+  root: string;
+  // Central per-project state directory (`<millHome>/projects/<id>/`).
+  stateDir: string;
 }
 
 function numEnv(name: string, fallback: number): number {
@@ -24,40 +50,83 @@ function numEnv(name: string, fallback: number): number {
   return Number.isFinite(n) ? n : fallback;
 }
 
+function strEnv(name: string, fallback: string): string {
+  const v = process.env[name];
+  if (typeof v === "string" && v.trim()) return v.trim();
+  return fallback;
+}
+
 export class NoProjectError extends Error {
-  constructor() {
+  constructor(message?: string) {
     super(
-      "no mill project found in this tree — run `mill init` to create one",
+      message ??
+        "no mill project resolved from cwd. Run `mill project add` to register this repo, or pass `--project <id|name|path>`.",
     );
   }
 }
 
-// Find the project the caller is cd'd inside, or honor MILL_ROOT for
-// scripts/tests that run outside a project tree. Throws NoProjectError
-// when no project is resolvable so the CLI can print a friendly message.
-export function loadConfig(): MillConfig {
-  const root = resolveProjectRoot();
-  if (!root) throw new NoProjectError();
+// Global pieces only — no project lookup. Used by the daemon
+// entrypoint and by reads that span all projects (`mill project ls`,
+// `mill findings` cross-project mode).
+export function loadGlobalConfig(): GlobalMillConfig {
+  const millHomePath = millRoot();
+  // Eagerly create the central root so the SQLite open below succeeds.
+  mkdirSync(millHomePath, { recursive: true });
   return {
-    root,
+    millHome: millHomePath,
+    dbPath: centralDbPath(),
+    daemonHost: strEnv("MILL_DAEMON_HOST", "127.0.0.1"),
+    daemonPort: numEnv("MILL_DAEMON_PORT", 7333),
+    maxConcurrentRuns: numEnv("MILL_MAX_CONCURRENT_RUNS", 2),
+    maxReviewIters: numEnv("MILL_MAX_REVIEW_ITERS", 3),
     timeoutSecPerRun: numEnv("MILL_TIMEOUT_SEC_PER_RUN", 14400),
     timeoutSecPerStage: numEnv("MILL_TIMEOUT_SEC_PER_STAGE", 600),
     timeoutSecPerStageOverrides: {
       implement: numEnv("MILL_TIMEOUT_SEC_IMPLEMENT", 7200),
       verify: numEnv("MILL_TIMEOUT_SEC_VERIFY", 1800),
     },
-    maxConcurrentRuns: numEnv("MILL_MAX_CONCURRENT_RUNS", 2),
-    maxReviewIters: numEnv("MILL_MAX_REVIEW_ITERS", 3),
     model: process.env.MILL_MODEL || undefined,
   };
 }
 
-// MILL_ROOT overrides discovery for scripts/tests; otherwise walk up from
-// cwd. `mill init` command can call this before a project exists and
-// handle the null itself.
-export function resolveProjectRoot(): string | null {
-  if (process.env.MILL_ROOT) return resolve(process.env.MILL_ROOT);
-  return findProjectRoot(process.cwd());
+export interface LoadConfigOpts {
+  cwd?: string;
+  // `--project <id|name|path>` from the CLI. When set, takes precedence
+  // over cwd-walk resolution.
+  projectIdentifier?: string;
+  // For tests / scripts that already opened the store. When omitted,
+  // `loadConfig` opens its own (and closes it before returning is the
+  // caller's responsibility to manage if they need to keep it open).
+  store?: StateStore;
+}
+
+export function loadConfig(opts: LoadConfigOpts = {}): MillConfig {
+  const global = loadGlobalConfig();
+  mkdirSync(dirname(global.dbPath), { recursive: true });
+  const store = opts.store ?? openStore(global.dbPath);
+  const project = resolveProject(store, opts);
+  if (!project) throw new NoProjectError();
+  return {
+    ...global,
+    project,
+    projectId: project.id,
+    root: project.root_path,
+    stateDir: projectStateDir(project.id),
+  };
+}
+
+function resolveProject(
+  store: StateStore,
+  opts: LoadConfigOpts,
+): ProjectRow | null {
+  const ident = opts.projectIdentifier?.trim();
+  if (ident) {
+    const byIdent = resolveProjectByIdentifier(store, ident);
+    if (byIdent && byIdent.removed_at === null) return byIdent;
+    return null;
+  }
+  const cwd = opts.cwd ? resolve(opts.cwd) : process.cwd();
+  return resolveProjectFromCwd(store, cwd);
 }
 
 // Pick the `--setting-sources` list passed to in-run `claude` subprocesses.

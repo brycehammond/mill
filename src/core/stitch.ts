@@ -9,9 +9,8 @@
 // prompt instructs `get_project` first; on not-found, fall back to
 // `create_project` and the new URL is written here on success).
 
-import { readFile, writeFile } from "node:fs/promises";
-import { join } from "node:path";
-import { projectMillDir } from "./project.js";
+import { readFile, writeFile, mkdir } from "node:fs/promises";
+import { dirname, join } from "node:path";
 
 export interface StitchProjectRef {
   projectUrl: string;
@@ -19,16 +18,16 @@ export interface StitchProjectRef {
   updatedAt: string;
 }
 
-export function stitchRefPath(root: string): string {
-  return join(projectMillDir(root), "stitch.json");
+export function stitchRefPath(stateDir: string): string {
+  return join(stateDir, "stitch.json");
 }
 
 // Defensive read: missing file or unparseable JSON returns null so
 // callers can cleanly fall back to "no prior project."
 export async function readStitchRef(
-  root: string,
+  stateDir: string,
 ): Promise<StitchProjectRef | null> {
-  const path = stitchRefPath(root);
+  const path = stitchRefPath(stateDir);
   let body: string;
   try {
     body = await readFile(path, "utf8");
@@ -46,10 +45,11 @@ export async function readStitchRef(
 }
 
 export async function writeStitchRef(
-  root: string,
+  stateDir: string,
   ref: StitchProjectRef,
 ): Promise<void> {
-  const path = stitchRefPath(root);
+  const path = stitchRefPath(stateDir);
+  await mkdir(dirname(path), { recursive: true });
   await writeFile(path, JSON.stringify(ref, null, 2) + "\n", "utf8");
 }
 

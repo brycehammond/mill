@@ -51,8 +51,8 @@ export async function spec2tests(ctx: RunContext): Promise<StageResult> {
   try {
     const systemPrompt = await loadPrompt("spec2tests");
     const specBody = await readFile(ctx.paths.spec, "utf8");
-    const profile = await readProfile(ctx.root);
-    const profileSummary = await readProfileSummary(ctx.root);
+    const profile = await readProfile(ctx.stateDir);
+    const profileSummary = await readProfileSummary(ctx.stateDir);
     const existingTestCmd = profile?.commands.test ?? null;
 
     // The prompt behaves differently in edit vs new mode. In edit the

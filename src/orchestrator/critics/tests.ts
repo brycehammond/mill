@@ -38,7 +38,7 @@ export async function testsCritic(args: TestsCriticArgs): Promise<CriticResult> 
   const { ctx, iteration } = args;
   const run = ctx.store.getRun(ctx.runId);
   const testCmd = await resolveTestCommand({
-    root: ctx.root,
+    stateDir: ctx.stateDir,
     runTestCommand: run?.test_command ?? null,
   });
   if (!testCmd) {

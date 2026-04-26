@@ -6,30 +6,73 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 `mill` is a Node/TypeScript harness that `spawn`s the `claude` CLI for each pipeline stage (spec → design → (spec2tests?) → implement ⇄ review → verify → deliver → decisions). The binary is `mill`. The harness does **not** call the Anthropic API directly — `claude` does. Our job is orchestration, sandboxing, budget/kill enforcement, and SQLite persistence. `README.md` has the user-facing tour; this file is for contributors.
 
+## Multi-project model (Phase 1)
+
+`mill` is now a host-level service rather than a per-repo tool. There are three pieces, with a sharp split:
+
+1. **Central management state at `~/.mill/`.** One SQLite DB at `~/.mill/mill.db` holds `projects`, `runs`, `stages`, `events`, `findings`, etc. Per-project durable files (`journal.md`, `decisions.md`, `profile.json`, `stitch.json`) live at `~/.mill/projects/<project-id>/`. Override the root with `MILL_HOME=/path` for tests/CI.
+
+2. **Per-repo workdirs at `<repo>/.mill/runs/<id>/...`.** Run artifacts (workdir, KILLED sentinel, verify/, reviews/, design/, requirement.md, spec.md, delivery.md) stay inside the project repo. **This is load-bearing**: Claude Code's CLAUDE.md auto-discovery walks up from cwd and the workdir is `<repo>/.mill/runs/<id>/workdir/` — moving it out of the repo would silently lose CLAUDE.md context, and edit-mode's `git worktree add` flow would also break. There is no `mill.db`, no journal, and no project marker inside the repo any more.
+
+3. **Daemon process owns run execution.** `mill daemon start` brings up a Hono HTTP server bound to `127.0.0.1:7333` (configurable via `MILL_DAEMON_HOST`/`MILL_DAEMON_PORT`). The CLI is a thin client: mutating commands (`mill new`, `mill run`, `mill kill`, `mill project add/rm`, clarifications) talk to the daemon over HTTP. Read commands (`mill status`, `mill tail`, `mill logs`, `mill history`, `mill findings`, `mill project ls`) open the central DB read-only and bypass the daemon, so observation works when the daemon is down. **Single writer** — only the daemon mutates the central DB, which avoids `database is locked` races.
+
+The orchestrator (`pipeline.ts`, `stages/*`, `critics/*`, retry, claude-cli, guard, run-settings, progress) is untouched by this restructure. Project-awareness lives in:
+
+- `RunContext.projectId` and `RunContext.stateDir` — set by `buildContext({ runId, config, store })` from the run row's `project_id`. Stages that need cross-run memory pass `ctx.stateDir` to journal/decisions/profile/stitch readers (the readers no longer take `<repo>/.mill/`).
+- `core/project.ts::addProject` — async; auto-runs `migrateLegacyMill` after a fresh registration so a user with an existing per-repo `.mill/mill.db` gets imported transparently.
+- `core/migrate.ts` — legacy `<repo>/.mill/mill.db` → central import. Idempotent (writes a `.mill/migrated-to-central.json` marker), non-destructive (legacy DB renamed to `mill.db.legacy-<unix-ts>`, not deleted), state files copied with central-wins on conflict.
+- `orchestrator/config.ts::loadConfig({ cwd?, projectIdentifier? })` — opens the central DB, resolves the project (from `--project <id|name|path>` or by walking up from cwd via `resolveProjectFromCwd`), returns `MillConfig` with `projectId`, `stateDir`, `root`, plus the global pieces. `loadGlobalConfig()` returns just the global pieces (used by the daemon entrypoint, which serves all projects).
+- `daemon/server.ts` and `daemon/run-loop.ts` — HTTP routes and the cross-project run scheduler. `MILL_MAX_CONCURRENT_RUNS` (default 2) is the **global** cap across all projects; per-project caps via `projects.default_concurrency` are bounded by the global one (global wins).
+
+`mill init` is kept as a deprecated alias for `mill project add`. The legacy `worker.ts` is still present but the daemon is the supported path.
+
+## Web UI (Phase 2)
+
+The same daemon process serves a React SPA at `http://<bind>/`. Four files own the new server-side surface:
+
+- `src/core/event-bus.ts` — in-process `EventEmitter` published to from `store.sqlite.ts::appendEvent` *after* the INSERT lands. Subscribers (only SSE today) attach with `subscribeToRunEvents(runId, listener)`. SQLite remains the source of truth; the bus is a fanout, not a queue. If the bus drops a fire (it shouldn't), the next reconnect's `Last-Event-ID` replay re-reads the events table.
+- `src/daemon/sse.ts` — `text/event-stream` handler at `/api/v1/runs/:id/events`. Replay-then-live: subscribes to the bus *before* paginating the SQL backlog so a row inserted mid-replay is queued, then drains the backlog, then dedups against in-flight queued frames by id. Frames carry `id:` (matching `events.id`) but **no `event:`** — `kind` lives in the JSON body so every frame routes through the client's `onmessage`. Slow consumers are dropped past `QUEUE_CAP` (1024); they reconnect via EventSource and replay from `Last-Event-ID`.
+- `src/daemon/static.ts` — serves `dist/web/index.html` + `dist/web/assets/*` with SPA fallback. **Crucial:** the resolver walks for `dist/web/index.html` only, never bare `web/index.html`, because the dev source's index.html references `/src/main.tsx` which 404s without Vite. Disabled via `MILL_NO_UI=1` (`mill daemon start --no-ui`) and `MILL_DEV=1` (the dev workflow runs Vite separately).
+- `src/daemon/server.ts` — Phase 1 unprefixed routes are unchanged (CLI client contract). New routes live under `/api/v1`: `runs/:id/events` (SSE), `dashboard` (cross-project rollup), `projects/:id/findings`, `findings/suppressed` GET/POST/DELETE. `BuildServerArgs.serveUi` defaults to true; `index.ts` reads `MILL_NO_UI` / `MILL_DEV` to flip it.
+
+The UI itself lives at `web/` as a separate package (not a workspace — its deps don't bloat the server bundle). Stack: React 18 + Vite + Tailwind + TanStack Query + a hand-rolled router (four routes — TanStack Router would be more dependency than the spec allows). `npm run build` at the repo root chains `tsc -p .` then `npm run build:web`, which `cd web && npm install --no-fund --no-audit && npm run build` and emits to `../dist/web/`. Bundle target: < 200KB gzipped (currently 65KB).
+
+Dev workflow: `MILL_DEV=1 mill daemon start --foreground` (UI off) + `cd web && npm run dev` (Vite at :5173 with HMR, proxying `/api`, `/healthz`, `/projects`, `/runs`, `/findings` to the daemon).
+
 ## Commands
 
 ```sh
-npm run mill -- init           # one-time: create .mill/ at the git repo root
+npm run mill -- daemon start   # bind 127.0.0.1:7333; pidfile at ~/.mill/daemon.pid
+npm run mill -- daemon stop    # SIGTERM, drains in-flight runs
+npm run mill -- daemon status
+
+npm run mill -- project add    # register cwd; idempotent; auto-imports legacy .mill/mill.db
+npm run mill -- project ls
+npm run mill -- project show <id>
+npm run mill -- project rm <id>
+
 npm run mill -- new "..."      # start a new run (prompts for clarifications inline)
 npm run mill -- run <run-id>   # resume a partially-completed run
-npm run mill -- status [id]    # inspect state
+npm run mill -- status [id]    # inspect state (works without daemon)
 npm run mill -- tail <id>      # human-readable activity stream
 npm run mill -- logs <id>      # raw events
 npm run mill -- kill <id>      # writes .mill/runs/<id>/KILLED sentinel
-npm run mill -- onboard        # one-shot repo profile → .mill/profile.json
+npm run mill -- onboard        # one-shot repo profile → ~/.mill/projects/<id>/profile.json
 npm run mill -- findings       # recurring findings across runs (ledger)
-npm run mill -- history        # print .mill/journal.md
-npm run worker               # long-running process that picks up queued runs
+npm run mill -- history        # print this project's journal
+npm run daemon                 # tsx src/daemon/index.ts — same as `mill daemon start --foreground`
+npm run worker                 # legacy single-project poll loop (deprecated; use daemon)
 
-npm run typecheck            # tsc --noEmit
-npm test                     # node test runner via tsx (src/**/*.test.ts)
-npm run build                # tsc + cp -r src/prompts dist/prompts (clean first!)
-npm run clean                # rm -rf dist
+npm run typecheck              # tsc --noEmit
+npm test                       # node test runner via tsx (src/**/*.test.ts)
+npm run build                  # tsc + cp prompts + npm run build:web (clean first!)
+npm run build:web              # cd web && npm install + vite build → dist/web/
+npm run clean                  # rm -rf dist
 ```
 
 The `build` target's `cp -r src/prompts dist/prompts` fails if `dist/prompts` already exists (macOS cp copies *into* rather than replacing). Always `npm run clean && npm run build` for a full build.
 
-`npm test` runs Node's built-in test runner under `tsx` with no extra deps. Coverage is intentionally pure-function-shaped — the harness `spawn`s `claude`, so end-to-end tests would require live API calls. Today's suites: `core/costs.test.ts` (cost tally), `core/types.test.ts` (severity ordering, finding fingerprint), `core/store.sqlite.test.ts` (SQLite round-trip via `:memory:`), `orchestrator/claude-cli.test.ts` (JSON / markdown extractors and `pickStructured`), `orchestrator/stages/review.test.ts` (`shouldStopReviewLoop`). When you add a new pure helper or load-bearing invariant, add a test next to it (`*.test.ts` colocated).
+`npm test` runs Node's built-in test runner under `tsx` with no extra deps. Coverage is intentionally pure-function-shaped — the harness `spawn`s `claude`, so end-to-end tests would require live API calls. Today's suites: `core/costs.test.ts` (cost tally), `core/types.test.ts` (severity ordering, finding fingerprint), `core/store.sqlite.test.ts` (SQLite round-trip via `:memory:`, projects CRUD), `core/project.test.ts` (`addProject` idempotency, cwd-walk resolution), `core/migrate.test.ts` (legacy `.mill/mill.db` import + state-file copy), `orchestrator/claude-cli.test.ts` (JSON / markdown extractors and `pickStructured`), `orchestrator/stages/review.test.ts` (`shouldStopReviewLoop`), `daemon/server.test.ts` (HTTP routes via `app.fetch`), `daemon/run-loop.test.ts` (cross-project scheduler caps + drain), `cli/client.test.ts` (HTTP client + `DaemonNotRunningError`). When you add a new pure helper or load-bearing invariant, add a test next to it (`*.test.ts` colocated).
 
 ## Import extension rule
 
@@ -83,12 +126,12 @@ Stages that need JSON pass a `jsonSchema` (zod → `zod-to-json-schema`) to `run
 
 ## Per-run sandbox
 
-`run-settings.ts` writes `.mill/runs/<id>/workdir/.claude/settings.json` with a `PreToolUse` hook pointing at `guard.ts` (dev: `tsx guard.ts`; prod: `node guard.js`, toggled by `isSourceMode`). Two things about this are easy to miss:
+`run-settings.ts` writes `<repo>/.mill/runs/<id>/workdir/.claude/settings.json` with a `PreToolUse` hook pointing at `guard.ts` (dev: `tsx guard.ts`; prod: `node guard.js`, toggled by `isSourceMode`). Two things about this are easy to miss:
 
 - Claude Code's `--setting-sources project` reads `.claude/settings.json` from **cwd only**, not walking up. The file must live in the workdir, not in a parent. (Verified against claude 2.1.117 on 2026-04-22.)
 - `guard.ts` runs **on every tool call** of every `claude` subprocess. Keep it dependency-free — no imports from `src/core/`. It reads state from env vars (`MILL_RUN_KILLED`, `MILL_WORKDIR`, `MILL_EXTRA_WRITE_DIRS`, `MILL_RUN_ID`) set by `claude-cli.ts`. It must fail open on parse/IO errors so a bug in the hook can't brick Claude Code itself.
 
-Stages that legitimately write outside the workdir (e.g. verify writes into `.mill/runs/<id>/verify/`) declare those paths via `extraWriteDirs`, which becomes `MILL_EXTRA_WRITE_DIRS` (colon-separated).
+Stages that legitimately write outside the workdir (e.g. verify writes into `<repo>/.mill/runs/<id>/verify/`) declare those paths via `extraWriteDirs`, which becomes `MILL_EXTRA_WRITE_DIRS` (colon-separated).
 
 ### Two layers of command restriction
 
@@ -108,13 +151,15 @@ Each stage persists a `session_id` via `store.saveSession(runId, slot, ...)`. Sl
 
 ## Cross-run memory
 
-Three files at the project root under `.mill/` accumulate state that future runs auto-inject into their prompts. When adding a new stage that takes spec/design as input, match the existing pattern: read these (via `readJournalTail`, `readDecisionsTail`, `renderLedgerHint`) and prepend to the prompt body.
+Per-project files under `~/.mill/projects/<project-id>/` accumulate state that future runs auto-inject into their prompts. When adding a new stage that takes spec/design as input, match the existing pattern: read these (via `readJournalTail`, `readDecisionsTail`, `renderLedgerHint`) — passing `ctx.stateDir`, NOT `ctx.root` — and prepend to the prompt body.
 
-- **`.mill/journal.md`** — one stanza per completed run. Written by `stages/deliver.ts`. Entries are `\n---\n`-delimited. A write failure is caught and logged but does not fail the run.
-- **`.mill/decisions.md`** — ADR-lite trade-off log. Written by `stages/decisions.ts` post-deliver, strictly gated (must cite a finding fingerprint, spec criterion, or external constraint — zero entries is the common case). Same delimiter convention.
-- **findings ledger** — aggregated from the `findings` SQLite table via `store.listLedgerEntries(...)` and rendered by `core/ledger.ts::renderLedgerHint`. Edit-mode only — surfaces recurring issues so the implementer preempts them.
-- **`.mill/profile.json`** — repo profile written by `mill onboard` (`orchestrator/onboard.ts`). Not per-run; refresh with `mill onboard --refresh`. Rendered into prompts via `readProfileSummary`.
-- **`.mill/stitch.json`** — Stitch project reference (URL + lastRunId + updatedAt) written by `stages/design.ui.ts` after a successful UI design. Edit-mode design runs that find this file load `prompts/design-ui-edit.md` instead of `prompts/design-ui.md` and get `mcp__stitch__get_project` + `mcp__stitch__list_projects` added to their allowedTools so they can confirm the URL is still live and reuse it via `edit_screens` instead of `create_project`. Stale-URL recovery is the model's job — the edit prompt instructs it to fall back to `create_project` if `get_project` returns not-found, and the new URL is written here on success. Helpers: `readStitchRef` / `writeStitchRef` in `core/stitch.ts`.
+- **`journal.md`** — one stanza per completed run. Written by `stages/deliver.ts` via `appendJournalEntry(ctx.stateDir, ...)`. Entries are `\n---\n`-delimited. A write failure is caught and logged but does not fail the run.
+- **`decisions.md`** — ADR-lite trade-off log. Written by `stages/decisions.ts` post-deliver via `appendDecisionEntries(ctx.stateDir, ...)`, strictly gated (must cite a finding fingerprint, spec criterion, or external constraint — zero entries is the common case). Same delimiter convention.
+- **findings ledger** — aggregated from the `findings` SQLite table at `~/.mill/mill.db` via `store.listLedgerEntries(...)` and rendered by `core/ledger.ts::renderLedgerHint`. Edit-mode only — surfaces recurring issues so the implementer preempts them.
+- **`profile.json`** — repo profile written by `mill onboard` (`orchestrator/onboard.ts`). Not per-run; refresh with `mill onboard --refresh`. Rendered into prompts via `readProfileSummary(ctx.stateDir)`.
+- **`stitch.json`** — Stitch project reference (URL + lastRunId + updatedAt) written by `stages/design.ui.ts` via `writeStitchRef(ctx.stateDir, ...)` after a successful UI design. Edit-mode design runs that find this file load `prompts/design-ui-edit.md` instead of `prompts/design-ui.md` and get `mcp__stitch__get_project` + `mcp__stitch__list_projects` added to their allowedTools so they can confirm the URL is still live and reuse it via `edit_screens` instead of `create_project`. Stale-URL recovery is the model's job — the edit prompt instructs it to fall back to `create_project` if `get_project` returns not-found, and the new URL is written here on success. Helpers: `readStitchRef` / `writeStitchRef` in `core/stitch.ts`.
+
+The state-file readers (`journal.ts`, `decisions.ts`, `profile.ts`, `stitch.ts`) take a `stateDir: string` directly — they do not know about `<repo>/.mill/` any more. The path resolver `paths.ts::projectStateDir(projectId)` is the canonical way to get a state dir from a project id. CLI commands resolve via `loadConfig()`, the daemon resolves per-request from the run row's `project_id`.
 
 ### CLAUDE.md is loaded by claude, not by mill
 
@@ -149,11 +194,11 @@ When adding new stages that need to run tests, use `resolveTestCommand`; do not 
 
 ## New-mode workdir promotion and branch import
 
-Edit-mode runs commit onto a fresh `mill/<slug>-<shortId>` branch via `git worktree add` (in `stages/intake.ts`). The slug is derived from the requirement text via `slugifyRequirement` (`core/slug.ts`) — biographical preambles ("I am a…", "As a…") are skipped in favor of the next sentence; stop words filtered; truncated to 40 chars at a word boundary. The 4-char shortId (last 4 chars of the run id) keeps two runs with similar intents from colliding. Falls back to `mill/run-<runId>` only when the requirement degenerates to all stop words. Result: branches show up in `git branch -a` as `mill/add-dark-mode-toggle-settings-page-sa2n` instead of `mill/run-20260424-140852-sa2n`. New-mode runs build into `.mill/runs/<id>/workdir/` with a self-contained git history — useful for sandboxing and parallel runs, but the result is invisible to anyone looking at the project root.
+Edit-mode runs commit onto a fresh `mill/<slug>-<shortId>` branch via `git worktree add` (in `stages/intake.ts`). The slug is derived from the requirement text via `slugifyRequirement` (`core/slug.ts`) — biographical preambles ("I am a…", "As a…") are skipped in favor of the next sentence; stop words filtered; truncated to 40 chars at a word boundary. The 4-char shortId (last 4 chars of the run id) keeps two runs with similar intents from colliding. Falls back to `mill/run-<runId>` only when the requirement degenerates to all stop words. Result: branches show up in `git branch -a` as `mill/add-dark-mode-toggle-settings-page-sa2n` instead of `mill/run-20260424-140852-sa2n`. New-mode runs build into `<repo>/.mill/runs/<id>/workdir/` with a self-contained git history — useful for sandboxing and parallel runs, but the result is invisible to anyone looking at the project root.
 
 After a clean delivery (verify pass + zero unresolved HIGH+), `deliver.ts` does two things, both best-effort:
 
-1. **`promoteWorkdir`** (`orchestrator/promote.ts`) copies the workdir contents up into `ctx.root` for new-mode runs. Two non-obvious rules: (1) `.git/` is skipped — copying it would destroy the parent's repo. The workdir's git history stays accessible at `.mill/runs/<id>/workdir/.git/` for users who want to cherry-pick it. (2) `.gitignore` is *merged*, not overwritten — the workdir's language-specific rules (`.build/`, `.swiftpm/`, …) are preserved alongside the `/.mill/` rule that `mill init` lays down. `MILL_PROMOTE_NEW_WORKDIR=auto|on|off` gates: `auto` skips when the parent root has user content beyond `{.git, .gitignore, .mill}` (don't silently overwrite); `on` always promotes; `off` never.
+1. **`promoteWorkdir`** (`orchestrator/promote.ts`) copies the workdir contents up into `ctx.root` for new-mode runs. Two non-obvious rules: (1) `.git/` is skipped — copying it would destroy the parent's repo. The workdir's git history stays accessible at `<repo>/.mill/runs/<id>/workdir/.git/` for users who want to cherry-pick it. (2) `.gitignore` is *merged*, not overwritten — the workdir's language-specific rules (`.build/`, `.swiftpm/`, …) are preserved alongside the `/.mill/` rule that `mill project add` lays down. `MILL_PROMOTE_NEW_WORKDIR=auto|on|off` gates: `auto` skips when the parent root has user content beyond `{.git, .gitignore, .mill}` (don't silently overwrite); `on` always promotes; `off` never.
 
 2. **`importWorkdirBranchToParent`** (same file) makes the workdir's branch reachable from the parent repo's `.git`, for **both** modes. Edit-mode is a short-circuit no-op via `gitBranchExists` (the worktree shares refs, and `git fetch` would refuse anyway because the branch is checked out in the linked worktree). New-mode runs `git fetch --update-head-ok <workdir> +<branch>:refs/heads/<branch>` from the parent root, init'ing `.git` first if needed. `--update-head-ok` is required because `gitInit` lands HEAD on `main` (unborn) and the workdir's branch is also `main` by default — without the flag git refuses to fetch into a checked-out ref. If the parent had no commits before the import (`gitHasHead === false`), the importer also `git symbolic-ref HEAD` + `git reset --hard <branch>` so the working tree matches the imported tip. Outcomes ("ref-only", "checkout", "skip-…") are surfaced in the delivery report and as `branch_imported` / `branch_import_skipped` / `branch_import_failed` events. Failures are logged but never fail the run.
 
@@ -161,4 +206,4 @@ There is no auto-PR creation. Earlier versions of mill had `--pr` to push the br
 
 ## Environment knobs
 
-All config is env-driven via `orchestrator/config.ts`. Defaults live there. `.env.example` documents them. `MILL_ROOT` controls where `.mill/` is discovered from — important if you run the worker from a different cwd than the checkout. Other sub-stage gates: `MILL_ADVERSARIAL_REVIEW`, `MILL_TESTS_CRITIC`, `MILL_SPEC2TESTS`, `MILL_AGENT_TEAMS` — all accept `auto|on|off`, where `on` turns a missing dependency (or in the teams case, a failure) into a hard failure rather than a skip/fallback. `MILL_PROMOTE_NEW_WORKDIR=auto|on|off` gates new-mode workdir promotion (see above). `MILL_USER_HOOKS=on|off` (default `on`) controls whether in-run `claude` subprocesses load user-level skills, hooks, and MCPs via `--setting-sources user`. `MILL_USER_MCP_CONFIG` overrides the paths mill reads MCPs from when a caller explicitly opts into the `inheritUserMcps` MCPs-without-hooks path, collapsing the default two-file load to the single file specified. `ANTHROPIC_API_KEY` and `ANTHROPIC_AUTH_TOKEN` are scrubbed from the `claude` subprocess env so a key in the parent shell can't silently flip billing to API mode.
+All config is env-driven via `orchestrator/config.ts`. Defaults live there. `.env.example` documents them. `MILL_HOME` controls the central state root (`~/.mill/` by default — DB, per-project state, daemon pidfile/portfile all live there); set it for tests or CI that need an isolated tree. `MILL_DAEMON_HOST` (`127.0.0.1`) and `MILL_DAEMON_PORT` (`7333`) are the daemon's loopback bind — also read by the CLI client to find a running daemon. `MILL_MAX_CONCURRENT_RUNS` (default 2) is the daemon's global cap across all projects (a per-project cap via `projects.default_concurrency` is bounded by this). Other sub-stage gates: `MILL_ADVERSARIAL_REVIEW`, `MILL_TESTS_CRITIC`, `MILL_SPEC2TESTS`, `MILL_AGENT_TEAMS` — all accept `auto|on|off`, where `on` turns a missing dependency (or in the teams case, a failure) into a hard failure rather than a skip/fallback. `MILL_PROMOTE_NEW_WORKDIR=auto|on|off` gates new-mode workdir promotion (see above). `MILL_USER_HOOKS=on|off` (default `on`) controls whether in-run `claude` subprocesses load user-level skills, hooks, and MCPs via `--setting-sources user`. `MILL_USER_MCP_CONFIG` overrides the paths mill reads MCPs from when a caller explicitly opts into the `inheritUserMcps` MCPs-without-hooks path, collapsing the default two-file load to the single file specified. `ANTHROPIC_API_KEY` and `ANTHROPIC_AUTH_TOKEN` are scrubbed from the `claude` subprocess env so a key in the parent shell can't silently flip billing to API mode.

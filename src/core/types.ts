@@ -96,8 +96,22 @@ export const ZERO_USAGE: TokenUsage = {
   output: 0,
 };
 
+export interface ProjectRow {
+  id: string;
+  name: string;
+  root_path: string;
+  added_at: number;
+  removed_at: number | null;
+  monthly_budget_usd: number | null;
+  default_concurrency: number | null;
+}
+
 export interface RunRow {
   id: string;
+  // Foreign key to projects.id. Nullable for legacy rows imported from a
+  // pre-multi-project DB before backfill, or rows created before the
+  // schema migration ran.
+  project_id: string | null;
   status: RunStatus;
   kind: Kind | null;
   mode: RunMode;
@@ -118,6 +132,50 @@ export interface RunRow {
 export interface StageRow {
   run_id: string;
   name: StageName;
+  status: StageStatus;
+  started_at: number | null;
+  finished_at: number | null;
+  cost_usd: number;
+  input_tokens: number;
+  cache_creation_tokens: number;
+  cache_read_tokens: number;
+  output_tokens: number;
+  session_id: string | null;
+  artifact_path: string | null;
+  error: string | null;
+}
+
+// Per-iteration stage row. Sibling table to `stages` — written only by
+// the implement ⇄ review loop. Cumulative `stages` rows continue to roll
+// up across iterations; this table preserves per-iteration detail so
+// `mill status` / progress ticker can show one row per iteration.
+export interface StageIterationRow {
+  run_id: string;
+  stage_name: StageName;
+  iteration: number;
+  status: StageStatus;
+  started_at: number | null;
+  finished_at: number | null;
+  cost_usd: number;
+  input_tokens: number;
+  cache_creation_tokens: number;
+  cache_read_tokens: number;
+  output_tokens: number;
+  session_id: string | null;
+  artifact_path: string | null;
+  error: string | null;
+}
+
+// Unified row consumed by display surfaces (`mill status`, progress
+// ticker). For non-iterating stages or runs without iteration data,
+// `iteration` is null and `displayName` is just the stage name. For
+// iterating stages with ≥2 iteration rows, one DisplayStageRow per
+// iteration is emitted with displayName like `implement #2`.
+export interface DisplayStageRow {
+  run_id: string;
+  name: StageName;
+  displayName: string;
+  iteration: number | null;
   status: StageStatus;
   started_at: number | null;
   finished_at: number | null;
@@ -237,6 +295,9 @@ export interface Logger {
 // `kind` is populated after the clarify stage classifies the requirement.
 export interface RunContext {
   runId: string;
+  // Identifier of the project this run belongs to. Resolved at intake;
+  // never changes for the lifetime of a run.
+  projectId: string;
   kind: Kind | null;
   mode: RunMode;
   paths: RunPaths;
@@ -245,7 +306,14 @@ export interface RunContext {
   costs: CostTracker;
   logger: Logger;
   model: string | undefined;
+  // Project repo root — where workdirs live, where git operates. Stays
+  // inside the registered repo so CLAUDE.md auto-discovery and worktrees
+  // keep working. Distinct from `stateDir` (central per-project state).
   root: string;
+  // Central per-project state directory (`~/.mill/projects/<id>/`).
+  // Holds journal.md, decisions.md, profile.json, stitch.json — files
+  // that travel with the project registration, not with the workdir.
+  stateDir: string;
   // Default wall-clock cap for a single `claude` subprocess. Stages override
   // per-call; if neither, runClaude uses this. Milliseconds.
   stageTimeoutMs: number;
@@ -264,6 +332,26 @@ export interface StateStore {
   // between doesn't double-bill on resume.
   transaction<T>(fn: () => T): T;
 
+  // ---- projects ----
+
+  addProject(row: {
+    id: string;
+    name: string;
+    root_path: string;
+    added_at?: number;
+    monthly_budget_usd?: number | null;
+    default_concurrency?: number | null;
+  }): ProjectRow;
+  getProject(id: string): ProjectRow | null;
+  getProjectByPath(rootPath: string): ProjectRow | null;
+  getProjectByName(name: string): ProjectRow | null;
+  listProjects(opts?: { includeRemoved?: boolean }): ProjectRow[];
+  removeProject(id: string): void;
+  updateProjectBudget(id: string, monthlyBudgetUsd: number | null): void;
+  updateProjectConcurrency(id: string, defaultConcurrency: number | null): void;
+
+  // ---- runs ----
+
   createRun(
     row: Omit<
       RunRow,
@@ -275,7 +363,13 @@ export interface StateStore {
       | "spec_path"
       | "mode"
       | "test_command"
-    > & { spec_path?: string | null; mode?: RunMode; test_command?: string | null },
+      | "project_id"
+    > & {
+      spec_path?: string | null;
+      mode?: RunMode;
+      test_command?: string | null;
+      project_id?: string | null;
+    },
   ): void;
   getRun(id: string): RunRow | null;
   updateRun(
@@ -284,9 +378,14 @@ export interface StateStore {
       Pick<RunRow, "status" | "kind" | "spec_path" | "test_command" | "total_cost_usd">
     >,
   ): void;
+  setRunProjectId(id: string, projectId: string): void;
   addRunCost(id: string, delta: number): void;
   addRunUsage(id: string, usage: TokenUsage): void;
-  listRuns(opts?: { status?: RunStatus; limit?: number }): RunRow[];
+  listRuns(opts?: {
+    status?: RunStatus;
+    limit?: number;
+    projectId?: string;
+  }): RunRow[];
 
   startStage(runId: string, name: StageName): void;
   finishStage(
@@ -302,6 +401,42 @@ export interface StateStore {
   setStageSession(runId: string, name: StageName, sessionId: string): void;
   getStage(runId: string, name: StageName): StageRow | null;
   listStages(runId: string): StageRow[];
+
+  // Per-iteration sibling rows for the implement ⇄ review loop. Mirror
+  // the cumulative stage methods 1:1. runClaude double-writes when an
+  // `iteration` is set so cumulative `stages.cost_usd` always equals
+  // SUM(stage_iterations.cost_usd) for that stage.
+  startStageIteration(runId: string, name: StageName, iteration: number): void;
+  finishStageIteration(
+    runId: string,
+    name: StageName,
+    iteration: number,
+    patch: Partial<Omit<StageIterationRow, "run_id" | "stage_name" | "iteration">>,
+  ): void;
+  addStageIterationCost(runId: string, name: StageName, iteration: number, delta: number): void;
+  addStageIterationUsage(
+    runId: string,
+    name: StageName,
+    iteration: number,
+    usage: TokenUsage,
+  ): void;
+  setStageIterationSession(
+    runId: string,
+    name: StageName,
+    iteration: number,
+    sessionId: string,
+  ): void;
+  getStageIteration(
+    runId: string,
+    name: StageName,
+    iteration: number,
+  ): StageIterationRow | null;
+  listStageIterations(runId: string, name?: StageName): StageIterationRow[];
+
+  // Merged view: cumulative `stages` rows expanded to per-iteration
+  // rows for `implement` / `review` when the sibling table has data,
+  // otherwise the cumulative row unchanged. Sorted chronologically.
+  listDisplayStages(runId: string): DisplayStageRow[];
 
   appendEvent(runId: string, stage: StageName, kind: string, payload: unknown): void;
   tailEvents(runId: string, afterId?: number, limit?: number): EventRow[];

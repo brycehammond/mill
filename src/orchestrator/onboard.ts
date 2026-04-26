@@ -39,6 +39,8 @@ export interface OnboardArgs {
   refresh?: boolean;
   // Override project root (defaults to loadConfig().root).
   root?: string;
+  // Override central state dir (defaults to loadConfig().stateDir).
+  stateDir?: string;
   // Override the backing model; otherwise loadConfig().model is used.
   model?: string;
 }
@@ -53,9 +55,10 @@ export interface OnboardResult {
 export async function onboard(args: OnboardArgs = {}): Promise<OnboardResult> {
   const config = loadConfig();
   const root = args.root ?? config.root;
+  const stateDir = args.stateDir ?? config.stateDir;
 
   if (!args.refresh) {
-    const existing = await readProfile(root);
+    const existing = await readProfile(stateDir);
     if (existing) {
       return { profile: existing, cached: true, costUsd: 0, durationMs: 0 };
     }
@@ -95,7 +98,7 @@ export async function onboard(args: OnboardArgs = {}): Promise<OnboardResult> {
     doNotTouch: parsed.doNotTouch,
     markdown: parsed.markdown,
   };
-  await writeProfile(root, profile);
+  await writeProfile(stateDir, profile);
 
   return {
     profile,

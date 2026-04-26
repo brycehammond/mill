@@ -1,38 +1,45 @@
 #!/usr/bin/env node
 import { createInterface } from "node:readline/promises";
-import { writeFile, readFile } from "node:fs/promises";
+import { readFile } from "node:fs/promises";
+import {
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  unlinkSync,
+} from "node:fs";
 import { parseArgs } from "node:util";
-import { execFileSync } from "node:child_process";
-import { relative } from "node:path";
+import { execFileSync, spawn } from "node:child_process";
+import { dirname, relative, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import {
   openStore,
   runPaths,
-  initProject,
-  readProjectInfo,
-  detectRunMode,
   readJournal,
   journalPath,
+  daemonPidPath,
+  daemonPortPath,
+  centralDbPath,
+  detectRunMode,
+  resolveProjectFromCwd,
+  resolveProjectByIdentifier,
+  projectStateDir,
   atLeast,
   type Clarifications,
   type DisplayStageRow,
+  type ProjectRow,
   type RunMode,
   type RunRow,
   type StageRow,
   type StageStatus,
+  type StateStore,
   type RunStatus,
 } from "./core/index.js";
 import {
-  buildContext,
-  intake,
-  clarify,
-  recordAnswers,
-  runPipeline,
   loadConfig,
   NoProjectError,
   onboard,
-  startStageProgressTicker,
 } from "./orchestrator/index.js";
-import type { PipelineResult } from "./orchestrator/pipeline.js";
+import { DaemonClient, DaemonNotRunningError } from "./cli/client.js";
 
 // --- Small presentation helpers ----------------------------------------
 
@@ -45,7 +52,6 @@ const dim = ansi("2");
 const red = ansi("31");
 const green = ansi("32");
 const yellow = ansi("33");
-const magenta = ansi("35");
 const cyan = ansi("36");
 
 function colorRunStatus(s: RunStatus): string {
@@ -102,10 +108,7 @@ function fmtCost(n: number): string {
   return `$${n.toFixed(2)}`;
 }
 
-// Render a matrix as a fixed-width table with auto-widths per column. The
-// first row is treated as the header (no coloring of widths, but the header
-// gets a dim/bold cue applied by the caller if it wants). Right-aligned
-// indexes are provided via `alignRight`.
+// Render a matrix as a fixed-width table with auto-widths per column.
 function renderTable(
   rows: string[][],
   opts: { alignRight?: Set<number>; gap?: string } = {},
@@ -139,49 +142,8 @@ function visibleWidth(s: string): number {
   return s.replace(/\x1b\[[0-9;]*m/g, "").length;
 }
 
-// Pretty-print a parsed JSON value with light syntax coloring (keys cyan,
-// strings green, numbers yellow, booleans magenta, null dim). Falls back
-// to plain indented JSON when color is off. Used by `mill tail -p` /
-// `mill logs -p` to show the raw event payload in a readable form —
-// complements --raw (NDJSON for scripts) and the default curated views.
-function prettyJson(value: unknown): string {
-  let body: string;
-  try {
-    body = JSON.stringify(value, null, 2);
-  } catch {
-    return String(value);
-  }
-  if (body === undefined) return "undefined";
-  if (!COLOR_ENABLED) return body;
-  // Matches: (a) string literals, optionally followed by `:` (= key),
-  // (b) numbers, (c) booleans / null. Same classic pattern Chrome
-  // devtools uses — string values contain no unescaped quotes by
-  // construction of JSON.stringify.
-  return body.replace(
-    /("(?:\\u[a-fA-F0-9]{4}|\\[^u]|[^\\"])*"(\s*:)?|\b(true|false|null)\b|-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)/g,
-    (m) => {
-      if (m.endsWith(":") || /":\s*$/.test(m)) return cyan(m);
-      if (m.startsWith('"')) return green(m);
-      if (m === "true" || m === "false") return magenta(m);
-      if (m === "null") return dim(m);
-      return yellow(m);
-    },
-  );
-}
-
-// Render one event as a compact header line plus a pretty-printed JSON
-// body. Shared by `mill tail -p` and `mill logs -p`.
-function renderPrettyEvent(args: {
-  ts: number;
-  stage: string;
-  kind: string;
-  payload: unknown;
-}): string {
-  const header = `${dim(`[${new Date(args.ts).toISOString()}]`)} ${bold(args.stage)} ${cyan(args.kind)}`;
-  const body = prettyJson(args.payload);
-  return `${header}\n${indent(body, "  ")}\n`;
-}
-
+// Top-level commands. Subcommand trees (`project`, `daemon`) dispatch
+// inside their own handlers.
 type Cmd =
   | "new"
   | "run"
@@ -193,6 +155,8 @@ type Cmd =
   | "onboard"
   | "history"
   | "findings"
+  | "project"
+  | "daemon"
   | "help";
 
 async function main() {
@@ -216,17 +180,26 @@ async function main() {
       case "kill":
         return await cmdKill(rest);
       case "history":
-        return await cmdHistory();
+        return await cmdHistory(rest);
       case "onboard":
         return await cmdOnboard(rest);
       case "findings":
         return await cmdFindings(rest);
+      case "project":
+        return await cmdProject(rest);
+      case "daemon":
+        return await cmdDaemon(rest);
       case "help":
       default:
         printHelp();
         return;
     }
   } catch (err) {
+    if (err instanceof DaemonNotRunningError) {
+      console.error(`${red("mill:")} ${err.message}`);
+      process.exitCode = 1;
+      return;
+    }
     if (err instanceof NoProjectError) {
       console.error(`${red("mill:")} ${err.message}`);
       process.exitCode = 1;
@@ -256,18 +229,27 @@ function printHelp() {
     [
       `${bold("mill")} — a harness around the ${cyan("claude")} CLI`,
       "",
-      h("Setup"),
-      `  ${c("mill init")} [<name>]             create .mill/ at the git root`,
-      `  ${c("mill onboard")} [--refresh]       profile the repo (auto-injected into prompts)`,
+      h("Daemon"),
+      `  ${c("mill daemon start")} [--port N] [--host H] [--foreground]   start the daemon`,
+      `  ${c("mill daemon stop")}                                          stop the daemon (SIGTERM, drains)`,
+      `  ${c("mill daemon status")}                                        running on host:port (pid)`,
+      "",
+      h("Projects"),
+      `  ${c("mill project add")} [<path>]            register a git repo (default: cwd)`,
+      `  ${c("mill project ls")}                      list projects + cost rollup`,
+      `  ${c("mill project show")} <id>               detailed view of one project`,
+      `  ${c("mill project rm")} <id> [--yes]         deregister (history kept)`,
+      `  ${c("mill init")}                            ${d("[deprecated alias for `mill project add`]")}`,
+      `  ${c("mill onboard")} [--refresh]             profile the repo (auto-injected into prompts)`,
       "",
       h("Runs"),
-      `  ${c("mill new")} (<requirement...> | --from <file>)`,
+      `  ${c("mill new")} (<requirement...> | --from <file>) [--project <id>]`,
       `           [--mode new|edit|auto] [--stop-after spec|design|spec2tests]`,
       `           [--detach] [--all-defaults]`,
       `    ${d("--mode auto")}         detects edit when the repo has committed source,`,
-      `                        otherwise new (scaffolds into .mill/runs/<id>/workdir/)`,
+      `                        otherwise new`,
       `    ${d("--stop-after <s>")}    halts after a named stage; resume with mill run <id>`,
-      `    ${d("--detach")}            queues the run; use mill worker to execute`,
+      `    ${d("--detach")}            queues the run; daemon picks it up`,
       `    ${d("--all-defaults")}      accept every clarify default (no prompting)`,
       `  ${c("mill run")} <run-id>              resume a run, skipping completed stages`,
       `  ${c("mill kill")} <run-id>             write KILLED sentinel; next tool call aborts`,
@@ -276,7 +258,7 @@ function printHelp() {
       `  ${c("mill status")} [<run-id>]         list recent runs, or stage breakdown of one`,
       `  ${c("mill tail")} <run-id> [-f] [-v]   human-readable activity stream (-v: full text + thinking + tool bodies)`,
       `  ${c("mill logs")} <run-id> [-f] [--raw]  events (--raw emits the raw stream-json as NDJSON)`,
-      `  ${c("mill history")}                   print .mill/journal.md`,
+      `  ${c("mill history")} [--project <id>]  print the project journal`,
       "",
       h("Findings"),
       `  ${c("mill findings")} [--all] [--limit N]        recurring findings across runs`,
@@ -288,7 +270,105 @@ function printHelp() {
   );
 }
 
+// ---------- shared helpers (used by both daemon-routed and direct paths) ----------
+
+// Open the central DB. Read commands use this so they keep working
+// when the daemon is down (AC-8). Mutating commands route through the
+// daemon to avoid a second writer racing on SQLite.
+function openCentralStoreReadOnly(): StateStore {
+  const dbPath = centralDbPath();
+  // mkdir the parent so openStore doesn't choke on a fresh install.
+  mkdirSync(dirname(dbPath), { recursive: true });
+  return openStore(dbPath);
+}
+
+// Resolve a project for a read command. Honors `--project <id|name|path>`
+// first, then walks up from cwd. Returns null when nothing matches —
+// reads are allowed to operate without a project (e.g. `mill status`
+// with no runs registered yet should print "(no runs)" rather than
+// failing).
+function resolveProjectForRead(
+  store: StateStore,
+  ident: string | undefined,
+): ProjectRow | null {
+  if (ident && ident.trim()) {
+    const p = resolveProjectByIdentifier(store, ident.trim());
+    return p ?? null;
+  }
+  return resolveProjectFromCwd(store, process.cwd());
+}
+
+// Strict variant for mutating commands: surface a clear error when no
+// project resolves so the user knows what to fix (AC-3).
+function requireProjectForMutate(
+  store: StateStore,
+  ident: string | undefined,
+): ProjectRow {
+  const p = resolveProjectForRead(store, ident);
+  if (!p) {
+    throw new NoProjectError(
+      "no project resolved from cwd. Use `mill project add` or pass --project <id|name|path>.",
+    );
+  }
+  if (p.removed_at !== null) {
+    throw new Error(
+      `project ${p.id} is removed. Re-register it with \`mill project add ${p.root_path}\`.`,
+    );
+  }
+  return p;
+}
+
+// ---------- mill init (deprecation alias) ----------
+
 async function cmdInit(argv: string[]) {
+  console.error(
+    `${dim("note:")} \`mill init\` is deprecated; use \`mill project add\``,
+  );
+  return await projectAdd(argv);
+}
+
+// ---------- mill project ----------
+
+async function cmdProject(argv: string[]) {
+  const [sub, ...rest] = argv;
+  switch (sub) {
+    case "add":
+      return await projectAdd(rest);
+    case "ls":
+    case "list":
+      return await projectLs(rest);
+    case "show":
+      return await projectShow(rest);
+    case "rm":
+    case "remove":
+      return await projectRm(rest);
+    case undefined:
+    case "help":
+    case "-h":
+    case "--help":
+      printProjectHelp();
+      return;
+    default:
+      console.error(`mill project: unknown subcommand "${sub}"`);
+      printProjectHelp();
+      process.exitCode = 2;
+  }
+}
+
+function printProjectHelp() {
+  console.log(
+    [
+      `${bold("mill project")} — manage registered repos`,
+      ``,
+      `  ${cyan("mill project add")} [<path>] [--name N]      register a git repo`,
+      `  ${cyan("mill project ls")}  [--all]                  list projects + cost rollup`,
+      `  ${cyan("mill project show")} <id>                    detailed view of one project`,
+      `  ${cyan("mill project rm")} <id> [--yes]              deregister (history kept)`,
+    ].join("\n"),
+  );
+}
+
+async function projectAdd(argv: string[]) {
   const { values, positionals } = parseArgs({
     args: argv,
     allowPositionals: true,
@@ -296,16 +376,468 @@ async function cmdInit(argv: string[]) {
       name: { type: "string" },
     },
   });
-  const name = values.name ?? positionals[0];
-  const result = initProject({ name });
-  const marker = result.created ? green("✓") : dim("·");
-  const verb = result.created ? "initialized" : "already initialized";
-  console.log(`${marker} ${verb} mill project ${bold(result.info.name)}`);
-  console.log(dim(`  ${result.projectRoot}`));
-  if (result.gitignoreUpdated) {
-    console.log(dim("  added /.mill/ to .gitignore"));
+  const path = positionals[0] ?? process.cwd();
+  const absPath = resolve(path);
+  const client = new DaemonClient();
+  const body: { root_path: string; name?: string } = { root_path: absPath };
+  if (values.name) body.name = values.name;
+  const out = await client.createProject(body);
+  const marker = out.created ? green("✓") : dim("·");
+  const verb = out.created ? "registered" : "already registered";
+  console.log(`${marker} ${verb} project ${bold(out.project.name)}`);
+  console.log(`  ${dim("id:")}   ${out.project.id}`);
+  console.log(`  ${dim("path:")} ${out.project.root_path}`);
+  if (out.migration) {
+    const m = out.migration;
+    if (m.runs_imported > 0 || m.events_imported > 0 || m.findings_imported > 0) {
+      console.log(
+        dim(
+          `  migrated ${m.runs_imported} run(s), ${m.events_imported} event(s), ${m.findings_imported} finding(s)`,
+        ),
+      );
+    }
+    if (m.legacy_db_renamed_to) {
+      console.log(dim(`  legacy db moved to ${m.legacy_db_renamed_to}`));
+    }
   }
 }
+
+async function projectLs(argv: string[]) {
+  const { values } = parseArgs({
+    args: argv,
+    allowPositionals: false,
+    options: {
+      all: { type: "boolean", default: false },
+    },
+  });
+  const client = new DaemonClient();
+  // AC-8: `project ls` must work with the daemon down. We fall back to
+  // a direct DB read, omitting cost rollups, only on
+  // DaemonNotRunningError; other failures surface to the user.
+  let entries;
+  let staleWarning = false;
+  try {
+    entries = await client.listProjects({ includeRemoved: values.all });
+  } catch (err) {
+    if (!(err instanceof DaemonNotRunningError)) throw err;
+    entries = projectsFromDbDirect({ includeRemoved: values.all });
+    staleWarning = true;
+  }
+  if (entries.length === 0) {
+    console.log(dim("(no projects registered — try `mill project add`)"));
+    return;
+  }
+  if (staleWarning) {
+    console.log(
+      dim(
+        "  daemon not running — showing registry only (cost rollups omitted).",
+      ),
+    );
+  }
+  const header = [
+    dim("id"),
+    dim("name"),
+    dim("path"),
+    dim("today"),
+    dim("MTD"),
+    dim("in-flight"),
+    dim("last delivered"),
+  ];
+  const rows = entries.map((e) => [
+    e.id,
+    e.name,
+    e.root_path,
+    fmtCost(e.cost_today_usd ?? 0),
+    fmtCost(e.cost_mtd_usd ?? 0),
+    String(e.in_flight_runs ?? 0),
+    e.last_delivery_ts ? dim(relTime(e.last_delivery_ts)) : dim("—"),
+  ]);
+  console.log(renderTable([header, ...rows], { alignRight: new Set([3, 4, 5]) }));
+}
+
+// Stale-rollup fallback for `project ls` when the daemon is down. Reads
+// the central DB directly and omits cost rollups; the table still shows
+// id/name/path so the user can confirm what's registered.
+function projectsFromDbDirect(opts: { includeRemoved: boolean }): {
+  id: string;
+  name: string;
+  root_path: string;
+  cost_today_usd: number;
+  cost_mtd_usd: number;
+  in_flight_runs: number;
+  last_delivery_ts: number | null;
+}[] {
+  const store = openCentralStoreReadOnly();
+  try {
+    const rows = store.listProjects({ includeRemoved: opts.includeRemoved });
+    return rows.map((p) => ({
+      id: p.id,
+      name: p.name,
+      root_path: p.root_path,
+      cost_today_usd: 0,
+      cost_mtd_usd: 0,
+      in_flight_runs: 0,
+      last_delivery_ts: null,
+    }));
+  } finally {
+    store.close();
+  }
+}
+
+async function projectShow(argv: string[]) {
+  const id = argv[0];
+  if (!id) {
+    console.error("mill project show: project id required");
+    process.exitCode = 2;
+    return;
+  }
+  const client = new DaemonClient();
+  const e = await client.getProject(id);
+  console.log(`${bold("project")} ${bold(e.name)} ${dim(e.id)}`);
+  const rows: string[][] = [
+    [dim("  path"), e.root_path],
+    [dim("  added"), dim(relTime(e.added_at))],
+    [dim("  today"), fmtCost(e.cost_today_usd)],
+    [dim("  MTD"), fmtCost(e.cost_mtd_usd)],
+    [dim("  in-flight"), String(e.in_flight_runs)],
+    [
+      dim("  last delivered"),
+      e.last_delivery_ts ? dim(relTime(e.last_delivery_ts)) : dim("—"),
+    ],
+  ];
+  if (e.removed_at !== null) {
+    rows.push([dim("  removed"), red(relTime(e.removed_at))]);
+  }
+  if (e.monthly_budget_usd !== null) {
+    rows.push([dim("  budget"), fmtCost(e.monthly_budget_usd)]);
+  }
+  if (e.default_concurrency !== null) {
+    rows.push([dim("  concurrency"), String(e.default_concurrency)]);
+  }
+  console.log(renderTable(rows));
+  console.log();
+  console.log(`${dim("  state dir:")} ${projectStateDir(e.id)}`);
+}
+
+async function projectRm(argv: string[]) {
+  const { values, positionals } = parseArgs({
+    args: argv,
+    allowPositionals: true,
+    options: { yes: { type: "boolean", default: false } },
+  });
+  const id = positionals[0];
+  if (!id) {
+    console.error("mill project rm: project id required");
+    process.exitCode = 2;
+    return;
+  }
+  if (!values.yes) {
+    const rl = createInterface({ input: process.stdin, output: process.stdout });
+    try {
+      const ans = (
+        await rl.question(`Remove project ${bold(id)}? [y/N] `)
+      ).trim().toLowerCase();
+      if (ans !== "y" && ans !== "yes") {
+        console.log(dim("aborted"));
+        return;
+      }
+    } finally {
+      rl.close();
+    }
+  }
+  const client = new DaemonClient();
+  await client.deleteProject(id);
+  console.log(`${green("✓")} removed ${bold(id)} ${dim("(history kept)")}`);
+}
+
+// ---------- mill daemon ----------
+
+async function cmdDaemon(argv: string[]) {
+  const [sub, ...rest] = argv;
+  switch (sub) {
+    case "start":
+      return await daemonStart(rest);
+    case "stop":
+      return await daemonStop(rest);
+    case "status":
+      return await daemonStatus(rest);
+    case undefined:
+    case "help":
+    case "-h":
+    case "--help":
+      printDaemonHelp();
+      return;
+    default:
+      console.error(`mill daemon: unknown subcommand "${sub}"`);
+      printDaemonHelp();
+      process.exitCode = 2;
+  }
+}
+
+function printDaemonHelp() {
+  console.log(
+    [
+      `${bold("mill daemon")} — long-running run-execution server`,
+      ``,
+      `  ${cyan("mill daemon start")} [--port N] [--host H] [--foreground] [--no-ui] [--open]   start (defaults to detached)`,
+      `  ${cyan("mill daemon stop")}                                          SIGTERM, drains in-flight runs`,
+      `  ${cyan("mill daemon status")}                                        check liveness via pidfile + /healthz`,
+    ].join("\n"),
+  );
+}
+
+async function daemonStart(argv: string[]) {
+  const { values } = parseArgs({
+    args: argv,
+    allowPositionals: false,
+    options: {
+      port: { type: "string" },
+      host: { type: "string" },
+      foreground: { type: "boolean", default: false },
+      "no-ui": { type: "boolean", default: false },
+      open: { type: "boolean", default: false },
+    },
+  });
+
+  // Per-invocation env overrides for host/port. The daemon entrypoint
+  // re-reads MILL_DAEMON_HOST/PORT via loadGlobalConfig(), so propagating
+  // through env is the cleanest way to thread these into the child.
+  // --no-ui flips MILL_NO_UI=1 in the child env so buildServer skips
+  // the static handler.
+  const env = { ...process.env };
+  if (values.port) env.MILL_DAEMON_PORT = values.port;
+  if (values.host) env.MILL_DAEMON_HOST = values.host;
+  if (values["no-ui"]) env.MILL_NO_UI = "1";
+
+  // Fast-fail if a daemon is already up on the configured bind. The
+  // daemon entrypoint also guards via the pidfile, but doing it here
+  // gives a nicer message and avoids spawning a doomed child.
+  const probeConfig: { daemonHost?: string; daemonPort?: string } = {};
+  if (values.host) probeConfig.daemonHost = values.host;
+  if (values.port) probeConfig.daemonPort = values.port;
+  const probe = new DaemonClient();
+  if (await probe.isLive()) {
+    const h = await probe.healthz();
+    console.log(
+      `${dim("·")} daemon already running on ${h.host}:${h.port} ${dim(`(pid ${h.pid})`)}`,
+    );
+    return;
+  }
+
+  const entry = resolveDaemonEntrypoint();
+
+  if (values.foreground) {
+    // Re-exec via spawn-and-inherit so SIGINT/SIGTERM forward to the
+    // child. We don't import the daemon module in-process because the
+    // production binary may be `node dist/cli.js`, not tsx, and `index.ts`
+    // requires the TypeScript loader.
+    if (env.MILL_DAEMON_PORT) process.env.MILL_DAEMON_PORT = env.MILL_DAEMON_PORT;
+    if (env.MILL_DAEMON_HOST) process.env.MILL_DAEMON_HOST = env.MILL_DAEMON_HOST;
+    await new Promise<void>((res, rej) => {
+      const cmd = entry.kind === "node" ? process.execPath : entry.cmd;
+      const args = entry.kind === "node" ? [entry.path] : entry.args;
+      const child = spawn(cmd, args, {
+        stdio: "inherit",
+        env,
+      });
+      child.on("error", rej);
+      child.on("exit", (code) => {
+        if (code === 0 || code === null) res();
+        else rej(new Error(`daemon exited with code ${code}`));
+      });
+      const forward = (sig: NodeJS.Signals) => () => child.kill(sig);
+      process.on("SIGINT", forward("SIGINT"));
+      process.on("SIGTERM", forward("SIGTERM"));
+    });
+    return;
+  }
+
+  // Detached background spawn. Ignore stdio so the child outlives this
+  // CLI invocation. Poll the pidfile + /healthz so the user sees a
+  // clean "running on host:port" line before we return.
+  const cmd = entry.kind === "node" ? process.execPath : entry.cmd;
+  const args = entry.kind === "node" ? [entry.path] : entry.args;
+  const child = spawn(cmd, args, {
+    detached: true,
+    stdio: "ignore",
+    env,
+  });
+  child.unref();
+
+  const pidPath = daemonPidPath();
+  const ok = await pollUntil(
+    async () => {
+      if (!existsSync(pidPath)) return false;
+      return await probe.isLive();
+    },
+    { timeoutMs: 10_000, intervalMs: 200 },
+  );
+  if (!ok) {
+    console.error(
+      `${red("mill:")} daemon did not become healthy within 10s. Check ~/.mill/daemon.pid and /healthz.`,
+    );
+    process.exitCode = 1;
+    return;
+  }
+  const h = await probe.healthz();
+  console.log(
+    `${green("✓")} daemon running on ${h.host}:${h.port} ${dim(`(pid ${h.pid})`)}`,
+  );
+  const url = `http://${h.host}:${h.port}/`;
+  if (!values["no-ui"]) {
+    console.log(`${dim("·")} web UI: ${cyan(url)}`);
+  }
+  if (values.open && !values["no-ui"]) {
+    openInBrowser(url);
+  }
+}
+
+function openInBrowser(url: string): void {
+  // Best-effort cross-platform "open this URL". Failures (no GUI, no
+  // handler) are intentionally swallowed — the URL was already printed
+  // and the user can copy it.
+  const platform = process.platform;
+  let cmd: string;
+  let args: string[];
+  if (platform === "darwin") {
+    cmd = "open";
+    args = [url];
+  } else if (platform === "win32") {
+    cmd = "cmd";
+    args = ["/c", "start", "", url];
+  } else {
+    cmd = "xdg-open";
+    args = [url];
+  }
+  try {
+    const child = spawn(cmd, args, { detached: true, stdio: "ignore" });
+    child.unref();
+  } catch {
+    // ignore
+  }
+}
+
+async function daemonStop(_argv: string[]) {
+  const pidPath = daemonPidPath();
+  if (!existsSync(pidPath)) {
+    console.log(`${dim("·")} daemon not running ${dim("(no pidfile)")}`);
+    return;
+  }
+  const raw = readFileSync(pidPath, "utf8").trim();
+  const pid = Number(raw);
+  if (!Number.isFinite(pid) || pid <= 0) {
+    console.error(
+      `${red("mill:")} daemon pidfile at ${pidPath} is not a valid pid: "${raw}"`,
+    );
+    process.exitCode = 1;
+    return;
+  }
+  if (!isPidAlive(pid)) {
+    try { unlinkSync(pidPath); } catch { /* ignore */ }
+    console.log(`${dim("·")} daemon not running ${dim(`(stale pid ${pid})`)}`);
+    return;
+  }
+  try {
+    process.kill(pid, "SIGTERM");
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error(`${red("mill:")} kill ${pid}: ${msg}`);
+    process.exitCode = 1;
+    return;
+  }
+  console.log(`${dim("▸")} sent SIGTERM to daemon (pid ${pid}); waiting for drain…`);
+  // Daemon's drain phase can be long if a stage is mid-flight. Cap at
+  // 30s — past that, surface a hint to send SIGTERM again to abort.
+  const drained = await pollUntil(async () => !isPidAlive(pid), {
+    timeoutMs: 30_000,
+    intervalMs: 250,
+  });
+  if (!drained) {
+    console.log(
+      dim(
+        `still running. Send SIGTERM again to force abort: kill ${pid}`,
+      ),
+    );
+    process.exitCode = 1;
+    return;
+  }
+  console.log(`${green("✓")} daemon stopped`);
+}
+
+async function daemonStatus(_argv: string[]) {
+  const pidPath = daemonPidPath();
+  const portPath = daemonPortPath();
+  if (!existsSync(pidPath)) {
+    console.log(`${dim("·")} not running ${dim("(no pidfile)")}`);
+    return;
+  }
+  const pid = Number(readFileSync(pidPath, "utf8").trim());
+  if (!Number.isFinite(pid) || !isPidAlive(pid)) {
+    console.log(`${dim("·")} not running ${dim(`(stale pid ${pid})`)}`);
+    return;
+  }
+  const client = new DaemonClient();
+  if (!(await client.isLive())) {
+    let portHint = "";
+    if (existsSync(portPath)) {
+      const p = readFileSync(portPath, "utf8").trim();
+      portHint = ` ${dim(`(pidfile says port ${p})`)}`;
+    }
+    console.log(
+      `${yellow("?")} pid ${pid} alive but /healthz not responding${portHint}`,
+    );
+    return;
+  }
+  const h = await client.healthz();
+  console.log(
+    `${green("✓")} running on ${h.host}:${h.port} ${dim(`(pid ${h.pid}, uptime ${h.uptime_s}s)`)}`,
+  );
+}
+
+// Resolve where the daemon entrypoint lives so we can spawn it. Two cases:
+//  - production: `dist/cli.js` runs and `dist/daemon/index.js` is its
+//    sibling — invoke with `node dist/daemon/index.js`.
+//  - dev (`npm run mill -- daemon start`): we're under tsx; the CLI
+//    file is `src/cli.ts`. Spawn `npx tsx src/daemon/index.ts` so the
+//    child gets the same TypeScript loader.
+type DaemonEntry =
+  | { kind: "node"; path: string }
+  | { kind: "spawn"; cmd: string; args: string[] };
+
+function resolveDaemonEntrypoint(): DaemonEntry {
+  const here = fileURLToPath(import.meta.url);
+  const srcMode = here.endsWith(".ts");
+  if (srcMode) {
+    const tsFile = resolve(dirname(here), "daemon", "index.ts");
+    return { kind: "spawn", cmd: "npx", args: ["tsx", tsFile] };
+  }
+  const jsFile = resolve(dirname(here), "daemon", "index.js");
+  return { kind: "node", path: jsFile };
+}
+
+function isPidAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    const code = (err as Error & { code?: string }).code;
+    return code === "EPERM";
+  }
+}
+
+async function pollUntil(
+  predicate: () => Promise<boolean> | boolean,
+  opts: { timeoutMs: number; intervalMs: number },
+): Promise<boolean> {
+  const deadline = Date.now() + opts.timeoutMs;
+  while (Date.now() < deadline) {
+    if (await predicate()) return true;
+    await sleep(opts.intervalMs);
+  }
+  return false;
+}
+
+// ---------- mill new ----------
 
 async function cmdNew(argv: string[]) {
   const { values, positionals } = parseArgs({
@@ -317,6 +849,7 @@ async function cmdNew(argv: string[]) {
       from: { type: "string" },
       mode: { type: "string", default: "auto" },
       "stop-after": { type: "string" },
+      project: { type: "string" },
     },
   });
 
@@ -334,6 +867,12 @@ async function cmdNew(argv: string[]) {
   const rawMode = (values.mode ?? "auto").toLowerCase();
   if (rawMode !== "auto" && rawMode !== "new" && rawMode !== "edit") {
     console.error(`mill new: --mode must be auto|new|edit, got "${values.mode}"`);
+    process.exitCode = 2;
+    return;
+  }
+
+  const stopAfter = resolveStopAfter(values["stop-after"]);
+  if (stopAfter === "error") {
     process.exitCode = 2;
     return;
   }
@@ -364,129 +903,124 @@ async function cmdNew(argv: string[]) {
 
   preflightClaude();
 
-  const config = loadConfig();
-  const store = openStore(config.root);
+  // Resolve project up front so we can do `--mode auto` detection
+  // against its repo. The daemon doesn't echo back the resolved root,
+  // so the CLI does this against the central DB directly — read-only.
+  const store = openCentralStoreReadOnly();
+  let project: ProjectRow;
+  try {
+    project = requireProjectForMutate(store, values.project);
+  } finally {
+    store.close();
+  }
 
   const effectiveMode: RunMode =
-    rawMode === "auto" ? await detectRunMode(config.root) : (rawMode as RunMode);
+    rawMode === "auto"
+      ? await detectRunMode(project.root_path)
+      : (rawMode as RunMode);
 
   if (rawMode === "auto") {
     console.log(`${dim("mode:")} ${effectiveMode} ${dim("(auto)")}`);
   } else {
     console.log(`${dim("mode:")} ${effectiveMode}`);
   }
+  console.log(`${dim("project:")} ${bold(project.name)} ${dim(project.id)}`);
 
-  let intakeResult;
-  try {
-    intakeResult = await intake({
-      requirement,
-      root: config.root,
-      store,
-      mode: effectiveMode,
-    });
-  } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    console.error(`mill new: intake failed: ${msg}`);
-    process.exitCode = 1;
-    return;
-  }
-  const { runId, branch, baseBranch } = intakeResult;
-  console.log(`${dim("run:")}  ${bold(runId)}`);
-  if (effectiveMode === "edit" && branch) {
-    const off = baseBranch ? ` ${dim(`(off ${baseBranch})`)}` : "";
-    console.log(`${dim("branch:")} ${branch}${off}`);
+  const client = new DaemonClient();
+  const body: {
+    requirement: string;
+    mode?: RunMode;
+    stop_after?: "spec" | "design" | "spec2tests";
+    all_defaults?: boolean;
+  } = { requirement, mode: effectiveMode };
+  if (stopAfter) body.stop_after = stopAfter;
+  if (values["all-defaults"]) body.all_defaults = true;
+
+  const created = await client.createRun(project.id, body);
+  console.log(`${dim("run:")}  ${bold(created.run_id)}`);
+  if (effectiveMode === "edit" && created.branch) {
+    const off = created.base_branch ? ` ${dim(`(off ${created.base_branch})`)}` : "";
+    console.log(`${dim("branch:")} ${created.branch}${off}`);
   }
 
-  const ctx = await buildContext({ runId, config, store });
-  console.log(`\n${dim("▸")} asking clarifying questions…`);
-  const clarifyRes = await clarify(ctx);
-  if (!clarifyRes.ok) {
-    console.error(red(`clarify failed: ${clarifyRes.error}`));
-    process.exitCode = 1;
-    return;
+  if (created.clarifications) {
+    console.log(`${dim("kind:")} ${created.clarifications.kind}`);
+    const answers = await promptForAnswers(
+      created.clarifications,
+      Boolean(values["all-defaults"]),
+    );
+    await client.submitClarifications(created.run_id, answers);
+    console.log(dim("\nanswers recorded. run is now in the daemon's queue.\n"));
+  } else {
+    console.log(dim("\nclarifications auto-accepted. run is queued.\n"));
   }
-
-  const clar = store.getClarifications(runId);
-  if (!clar) throw new Error("clarifications not stored");
-
-  console.log(`${dim("kind:")} ${clar.kind}`);
-  const answers = await promptForAnswers(clar, Boolean(values["all-defaults"]));
-  await recordAnswers(ctx, answers);
-  console.log(dim("\nanswers recorded. run is now dark.\n"));
 
   if (values.detach) {
-    console.log(dim("queued — launch `npm run worker` to execute."));
+    console.log(
+      dim(
+        "queued — daemon will pick it up. follow with `mill tail "
+          + created.run_id + " -f`.",
+      ),
+    );
     return;
   }
 
-  // --stop-after <stage> halts the pipeline after a named stage so the
-  // user can review before paying for the rest. Unrelated to Claude
-  // Code's `permissionMode: plan` (in-process planning).
-  const stopAfter = resolveStopAfter(values["stop-after"]);
-  if (stopAfter === "error") {
-    process.exitCode = 2;
-    return;
-  }
-  const stageList = stopAfter
-    ? stageChainUpTo(stopAfter)
-    : "spec → design → implement ⇄ review → verify → deliver";
-  console.log(`${dim("▸")} running pipeline: ${stageList}`);
-  installInlineAbortHandler(ctx);
-  const ticker = startStageProgressTicker({
-    store,
-    runId,
-    fmtDurationMs,
-    fmtCost,
-    green,
-    red,
-    yellow,
-    dim,
-  });
-  let result: PipelineResult;
+  // Inline progress: poll the central DB and wait for terminal status.
+  // Mutations stay in the daemon — we're just observing.
+  console.log(
+    `${dim("▸")} pipeline running on the daemon. Use `
+      + `${cyan("mill tail " + created.run_id + " -f")} for the live stream, `
+      + `or ${cyan("Ctrl-C")} to detach.`,
+  );
+  console.log();
+  await waitForRunTerminal(created.run_id);
+}
+
+// Poll the central DB until the run reaches a terminal status; print
+// the final outcome. The daemon owns the writes; we just watch.
+async function waitForRunTerminal(runId: string): Promise<void> {
+  const store = openCentralStoreReadOnly();
   try {
-    result = await runPipeline({
-      runId,
-      config,
-      ctx,
-      ...(stopAfter ? { stopAfter } : {}),
-    });
+    // eslint-disable-next-line no-constant-condition
+    while (true) {
+      const run = store.getRun(runId);
+      if (!run) {
+        await sleep(500);
+        continue;
+      }
+      if (
+        run.status === "completed" ||
+        run.status === "failed" ||
+        run.status === "killed"
+      ) {
+        const proj = run.project_id ? store.getProject(run.project_id) : null;
+        const paths = proj ? runPaths(proj.root_path, runId) : null;
+        const stages = store.listDisplayStages(runId);
+        printRunOutcome(run, stages, paths);
+        return;
+      }
+      await sleep(1000);
+    }
   } finally {
-    ticker.stop();
+    store.close();
   }
-  const paths = runPaths(config.root, runId);
-  printPipelineOutcome(result, { store, paths, stopAfter });
 }
 
-function stageChainUpTo(stop: StopStage): string {
-  const chain = ["spec", "design", "spec2tests"];
-  const idx = chain.indexOf(stop);
-  return chain.slice(0, idx + 1).join(" → ") + dim(" (then stop)");
-}
-
-function printPipelineOutcome(
-  result: PipelineResult,
-  opts: {
-    store: ReturnType<typeof openStore>;
-    paths: ReturnType<typeof runPaths>;
-    stopAfter?: StopStage;
-  },
+function printRunOutcome(
+  run: RunRow,
+  stages: DisplayStageRow[],
+  paths: ReturnType<typeof runPaths> | null,
 ) {
   const statusLabel =
-    result.status === "completed"
+    run.status === "completed"
       ? green("✓ completed")
-      : result.status === "planned"
-        ? cyan("◇ planned")
-        : result.status === "killed"
-          ? red("✗ killed")
-          : red("✗ failed");
+      : run.status === "killed"
+        ? red("✗ killed")
+        : red("✗ failed");
   console.log();
   console.log(
-    `${statusLabel}  ${dim("·")}  ${fmtCost(result.costUsd)}  ${dim("·")}  ${fmtDurationMs(result.durationMs)}`,
+    `${statusLabel}  ${dim("·")}  ${fmtCost(run.total_cost_usd)}`,
   );
-  if (result.reason) console.log(dim(`  reason: ${result.reason}`));
-
-  // Compact per-stage breakdown — easier to scan than JSON.
-  const stages = opts.store.listDisplayStages(result.runId);
   if (stages.length > 0) {
     console.log();
     const rows = stages.map((s) => [
@@ -498,21 +1032,10 @@ function printPipelineOutcome(
     ]);
     console.log(renderTable(rows, { alignRight: new Set([3]) }));
   }
-
-  if (opts.stopAfter) {
+  if (run.status === "completed" && paths) {
     console.log();
-    if (opts.stopAfter === "spec") {
-      console.log(`${dim("spec:")} ${opts.paths.spec}`);
-    } else {
-      console.log(`${dim("spec:")}         ${opts.paths.spec}`);
-      console.log(`${dim("architecture:")} ${opts.paths.architecture}`);
-    }
-    console.log(dim(`\nreview those files, then continue with:`));
-    console.log(`  ${cyan(`mill run ${result.runId}`)}`);
-  } else if (result.status === "completed") {
-    console.log();
-    console.log(`${dim("delivery:")} ${opts.paths.delivery}`);
-    console.log(`${dim("workdir:")}  ${opts.paths.workdir}`);
+    console.log(`${dim("delivery:")} ${paths.delivery}`);
+    console.log(`${dim("workdir:")}  ${paths.workdir}`);
   }
 }
 
@@ -537,82 +1060,32 @@ function resolveStopAfter(raw: string | undefined): StopStage | undefined | "err
   return v as StopStage;
 }
 
+// ---------- mill run ----------
+
 async function cmdRun(argv: string[]) {
-  const runId = argv[0];
+  const { positionals } = parseArgs({
+    args: argv,
+    allowPositionals: true,
+    options: {
+      project: { type: "string" }, // accepted but not required (run id is unique)
+    },
+  });
+  const runId = positionals[0];
   if (!runId) {
     console.error("mill run: run-id required");
     process.exitCode = 2;
     return;
   }
   preflightClaude();
-  const config = loadConfig();
-  const store = openStore(config.root);
-  const run = store.getRun(runId);
-  if (!run) {
-    console.error(red(`no run: ${runId}`));
-    process.exitCode = 1;
-    return;
-  }
-  if (run.status === "completed") {
-    console.log(`${green("✓")} ${bold(runId)} ${dim("already completed; nothing to do")}`);
-    return;
-  }
-  if (run.status === "killed") {
-    console.log(`${red("✗")} ${bold(runId)} ${dim("is killed; remove runs/<id>/KILLED to retry")}`);
-    return;
-  }
-  const ctx = await buildContext({ runId, config, store });
-  console.log(`${dim("▸")} resuming ${bold(runId)} ${dim(`(was ${run.status})`)}`);
-  // Flip status back to running so observers (`mill tail -f`, `mill logs -f`,
-  // future web UI) don't see the prior terminal status and exit their
-  // follow loops immediately. Pipeline stages update to completed/failed
-  // at their natural boundaries.
-  if (run.status !== "running") {
-    store.updateRun(runId, { status: "running" });
-  }
-  installInlineAbortHandler(ctx);
-  const ticker = startStageProgressTicker({
-    store,
-    runId,
-    fmtDurationMs,
-    fmtCost,
-    green,
-    red,
-    yellow,
-    dim,
-  });
-  let result: PipelineResult;
-  try {
-    result = await runPipeline({ runId, config, ctx });
-  } finally {
-    ticker.stop();
-  }
-  const paths = runPaths(config.root, runId);
-  printPipelineOutcome(result, { store, paths });
-}
-
-// Hook SIGINT/SIGTERM during an inline pipeline run. First signal aborts the
-// context (propagates SIGTERM → SIGKILL to the claude subprocess via
-// runClaude.onAbort); pipeline.ts catches KilledError and records the run as
-// killed. Second signal gives up and exits immediately.
-function installInlineAbortHandler(ctx: {
-  abortController: AbortController;
-}): void {
-  let firstSignal = true;
-  const handler = (signal: NodeJS.Signals) => {
-    if (firstSignal) {
-      firstSignal = false;
-      process.stderr.write(
-        `\n${signal}: aborting run — send again to force exit\n`,
-      );
-      ctx.abortController.abort();
-      return;
-    }
-    process.stderr.write(`\n${signal} (again): forcing exit\n`);
-    process.exit(130);
-  };
-  process.on("SIGINT", handler);
-  process.on("SIGTERM", handler);
+  const client = new DaemonClient();
+  await client.resumeRun(runId);
+  console.log(`${dim("▸")} resumed ${bold(runId)} ${dim("on the daemon")}`);
+  console.log(
+    `   follow with ${cyan("mill tail " + runId + " -f")} `
+      + `(${dim("Ctrl-C to detach")})`,
+  );
+  console.log();
+  await waitForRunTerminal(runId);
 }
 
 async function promptForAnswers(
@@ -654,12 +1127,15 @@ async function promptForAnswers(
   return answers;
 }
 
+// ---------- mill onboard ----------
+
 async function cmdOnboard(argv: string[]) {
   const { values } = parseArgs({
     args: argv,
     allowPositionals: false,
     options: {
       refresh: { type: "boolean", default: false },
+      project: { type: "string" },
     },
   });
   preflightClaude();
@@ -671,14 +1147,21 @@ async function cmdOnboard(argv: string[]) {
         : "▸ checking for existing profile…",
     ),
   );
-  const result = await onboard({ refresh });
+  // Onboard is a single-shot stage; it runs in-process against the
+  // resolved project. Writes profile.{md,json} into the central
+  // per-project state dir, not into the repo. (Open question 7 in the
+  // plan; "write to the central path immediately" is what we ship.)
+  const cfgOpts = values.project
+    ? { projectIdentifier: values.project }
+    : {};
+  const config = loadConfig(cfgOpts);
+  const result = await onboard({ refresh, root: config.root });
   if (result.cached) {
     console.log(dim("profile already exists. Run `mill onboard --refresh` to rebuild."));
     return;
   }
-  const config = loadConfig();
   console.log(`${green("✓")} profile written`);
-  console.log(dim(`  ${config.root}/.mill/profile.md`));
+  console.log(dim(`  ${config.stateDir}/profile.md`));
   console.log(
     `  ${dim("cost:")} ${fmtCost(result.costUsd)}  ${dim("·")}  ${dim("duration:")} ${fmtDurationMs(result.durationMs)}`,
   );
@@ -692,9 +1175,16 @@ async function cmdOnboard(argv: string[]) {
   console.log(present("typecheck", cmds.typecheck));
 }
 
+// ---------- mill findings ----------
+
 async function cmdFindings(argv: string[]) {
   const sub = argv[0];
   if (sub === "suppress" || sub === "unsuppress") {
+    // Suppression is a write — but it's metadata, not run state. Phase
+    // 1 doesn't have a daemon route for it (the plan's item-6 surface
+    // doesn't list one); we open the central DB directly. Acceptable
+    // because suppressions are append-only and don't race with run
+    // writes.
     const fp = argv[1];
     if (!fp) {
       console.error(`mill findings ${sub}: fingerprint required`);
@@ -706,32 +1196,38 @@ async function cmdFindings(argv: string[]) {
       allowPositionals: false,
       options: { note: { type: "string" } },
     });
-    const config = loadConfig();
-    const store = openStore(config.root);
-    if (sub === "suppress") {
-      store.suppressFingerprint(fp, values.note);
-      console.log(`${green("✓")} suppressed ${dim(fp)}`);
-    } else {
-      store.unsuppressFingerprint(fp);
-      console.log(`${green("✓")} unsuppressed ${dim(fp)}`);
+    const store = openCentralStoreReadOnly();
+    try {
+      if (sub === "suppress") {
+        store.suppressFingerprint(fp, values.note);
+        console.log(`${green("✓")} suppressed ${dim(fp)}`);
+      } else {
+        store.unsuppressFingerprint(fp);
+        console.log(`${green("✓")} unsuppressed ${dim(fp)}`);
+      }
+    } finally {
+      store.close();
     }
     return;
   }
   if (sub === "suppressed") {
-    const config = loadConfig();
-    const store = openStore(config.root);
-    const rows = store.listSuppressedFingerprints();
-    if (rows.length === 0) {
-      console.log(dim("(none)"));
-      return;
+    const store = openCentralStoreReadOnly();
+    try {
+      const rows = store.listSuppressedFingerprints();
+      if (rows.length === 0) {
+        console.log(dim("(none)"));
+        return;
+      }
+      const table: string[][] = [
+        [dim("added"), dim("fingerprint"), dim("note")],
+      ];
+      for (const r of rows) {
+        table.push([dim(relTime(r.added_at)), r.fingerprint, r.note ?? ""]);
+      }
+      console.log(renderTable(table));
+    } finally {
+      store.close();
     }
-    const table: string[][] = [
-      [dim("added"), dim("fingerprint"), dim("note")],
-    ];
-    for (const r of rows) {
-      table.push([dim(relTime(r.added_at)), r.fingerprint, r.note ?? ""]);
-    }
-    console.log(renderTable(table));
     return;
   }
 
@@ -742,119 +1238,187 @@ async function cmdFindings(argv: string[]) {
       all: { type: "boolean", default: false },
       limit: { type: "string", default: "50" },
       "include-suppressed": { type: "boolean", default: false },
+      project: { type: "string" },
     },
   });
-  const config = loadConfig();
-  const store = openStore(config.root);
-  // Default view = recurring (seen in ≥2 runs). --all lowers the gate
-  // to ≥1 so the user can see every distinct fingerprint.
-  const minRuns = values.all ? 1 : 2;
-  const limit = Number(values.limit ?? "50");
-  const entries = store.listLedgerEntries({
-    minRuns,
-    includeSuppressed: Boolean(values["include-suppressed"]),
-    limit,
-  });
-  if (entries.length === 0) {
-    console.log(
-      dim(
-        values.all
-          ? "(no findings on record)"
-          : "(no recurring findings — use --all to see singletons)",
-      ),
-    );
-    return;
-  }
-  const colorSeverity = (s: string) => {
-    if (s === "CRITICAL") return red(bold(s));
-    if (s === "HIGH") return red(s);
-    if (s === "MEDIUM") return yellow(s);
-    return dim(s);
-  };
-  const header = [dim("runs"), dim("sev"), dim("critic"), dim("last"), dim("title")];
-  const table: string[][] = [header];
-  for (const e of entries) {
-    const title = e.suppressed ? `${e.title} ${dim("(suppressed)")}` : e.title;
-    table.push([
-      String(e.runCount),
-      colorSeverity(e.severity),
-      e.critic,
-      dim(relTime(e.lastSeen)),
-      title,
-    ]);
-  }
-  console.log(renderTable(table, { alignRight: new Set([0]) }));
-  console.log();
-  for (const e of entries) {
-    console.log(`  ${dim("fp")} ${dim(e.fingerprint)}`);
-    if (e.exampleDetailPath) console.log(`     ${dim("↳ " + e.exampleDetailPath)}`);
-  }
-}
-
-async function cmdHistory() {
-  const config = loadConfig();
-  const body = await readJournal(config.root);
-  if (!body.trim()) {
-    console.log("(no journal yet)");
-    console.log(`will be written to: ${journalPath(config.root)}`);
-    return;
-  }
-  process.stdout.write(body.endsWith("\n") ? body : body + "\n");
-}
-
-async function cmdStatus(argv: string[]) {
-  const config = loadConfig();
-  const store = openStore(config.root);
-  const runId = argv[0];
-  if (!runId) {
-    const info = readProjectInfo(config.root);
-    if (info) {
-      console.log(`${dim("project:")} ${bold(info.name)} ${dim(config.root)}`);
-      console.log();
-    }
-    const rows = store.listRuns({ limit: 20 });
-    if (rows.length === 0) {
-      console.log(dim("(no runs yet — try `mill new \"...\"`)"));
+  // AC-8: read-only, must work without the daemon. Open the DB
+  // directly and run the same listLedgerEntries the daemon would.
+  const store = openCentralStoreReadOnly();
+  try {
+    const minRuns = values.all ? 1 : 2;
+    const limit = Number(values.limit ?? "50");
+    const entries = store.listLedgerEntries({
+      minRuns,
+      includeSuppressed: Boolean(values["include-suppressed"]),
+      limit,
+    });
+    if (entries.length === 0) {
+      console.log(
+        dim(
+          values.all
+            ? "(no findings on record)"
+            : "(no recurring findings — use --all to see singletons)",
+        ),
+      );
       return;
     }
-    const header = [
-      dim("id"),
-      dim("status"),
-      dim("mode"),
-      dim("kind"),
-      dim("cost"),
-      dim("created"),
-    ];
-    const table = [header];
-    for (const r of rows) {
+    const colorSeverity = (s: string) => {
+      if (s === "CRITICAL") return red(bold(s));
+      if (s === "HIGH") return red(s);
+      if (s === "MEDIUM") return yellow(s);
+      return dim(s);
+    };
+    const header = [dim("runs"), dim("sev"), dim("critic"), dim("last"), dim("title")];
+    const table: string[][] = [header];
+    for (const e of entries) {
+      const title = e.suppressed ? `${e.title} ${dim("(suppressed)")}` : e.title;
       table.push([
-        r.id,
-        colorRunStatus(r.status),
-        r.mode ?? "new",
-        r.kind ?? dim("—"),
-        fmtCost(r.total_cost_usd),
-        dim(relTime(r.created_at)),
+        String(e.runCount),
+        colorSeverity(e.severity),
+        e.critic,
+        dim(relTime(e.lastSeen)),
+        title,
       ]);
     }
-    console.log(renderTable(table, { alignRight: new Set([4]) }));
-    return;
+    console.log(renderTable(table, { alignRight: new Set([0]) }));
+    console.log();
+    for (const e of entries) {
+      console.log(`  ${dim("fp")} ${dim(e.fingerprint)}`);
+      if (e.exampleDetailPath) console.log(`     ${dim("↳ " + e.exampleDetailPath)}`);
+    }
+  } finally {
+    store.close();
   }
-  const run = store.getRun(runId);
-  if (!run) {
-    console.error(red(`no run: ${runId}`));
-    process.exitCode = 1;
-    return;
-  }
-  const stages = store.listDisplayStages(runId);
-  renderRunHeader(run);
-  console.log();
-  renderStageTable(stages, store, runId);
 }
 
-function renderRunHeader(run: RunRow) {
+// ---------- mill history ----------
+
+async function cmdHistory(argv: string[]) {
+  const { values } = parseArgs({
+    args: argv,
+    allowPositionals: false,
+    options: { project: { type: "string" } },
+  });
+  const store = openCentralStoreReadOnly();
+  try {
+    const project = resolveProjectForRead(store, values.project);
+    if (!project) {
+      console.error(
+        `${red("mill:")} no project resolved (cwd or --project). ` +
+          `Run \`mill project ls\` to see registered projects.`,
+      );
+      process.exitCode = 1;
+      return;
+    }
+    const stateDir = projectStateDir(project.id);
+    const body = await readJournal(stateDir);
+    if (!body.trim()) {
+      console.log("(no journal yet)");
+      console.log(`will be written to: ${journalPath(stateDir)}`);
+      return;
+    }
+    process.stdout.write(body.endsWith("\n") ? body : body + "\n");
+  } finally {
+    store.close();
+  }
+}
+
+// ---------- mill status ----------
+
+async function cmdStatus(argv: string[]) {
+  const { values, positionals } = parseArgs({
+    args: argv,
+    allowPositionals: true,
+    options: {
+      project: { type: "string" },
+      all: { type: "boolean", default: false },
+    },
+  });
+  const store = openCentralStoreReadOnly();
+  try {
+    const runId = positionals[0];
+    if (!runId) {
+      // No run id: list mode. Honor --project (or cwd resolution) to
+      // scope to one project, otherwise fall back to a cross-project
+      // listing — the user with no project registered should still see
+      // mill is alive.
+      const project = resolveProjectForRead(store, values.project);
+      if (project) {
+        console.log(`${dim("project:")} ${bold(project.name)} ${dim(project.id)}`);
+        console.log(dim(`  ${project.root_path}`));
+        console.log();
+      } else if (!values.all) {
+        console.log(
+          dim(
+            "no project resolved from cwd. Showing all runs — use `--project <id>` to scope.",
+          ),
+        );
+        console.log();
+      }
+      const listOpts: { limit: number; projectId?: string } = { limit: 20 };
+      if (project) listOpts.projectId = project.id;
+      const rows = store.listRuns(listOpts);
+      if (rows.length === 0) {
+        console.log(dim("(no runs yet — try `mill new \"...\"`)"));
+        return;
+      }
+      const showProjectCol = !project; // cross-project view → include id
+      const header = [
+        dim("id"),
+        ...(showProjectCol ? [dim("project")] : []),
+        dim("status"),
+        dim("mode"),
+        dim("kind"),
+        dim("cost"),
+        dim("created"),
+      ];
+      const table = [header];
+      for (const r of rows) {
+        const projectCell: string[] = showProjectCol
+          ? [r.project_id ?? dim("—")]
+          : [];
+        table.push([
+          r.id,
+          ...projectCell,
+          colorRunStatus(r.status),
+          r.mode ?? "new",
+          r.kind ?? dim("—"),
+          fmtCost(r.total_cost_usd),
+          dim(relTime(r.created_at)),
+        ]);
+      }
+      console.log(
+        renderTable(table, {
+          alignRight: new Set([showProjectCol ? 5 : 4]),
+        }),
+      );
+      return;
+    }
+    const run = store.getRun(runId);
+    if (!run) {
+      console.error(red(`no run: ${runId}`));
+      process.exitCode = 1;
+      return;
+    }
+    const stages = store.listDisplayStages(runId);
+    renderRunHeader(run, store);
+    console.log();
+    renderStageTable(stages, store, runId);
+  } finally {
+    store.close();
+  }
+}
+
+function renderRunHeader(run: RunRow, store: StateStore) {
   const runTokens = totalTokens(run);
   console.log(`${bold("run")} ${bold(run.id)}`);
+  const project =
+    run.project_id ? store.getProject(run.project_id) : null;
   const rows: string[][] = [
+    [
+      dim("  project"),
+      project ? `${project.name} ${dim(project.id)}` : dim("—"),
+    ],
     [dim("  status"), colorRunStatus(run.status)],
     [dim("  mode"), run.mode ?? "new"],
     [dim("  kind"), run.kind ?? "—"],
@@ -870,17 +1434,13 @@ function renderRunHeader(run: RunRow) {
 
 function renderStageTable(
   stages: DisplayStageRow[],
-  store?: ReturnType<typeof openStore>,
-  runId?: string,
+  store: StateStore | undefined,
+  runId: string | undefined,
 ) {
   if (stages.length === 0) {
     console.log(dim("(no stages yet)"));
     return;
   }
-  // Per-iteration HIGH+ finding counts let the user see at a glance
-  // *which* review iteration found what — review#1 might have flagged
-  // 5 issues, review#3 only 2. Looked up once and cached so the table
-  // doesn't fan out one DB call per row.
   const highByIter = new Map<number, number>();
   if (store && runId && stages.some((s) => s.name === "review")) {
     for (const f of store.listFindings(runId)) {
@@ -934,7 +1494,6 @@ function stageNote(
   return "";
 }
 
-// Format token counts for the compact per-stage column: 1.2k, 342, 4.8M, etc.
 function compactTokens(n: number): string {
   if (!Number.isFinite(n) || n <= 0) return "0";
   if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
@@ -960,15 +1519,14 @@ function totalTokens(r: {
   );
 }
 
+// ---------- mill logs / mill tail ----------
+
 async function cmdLogs(argv: string[]) {
   const { values, positionals } = parseArgs({
     args: argv,
     allowPositionals: true,
     options: {
       follow: { type: "boolean", short: "f", default: false },
-      // --raw / --json emit the unmodified payload JSON per line (NDJSON),
-      // i.e. exactly what the `claude` subprocess streamed. Useful for
-      // piping into jq or diffing across runs.
       raw: { type: "boolean", default: false },
       json: { type: "boolean", default: false },
       after: { type: "string" },
@@ -982,49 +1540,46 @@ async function cmdLogs(argv: string[]) {
     return;
   }
   const raw = Boolean(values.raw || values.json);
-  const config = loadConfig();
-  const store = openStore(config.root);
-  let after = values.after ? Number(values.after) : 0;
-  const limit = Number(values.limit ?? "200");
+  const store = openCentralStoreReadOnly();
+  try {
+    let after = values.after ? Number(values.after) : 0;
+    const limit = Number(values.limit ?? "200");
 
-  const dump = () => {
-    const events = store.tailEvents(runId, after, limit);
-    for (const e of events) {
-      if (raw) {
-        // payload_json is the stream-json line from the `claude` subprocess,
-        // wrapped as-is. Emit it verbatim so downstream jq parses it.
-        process.stdout.write(e.payload_json + "\n");
-      } else {
-        const payload = safeParse(e.payload_json);
-        const line = compactEvent(e.ts, e.stage, e.kind, payload);
-        console.log(line);
+    const dump = () => {
+      const events = store.tailEvents(runId, after, limit);
+      for (const e of events) {
+        if (raw) {
+          process.stdout.write(e.payload_json + "\n");
+        } else {
+          const payload = safeParse(e.payload_json);
+          const line = compactEvent(e.ts, e.stage, e.kind, payload);
+          console.log(line);
+        }
+        after = e.id;
       }
-      after = e.id;
-    }
-  };
+    };
 
-  dump();
-  if (!values.follow) return;
-
-  // Poll every second until the process is interrupted. Only exit when
-  // we've seen two consecutive "terminal & no new events" reads — this
-  // tolerates starting against a stale terminal status while a resume
-  // is spinning up (cmdRun flips status to running, but there's a race).
-  let quietTicks = 0;
-  // eslint-disable-next-line no-constant-condition
-  while (true) {
-    await sleep(1000);
-    const run = store.getRun(runId);
-    const before = after;
     dump();
-    const gotEvents = after !== before;
-    const terminal =
-      !!run && (run.status === "completed" || run.status === "failed" || run.status === "killed");
-    if (terminal && !gotEvents) {
-      if (++quietTicks >= 2) break;
-    } else {
-      quietTicks = 0;
+    if (!values.follow) return;
+
+    let quietTicks = 0;
+    // eslint-disable-next-line no-constant-condition
+    while (true) {
+      await sleep(1000);
+      const run = store.getRun(runId);
+      const before = after;
+      dump();
+      const gotEvents = after !== before;
+      const terminal =
+        !!run && (run.status === "completed" || run.status === "failed" || run.status === "killed");
+      if (terminal && !gotEvents) {
+        if (++quietTicks >= 2) break;
+      } else {
+        quietTicks = 0;
+      }
     }
+  } finally {
+    store.close();
   }
 }
 
@@ -1045,72 +1600,68 @@ async function cmdTail(argv: string[]) {
     process.exitCode = 2;
     return;
   }
-  const config = loadConfig();
-  const store = openStore(config.root);
-  const run = store.getRun(runId);
-  if (!run) {
-    console.error(`no run: ${runId}`);
-    process.exitCode = 1;
-    return;
-  }
-  const paths = runPaths(config.root, runId);
-  let after = values.after ? Number(values.after) : 0;
-  let lastStage = "";
-
-  const dump = () => {
-    const events = store.tailEvents(runId, after, 500);
-    for (const e of events) {
-      if (e.stage !== lastStage) {
-        process.stdout.write(`\n${dim("──")} ${bold(e.stage)} ${dim("──")}\n`);
-        lastStage = e.stage;
-      }
-      const payload = safeParse(e.payload_json);
-      const line = renderTailLine(e.kind, payload, paths.workdir, tailOpts);
-      if (line !== null) process.stdout.write(line + "\n");
-      after = e.id;
+  const store = openCentralStoreReadOnly();
+  try {
+    const run = store.getRun(runId);
+    if (!run) {
+      console.error(`no run: ${runId}`);
+      process.exitCode = 1;
+      return;
     }
-  };
+    const project = run.project_id ? store.getProject(run.project_id) : null;
+    const paths = project ? runPaths(project.root_path, runId) : null;
+    let after = values.after ? Number(values.after) : 0;
+    let lastStage = "";
 
-  dump();
-  if (!values.follow) return;
+    const dump = () => {
+      const events = store.tailEvents(runId, after, 500);
+      for (const e of events) {
+        if (e.stage !== lastStage) {
+          process.stdout.write(`\n${dim("──")} ${bold(e.stage)} ${dim("──")}\n`);
+          lastStage = e.stage;
+        }
+        const payload = safeParse(e.payload_json);
+        const workdir = paths?.workdir ?? "";
+        const line = renderTailLine(e.kind, payload, workdir, tailOpts);
+        if (line !== null) process.stdout.write(line + "\n");
+        after = e.id;
+      }
+    };
 
-  // Only exit when we've seen two consecutive "terminal & no new events"
-  // reads — tolerates starting against a stale terminal status while a
-  // resume is spinning up.
-  let quietTicks = 0;
-  // eslint-disable-next-line no-constant-condition
-  while (true) {
-    await sleep(1000);
-    const r = store.getRun(runId);
-    const before = after;
     dump();
-    const gotEvents = after !== before;
-    const terminal =
-      !!r && (r.status === "completed" || r.status === "failed" || r.status === "killed");
-    if (terminal && !gotEvents) {
-      if (++quietTicks >= 2) {
-        const marker = r.status === "completed" ? green("✓") : red("✗");
-        process.stdout.write(
-          `\n${marker} run ${colorRunStatus(r.status)}  ${dim("·")}  total ${fmtCost(r.total_cost_usd)}\n`,
-        );
-        break;
+    if (!values.follow) return;
+
+    let quietTicks = 0;
+    // eslint-disable-next-line no-constant-condition
+    while (true) {
+      await sleep(1000);
+      const r = store.getRun(runId);
+      const before = after;
+      dump();
+      const gotEvents = after !== before;
+      const terminal =
+        !!r && (r.status === "completed" || r.status === "failed" || r.status === "killed");
+      if (terminal && !gotEvents) {
+        if (++quietTicks >= 2) {
+          const marker = r.status === "completed" ? green("✓") : red("✗");
+          process.stdout.write(
+            `\n${marker} run ${colorRunStatus(r.status)}  ${dim("·")}  total ${fmtCost(r.total_cost_usd)}\n`,
+          );
+          break;
+        }
+      } else {
+        quietTicks = 0;
       }
-    } else {
-      quietTicks = 0;
     }
+  } finally {
+    store.close();
   }
 }
 
 interface TailOpts {
-  // Verbose mode shows the model's text in full (no 140-char clip),
-  // includes thinking blocks, prints full tool inputs/results. Default
-  // off because the unabridged stream is noisy during long implement
-  // stages; -v on demand is usually what you want.
   verbose: boolean;
 }
 
-// Translate one SDK message (already JSON-parsed) into a human-readable line.
-// Returns null to suppress (e.g. rate-limit heartbeats).
 function renderTailLine(
   kind: string,
   payload: unknown,
@@ -1167,8 +1718,6 @@ function renderTailLine(
           lines.push(dim(`  │ ${clipped}`));
         }
       } else if (cc.type === "thinking") {
-        // Only surface thinking in verbose — it's long and rarely worth
-        // reading at a glance.
         if (!opts.verbose) continue;
         const text = typeof cc.thinking === "string" ? cc.thinking.trim() : "";
         if (text) lines.push(indent(text, `  ${dim("~")} `));
@@ -1271,9 +1820,6 @@ function extractToolResultText(content: unknown, preserveWhitespace = false): st
   return "";
 }
 
-// Prefix every line of `text` with `prefix`. Used in verbose tail to keep
-// multi-line assistant text / tool results visually grouped under the
-// event they belong to.
 function indent(text: string, prefix: string): string {
   return text
     .split("\n")
@@ -1281,11 +1827,6 @@ function indent(text: string, prefix: string): string {
     .join("\n");
 }
 
-// Verbose tool-input formatter. For the tools we know (Read/Write/Edit/
-// Bash/Glob/Grep) emit the human-meaningful field(s); fall back to
-// pretty-printed JSON for everything else. Long content (file bodies
-// inside Write.content, large strings) gets soft-capped so one mega
-// event doesn't flood the terminal.
 function formatToolInputFull(input: unknown, workdir: string): string {
   if (!input || typeof input !== "object") return "";
   const i = input as Record<string, unknown>;
@@ -1307,13 +1848,14 @@ function formatToolInputFull(input: unknown, workdir: string): string {
   if (typeof i.prompt === "string") pushKV("prompt", cap(i.prompt, 600));
 
   if (lines.length > 0) return lines.join("\n");
-  // Unknown tool shape — dump JSON.
   try {
     return cap(JSON.stringify(i, null, 2));
   } catch {
     return "";
   }
 }
+
+// ---------- mill kill ----------
 
 async function cmdKill(argv: string[]) {
   const runId = argv[0];
@@ -1322,19 +1864,10 @@ async function cmdKill(argv: string[]) {
     process.exitCode = 2;
     return;
   }
-  const config = loadConfig();
-  const store = openStore(config.root);
-  const run = store.getRun(runId);
-  if (!run) {
-    console.error(`no run: ${runId}`);
-    process.exitCode = 1;
-    return;
-  }
-  const paths = runPaths(config.root, runId);
-  await writeFile(paths.killed, `killed at ${new Date().toISOString()}\n`, "utf8");
-  store.updateRun(runId, { status: "killed" });
+  const client = new DaemonClient();
+  const out = await client.killRun(runId);
   console.log(`${red("✗")} kill sentinel written for ${bold(runId)}`);
-  console.log(dim(`  ${paths.killed}`));
+  console.log(dim(`  ${out.killed_path}`));
   console.log(dim("  run stops on the next tool call inside the claude subprocess."));
 }
 
@@ -1369,4 +1902,3 @@ main().catch((err) => {
   console.error(`${red("mill error:")} ${err instanceof Error ? err.message : String(err)}`);
   process.exit(1);
 });
-

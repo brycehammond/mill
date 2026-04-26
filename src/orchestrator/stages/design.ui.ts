@@ -28,9 +28,9 @@ const UiDesignSchema = zodToJsonSchema(UiDesignOutput);
 
 export async function designUi(ctx: RunContext): Promise<StageResult> {
   const specBody = await readFile(ctx.paths.spec, "utf8");
-  const journal = await readJournalTail(ctx.root, 20);
-  const decisionsBlock = await readDecisionsTail(ctx.root, 10);
-  const profile = await readProfileSummary(ctx.root);
+  const journal = await readJournalTail(ctx.stateDir, 20);
+  const decisionsBlock = await readDecisionsTail(ctx.stateDir, 10);
+  const profile = await readProfileSummary(ctx.stateDir);
   const profileBlock = profile ? `## Repo profile\n\n${profile}\n` : "";
 
   // Reuse mode: edit-mode runs that find a prior `.mill/stitch.json`
@@ -39,7 +39,7 @@ export async function designUi(ctx: RunContext): Promise<StageResult> {
   // needed to confirm/recover from a stale URL. New mode and edit-mode
   // first runs (no prior ref) take the original create-from-scratch
   // path. Stale-URL recovery is the model's job — see design-ui-edit.md.
-  const existingRef = await readStitchRef(ctx.root);
+  const existingRef = await readStitchRef(ctx.stateDir);
   const reuseMode = ctx.mode === "edit" && existingRef !== null;
   const promptName = reuseMode ? "design-ui-edit" : "design-ui";
   const systemPrompt = await loadPrompt(promptName);
@@ -103,7 +103,7 @@ export async function designUi(ctx: RunContext): Promise<StageResult> {
     // run state catches the latest URL even if writing the per-run
     // file later fails for unrelated reasons.
     try {
-      await writeStitchRef(ctx.root, {
+      await writeStitchRef(ctx.stateDir, {
         projectUrl: parsed.stitch_url.trim(),
         lastRunId: ctx.runId,
         updatedAt: new Date().toISOString(),

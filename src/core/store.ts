@@ -4,14 +4,13 @@ export type { StateStore } from "./types.js";
 
 import { SqliteStateStore } from "./store.sqlite.js";
 import type { StateStore } from "./types.js";
-import { projectDbPath } from "./project.js";
+import { centralDbPath } from "./paths.js";
 
-// `root` is the project root (directory containing `.mill/`). The DB
-// lives at `.mill/mill.db`; callers should have already run
-// `mill init` to create it (SqliteStateStore.init() then lays down the
-// schema idempotently).
-export function openStore(root: string): StateStore {
-  const path = projectDbPath(root);
+// Open a SqliteStateStore at the given DB path. Phase 1 of multi-project
+// mill: the canonical mill DB lives at `~/.mill/mill.db`. Pass either an
+// explicit path (tests, migration tools) or omit to use the central DB.
+export function openStore(dbPath?: string): StateStore {
+  const path = dbPath ?? centralDbPath();
   const s = new SqliteStateStore(path);
   s.init();
   return s;

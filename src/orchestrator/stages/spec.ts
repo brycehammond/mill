@@ -24,9 +24,9 @@ export async function spec(ctx: RunContext): Promise<StageResult> {
       throw new Error("clarifications missing user answers");
     }
 
-    const journal = await readJournalTail(ctx.root, 20);
-    const decisionsBlock = await readDecisionsTail(ctx.root, 10);
-    const profile = await readProfileSummary(ctx.root);
+    const journal = await readJournalTail(ctx.stateDir, 20);
+    const decisionsBlock = await readDecisionsTail(ctx.stateDir, 10);
+    const profile = await readProfileSummary(ctx.stateDir);
     const profileBlock = profile ? `## Repo profile\n\n${profile}\n` : "";
     const ledgerBlock =
       ctx.mode === "edit" ? renderLedgerHint(ctx.store, { limit: 5 }) : "";

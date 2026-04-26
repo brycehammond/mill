@@ -19,6 +19,10 @@ export interface IntakeArgs {
   root: string;
   store: StateStore;
   mode: RunMode;
+  // Owning project — required so the run row is correctly attributed
+  // in the central registry. Caller (CLI / daemon) is responsible for
+  // resolving the project before calling intake.
+  projectId: string;
 }
 
 export interface IntakeResult {
@@ -63,6 +67,7 @@ export async function intake(args: IntakeArgs): Promise<IntakeResult> {
 
   args.store.createRun({
     id: runId,
+    project_id: args.projectId,
     status: "queued",
     kind: null,
     mode,

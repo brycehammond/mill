@@ -63,7 +63,7 @@ export async function decisions(args: DecisionsArgs): Promise<StageResult> {
 
     const findings = ctx.store.listFindings(ctx.runId);
     const commits = await readBranchCommits(ctx);
-    const priorBlock = await readDecisionsTail(ctx.root, 10);
+    const priorBlock = await readDecisionsTail(ctx.stateDir, 10);
 
     const prompt = buildPrompt({
       runId: ctx.runId,
@@ -110,7 +110,7 @@ export async function decisions(args: DecisionsArgs): Promise<StageResult> {
     }));
 
     if (entries.length > 0) {
-      await appendDecisionEntries(ctx.root, entries);
+      await appendDecisionEntries(ctx.stateDir, entries);
     }
 
     // cost, usage, and session are persisted incrementally by runClaude.

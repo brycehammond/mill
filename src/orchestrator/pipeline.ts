@@ -103,40 +103,24 @@ export async function runPipeline(args: RunPipelineArgs): Promise<PipelineResult
     }
 
     // 4. implement ⇄ review loop
-    let iteration = 0;
     let previousHigh: Finding[] = [];
     let currentHigh: Finding[] = [];
     let allHigh: Finding[] = [];
     let stopReason = "";
 
-    // Resume awareness: if a prior `mill run` got partway through this
-    // loop, the implement stage row is already `completed` and we have
-    // findings persisted for one or more iterations. Re-running
-    // implement for an iteration we already completed is wasted spend;
-    // skip ahead to the iteration that actually needs work. We use the
-    // findings table as the source of truth — the highest iteration
-    // with any finding rows is the iteration whose review ran.
-    const persistedHighestIter = highestIterationWithFindings(ctx);
-    if (persistedHighestIter > 0) {
+    // Resume awareness: when a prior `mill run` got partway through, the
+    // sibling per-iteration rows in `stage_iterations` tell us exactly
+    // which iterations completed. We resume from the iteration after
+    // the last fully-completed `review` row. Old runs without sibling
+    // data fall back to `highestIterationWithFindings`.
+    let iteration = resumeIteration(ctx);
+    if (iteration > 0) {
       ctx.logger.info("review loop resume: skipping completed iterations", {
-        iterations: persistedHighestIter,
+        iterations: iteration,
       });
-      iteration = persistedHighestIter;
-      // Seed previousHigh from the highest-iteration findings so the
+      // Seed previousHigh from the resume-iteration findings so the
       // next implement call gets the right prior-findings prompt.
-      previousHigh = ctx.store
-        .listFindings(ctx.runId, { iteration: persistedHighestIter })
-        .filter((f) => atLeast(f.severity, "HIGH"))
-        .map((f) => ({
-          critic: f.critic,
-          severity: f.severity,
-          title: f.title,
-          // Detail body isn't persisted on the row; the next implement
-          // doesn't need it (the title + severity + critic is what
-          // shows up in its prompt anyway).
-          evidence: "",
-          suggested_fix: "",
-        }));
+      previousHigh = findingsAtIterationAsHigh(ctx, iteration);
       currentHigh = previousHigh;
       allHigh = currentHigh;
     }
@@ -145,15 +129,35 @@ export async function runPipeline(args: RunPipelineArgs): Promise<PipelineResult
       iteration += 1;
       ctx.logger.info("implement iteration", { iteration });
 
-      const implResult = await implement({
-        ctx,
+      // Per-iteration crash recovery: if a previous run already
+      // completed implement#N and review#N, skip them on this resume.
+      // implement#N completed but review#N didn't → resume from review.
+      const implRow = ctx.store.getStageIteration(
+        ctx.runId,
+        "implement",
         iteration,
-        priorFindings: previousHigh,
-      });
-      throwIfKilledOrBroken(ctx, implResult, `implement-${iteration}`);
+      );
+      if (!implRow || implRow.status !== "completed") {
+        const implResult = await implement({
+          ctx,
+          iteration,
+          priorFindings: previousHigh,
+        });
+        throwIfKilledOrBroken(ctx, implResult, `implement-${iteration}`);
+      }
 
-      const revResult = await review({ ctx, iteration });
-      throwIfKilledOrBroken(ctx, revResult, `review-${iteration}`);
+      const revRow = ctx.store.getStageIteration(
+        ctx.runId,
+        "review",
+        iteration,
+      );
+      let revResult: Awaited<ReturnType<typeof review>>;
+      if (!revRow || revRow.status !== "completed") {
+        revResult = await review({ ctx, iteration });
+        throwIfKilledOrBroken(ctx, revResult, `review-${iteration}`);
+      } else {
+        revResult = rebuildReviewResultFromFindings(ctx, iteration);
+      }
       currentHigh = revResult.data.highFindings;
       allHigh = currentHigh;
 
@@ -251,15 +255,71 @@ function throwIfKilledOrBroken(
   }
 }
 
-// Highest iteration number that has any persisted findings. Used to
-// resume the implement⇄review loop without re-running iterations whose
-// review already produced findings on disk. Returns 0 when the loop
-// hasn't started yet.
+// Highest iteration number that has any persisted findings. Kept as a
+// fallback for resuming runs that predate the per-iteration `stage_iterations`
+// table — in current runs, `resumeIteration` prefers those rows. Returns 0
+// when no findings have been written.
 function highestIterationWithFindings(ctx: RunContext): number {
   const all = ctx.store.listFindings(ctx.runId);
   let max = 0;
   for (const f of all) if (f.iteration > max) max = f.iteration;
   return max;
+}
+
+// Highest iteration where the `review` row reached `completed`. The
+// loop resumes from this number — the next pass increments it before
+// checking implement#N+1. Falls back to findings-based detection so
+// runs that started before this feature shipped still resume cleanly.
+function resumeIteration(ctx: RunContext): number {
+  const reviews = ctx.store.listStageIterations(ctx.runId, "review");
+  let max = 0;
+  for (const r of reviews) {
+    if (r.status === "completed" && r.iteration > max) max = r.iteration;
+  }
+  if (max > 0) return max;
+  return highestIterationWithFindings(ctx);
+}
+
+// Reconstruct just enough of a ReviewOutput from the findings table to
+// re-evaluate `shouldStopReviewLoop` on resume. The full ReviewOutput
+// (summaries, reportPaths, cost) isn't needed downstream — only
+// highFindings drives the loop's stop decision and the next implement's
+// prior-findings prompt.
+function rebuildReviewResultFromFindings(
+  ctx: RunContext,
+  iteration: number,
+): Awaited<ReturnType<typeof review>> {
+  const highFindings = findingsAtIterationAsHigh(ctx, iteration);
+  return {
+    ok: true,
+    cost: 0,
+    data: {
+      findings: highFindings,
+      highFindings,
+      summaries: [],
+      cost: 0,
+      reportPaths: [],
+    },
+  };
+}
+
+function findingsAtIterationAsHigh(
+  ctx: RunContext,
+  iteration: number,
+): Finding[] {
+  return ctx.store
+    .listFindings(ctx.runId, { iteration })
+    .filter((f) => atLeast(f.severity, "HIGH"))
+    .map((f) => ({
+      critic: f.critic,
+      severity: f.severity,
+      title: f.title,
+      // Detail body isn't persisted on the row; the next implement
+      // doesn't need it — the title + severity + critic is what shows
+      // up in its prompt anyway.
+      evidence: "",
+      suggested_fix: "",
+    }));
 }
 
 function needsStage(ctx: RunContext, name: Parameters<typeof ctx.store.getStage>[1]): boolean {

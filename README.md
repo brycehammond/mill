@@ -39,12 +39,24 @@ npm link                # puts `mill` on your PATH
 mill --help
 ```
 
-Per-repo init — creates `.mill/` at the git root:
+Start the daemon (it owns run execution, exposes a localhost HTTP
+API the CLI talks to, and serves the web UI from the same port) and
+register a repo:
 
 ```sh
+mill daemon start                  # binds 127.0.0.1:7333; pidfile at ~/.mill/daemon.pid
+                                   # UI at http://127.0.0.1:7333/
 cd /path/to/your/repo
-mill init
+mill project add                   # registers cwd in the central registry at ~/.mill/
 ```
+
+Pass `--open` to launch the dashboard in your browser, or `--no-ui`
+for an API-only daemon (CI, headless servers).
+
+`mill project add` is idempotent and migrates any existing per-repo
+`.mill/mill.db` into the central DB on first registration (legacy file
+is renamed to `.mill/mill.db.legacy-<ts>`, never deleted). `mill init`
+is kept as a deprecated alias.
 
 Requires Node ≥ 22. `claude` handles auth via its own login flow
 (subscription or workspace); mill scrubs `ANTHROPIC_API_KEY` /
@@ -54,11 +66,25 @@ API key in your shell can't accidentally route billing through the API.
 ## Usage
 
 ```sh
-# Start a new run. Prompts clarifying questions inline, then runs dark.
-# Stages stream their progress to stdout as they transition (▸ start,
-# ✓ ok, ✗ failed, ⊘ skipped) — close the terminal whenever; the run
-# keeps going if you started a worker (`mill new --detach`), or you
-# can resume an interrupted run with `mill run <id>`.
+# Daemon — owns run execution; CLI mutating commands talk to it over
+# localhost HTTP. Read-only commands (status, tail, logs, history,
+# findings, project ls) work even when the daemon is down.
+mill daemon start                   # detached; pidfile at ~/.mill/daemon.pid
+mill daemon start --foreground      # run in this shell for development
+mill daemon status
+mill daemon stop                    # SIGTERM, drains in-flight runs
+
+# Projects — first-class entities in the central registry at ~/.mill/.
+mill project add [<path>]           # default cwd; idempotent; migrates legacy .mill/
+mill project ls
+mill project show <id>
+mill project rm <id> [--yes]
+
+# Start a new run from inside a registered repo. Pass --project <id> from
+# anywhere else. Prompts clarifying questions inline, then runs dark.
+# Stages stream progress (▸ start, ✓ ok, ✗ failed, ⊘ skipped). Close the
+# terminal anytime — the daemon keeps the run going; resume polling with
+# `mill tail <id> -f`.
 mill new "TypeScript CLI that converts markdown to minified HTML"
 
 # Edit-mode run on an existing repo (auto-detected when the repo has
@@ -72,24 +98,70 @@ mill new "refactor the auth middleware" --mode edit
 # Resume with `mill run <id>` to continue.
 mill new "..." --stop-after design
 
-# Resume a partially-completed run (crash recovery, or after --stop-after)
+# Resume a partially-completed run (crash recovery, or after --stop-after).
 mill run <run-id>
 
-# Inspect state
+# Inspect state (daemon-optional).
 mill status [<run-id>]
 mill tail   <run-id> --follow   # human-readable activity stream
 mill logs   <run-id> --follow   # raw events
 mill kill   <run-id>
 
-# Cross-run memory
-mill history                    # print .mill/journal.md
+# Cross-run memory (per-project; lives at ~/.mill/projects/<id>/).
+mill history [--project <id>]   # print the project journal
 mill findings                   # recurring findings across runs
 mill findings suppress <fp>     # silence a known false positive
 mill onboard                    # profile the repo for future runs
-
-# Long-running worker that picks up queued runs (from the mill checkout)
-npm run worker
 ```
+
+The repo-local `<repo>/.mill/runs/<id>/workdir/` directory still exists
+— that's where the per-run sandboxed workdir lives so Claude Code's
+CLAUDE.md auto-discovery and the `git worktree add` flow keep working.
+Management state (DB, journal, decisions, profile, stitch) all moved to
+`~/.mill/`.
+
+## Web UI
+
+Once the daemon is running, the same port serves a small React SPA at
+`http://127.0.0.1:7333/`. Four screens cover the CLI's surface:
+
+- **Dashboard** — cross-project rollup: today's cost, MTD cost, runs
+  in flight, per-project cards, top recurring findings.
+- **Project view** (`/projects/:id`) — start a new run from a textarea
+  (with the same clarification questions the CLI asks), browse the
+  project's runs, and see its scoped findings ledger.
+- **Run view** (`/runs/:id`) — live SSE-streamed activity feed, stage
+  timeline, kill button, per-stage cost breakdown. Reconnects use the
+  browser's native `Last-Event-ID` replay so no frames are dropped on
+  network blips.
+- **Findings ledger** (`/findings`) — cross-project recurring findings
+  with one-click suppress / unsuppress. Suppressed entries persist in
+  the central DB and the same fingerprints disappear from
+  `mill findings`.
+
+The bind is loopback-only and there's no auth — anyone who can run the
+CLI on this host can already drive mill. Treat it like the Hono API:
+fine for solo / shared-laptop use, not appropriate for shared servers
+without a reverse proxy that adds auth.
+
+### Hacking on the UI
+
+In dev, run Vite's dev server alongside the daemon (don't let the
+daemon serve stale static files):
+
+```sh
+# terminal 1
+MILL_DEV=1 mill daemon start --foreground
+
+# terminal 2
+cd web && npm run dev               # Vite at http://localhost:5173
+```
+
+Vite proxies `/api`, `/healthz`, `/projects`, `/runs`, `/findings` to
+the daemon, so HMR keeps working while the API calls go to the real
+server. `npm run build` at the repo root builds both the daemon JS
+(`dist/`) and the UI bundle (`dist/web/`); the npm artifact ships
+both.
 
 ## How it works
 
@@ -182,18 +254,19 @@ default; set `MILL_ADVERSARIAL_REVIEW=off` to disable, or `=on` to require it
 
 ## Cross-run memory
 
-Files under `.mill/` feed future runs by being auto-injected into stage
-prompts or consulted by the orchestrator before it picks a prompt:
+Per-project state lives centrally at `~/.mill/projects/<project-id>/`
+and is auto-injected into stage prompts (or consulted by the
+orchestrator before it picks a prompt):
 
-- **`.mill/journal.md`** — one stanza per completed run. Activity log: what was
+- **`journal.md`** — one stanza per completed run. Activity log: what was
   asked, what shipped, cost. Written by the deliver stage.
-- **`.mill/decisions.md`** — ADR-lite entries for non-obvious design
+- **`decisions.md`** — ADR-lite entries for non-obvious design
   trade-offs the run resolved. Written by the `decisions` sub-stage after
   deliver, strictly gated: each entry must cite a specific finding, spec
   criterion, or external constraint. A clean run produces zero entries.
-- **`.mill/profile.json`** — one-shot repo profile (language, test command,
+- **`profile.json`** — one-shot repo profile (language, test command,
   conventions). Written by `mill onboard`, refreshed with `mill onboard --refresh`.
-- **`.mill/stitch.json`** — Stitch project URL + originating run id.
+- **`stitch.json`** — Stitch project URL + originating run id.
   Written by `design.ui` after a successful UI design. Edit-mode UI runs
   that find this file load `prompts/design-ui-edit.md` instead of
   `prompts/design-ui.md` and reuse the project via `edit_screens`
@@ -210,7 +283,7 @@ keep getting flagged on this repo.
 |---|---|---|
 | journal.md | What did mill do last time? | Every completed run |
 | decisions.md | What design debates have we already resolved? | Post-deliver, only for non-obvious trade-offs |
-| ledger (SQLite) | What bugs keep recurring? | Every review stage |
+| ledger (SQLite, `~/.mill/mill.db`) | What bugs keep recurring? | Every review stage |
 | profile.json | What is this repo? (language, test cmd) | `mill onboard` |
 | stitch.json | Which Stitch project should we keep editing? | Every successful UI design |
 
@@ -218,14 +291,21 @@ keep getting flagged on this repo.
 
 ```
 src/
-├── cli.ts                          # mill init|new|run|status|logs|tail|kill
-│                                   # |onboard|history|findings
+├── cli.ts                          # mill new|run|status|logs|tail|kill|history|
+│                                   # findings|onboard + project|daemon subcommand trees
+├── cli/
+│   └── client.ts                   # thin HTTP client for the daemon
 ├── core/                           # types, SQLite store, paths, costs, logger
 │   ├── journal.ts | ledger.ts | decisions.ts | profile.ts | project.ts
+│   ├── migrate.ts                  # legacy <repo>/.mill/mill.db → central import
 │   └── store.sqlite.ts
+├── daemon/                         # localhost HTTP daemon (Hono on Node)
+│   ├── server.ts                   # routes: /projects, /runs, /findings
+│   ├── run-loop.ts                 # cross-project run scheduler (global cap)
+│   └── index.ts                    # entrypoint: bind 127.0.0.1:7333, pidfile, drain
 └── orchestrator/
     ├── pipeline.ts                 # stage state machine
-    ├── worker.ts                   # polls SQLite for queued runs
+    ├── worker.ts                   # legacy single-project polling loop (deprecated)
     ├── claude-cli.ts               # `claude` subprocess runner
     ├── guard.ts                    # PreToolUse hook binary
     ├── run-settings.ts             # writes per-run .claude/settings.json
@@ -239,15 +319,19 @@ src/
 src/prompts/*.md                    # stage + critic system prompts, iterable
                                     # without rebuild (tsx reads from src/)
 
-.mill/                                # per-project state (gitignored)
-├── project.json                    # project marker (written by mill init)
-├── mill.db                         # SQLite: runs, stages, findings, sessions
-├── journal.md | decisions.md       # cross-run memory
-├── profile.json                    # repo profile (mill onboard)
-├── stitch.json                     # Stitch project ref (UI runs)
-└── runs/<id>/                      # per-run artifacts
-    ├── .claude/settings.json       # sandbox hook config
-    ├── KILLED                      # (sentinel; present if `mill kill`ed)
+~/.mill/                            # central management state (one tree per host)
+├── mill.db                         # SQLite: projects, runs, stages, findings, sessions
+├── daemon.pid                      # daemon process id (written by `mill daemon start`)
+├── daemon.port                     # actual port if a non-default one was used
+└── projects/<project-id>/          # per-project durable state
+    ├── journal.md | decisions.md   # cross-run memory
+    ├── profile.json | profile.md   # repo profile (mill onboard)
+    └── stitch.json                 # Stitch project ref (UI runs)
+
+<repo>/.mill/                       # per-repo (workdirs only — no DB, no journal)
+└── runs/<id>/                      # per-run artifacts; stays in the repo so
+    ├── .claude/settings.json       #  CLAUDE.md auto-discovery + git worktree
+    ├── KILLED                      #  flow keep working
     ├── requirement.md | spec.md
     ├── design/                     # design-intent.md or architecture.md
     ├── workdir/                    # where the implementer edits
@@ -267,9 +351,11 @@ See `.env.example`. Relevant knobs:
 | `MILL_TIMEOUT_SEC_IMPLEMENT` | 7200 | Wall-clock cap for the implement stage (2h — TDD builds are 100+ tool calls) |
 | `MILL_TIMEOUT_SEC_VERIFY` | 1800 | Wall-clock cap for verify (30m — end-to-end checks take a while) |
 | `MILL_MAX_REVIEW_ITERS` | 3 | implement ⇄ review loop cap |
-| `MILL_MAX_CONCURRENT_RUNS` | 2 | Worker concurrency |
+| `MILL_MAX_CONCURRENT_RUNS` | 2 | Daemon's global cap (sum across all projects) |
 | `MILL_MODEL` | (claude default) | Pass to every `claude` invocation |
-| `MILL_ROOT` | cwd | Project root (for worker processes running elsewhere) |
+| `MILL_HOME` | `~/.mill` | Central state root (DB + per-project state) |
+| `MILL_DAEMON_HOST` | `127.0.0.1` | Daemon HTTP bind host (loopback only) |
+| `MILL_DAEMON_PORT` | `7333` | Daemon HTTP bind port |
 | `MILL_ADVERSARIAL_REVIEW` | auto | `auto` \| `on` \| `off` — optional Codex critic |
 | `MILL_TESTS_CRITIC` | auto | `auto` \| `on` \| `off` — mechanical test critic |
 | `MILL_SPEC2TESTS` | auto | `auto` \| `on` \| `off` — generate test scaffolds from spec |

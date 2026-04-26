@@ -1,8 +1,104 @@
 import { mkdir, stat } from "node:fs/promises";
 import { existsSync } from "node:fs";
+import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import type { RunPaths } from "./types.js";
 import { MILL_DIR, RUNS_DIRNAME } from "./project.js";
+
+// ---- central state (~/.mill) ----
+//
+// Phase 1 of multi-project mill: management state (the SQLite DB,
+// per-project journals, decisions log, profile, stitch ref) lives at
+// `~/.mill/`, NOT inside each repo's `.mill/`. Per-run workdirs and
+// run-scoped artifacts (KILLED sentinel, verify/, reviews/, design/)
+// stay at `<repo>/.mill/runs/<id>/...` so CLAUDE.md auto-discovery and
+// the `git worktree add` flow keep working unchanged.
+//
+// Override the central root with `MILL_HOME=/path/to/dir` for
+// scripts/tests/CI; defaults to `$HOME/.mill`.
+
+export const PROJECTS_DIRNAME = "projects";
+export const DAEMON_PIDFILE = "daemon.pid";
+export const DAEMON_PORTFILE = "daemon.port";
+export const CENTRAL_DB_FILENAME = "mill.db";
+
+export function millRoot(env: NodeJS.ProcessEnv = process.env): string {
+  const override = env.MILL_HOME;
+  if (override && override.trim()) return resolve(override.trim());
+  return join(homedir(), ".mill");
+}
+
+export function centralDbPath(env: NodeJS.ProcessEnv = process.env): string {
+  return join(millRoot(env), CENTRAL_DB_FILENAME);
+}
+
+export function projectStateDir(
+  projectId: string,
+  env: NodeJS.ProcessEnv = process.env,
+): string {
+  return join(millRoot(env), PROJECTS_DIRNAME, projectId);
+}
+
+export function projectJournalPath(
+  projectId: string,
+  env: NodeJS.ProcessEnv = process.env,
+): string {
+  return join(projectStateDir(projectId, env), "journal.md");
+}
+
+export function projectDecisionsPath(
+  projectId: string,
+  env: NodeJS.ProcessEnv = process.env,
+): string {
+  return join(projectStateDir(projectId, env), "decisions.md");
+}
+
+export function projectProfileJsonPath(
+  projectId: string,
+  env: NodeJS.ProcessEnv = process.env,
+): string {
+  return join(projectStateDir(projectId, env), "profile.json");
+}
+
+export function projectProfileMdPath(
+  projectId: string,
+  env: NodeJS.ProcessEnv = process.env,
+): string {
+  return join(projectStateDir(projectId, env), "profile.md");
+}
+
+export function projectStitchPath(
+  projectId: string,
+  env: NodeJS.ProcessEnv = process.env,
+): string {
+  return join(projectStateDir(projectId, env), "stitch.json");
+}
+
+export function daemonPidPath(env: NodeJS.ProcessEnv = process.env): string {
+  return join(millRoot(env), DAEMON_PIDFILE);
+}
+
+export function daemonPortPath(env: NodeJS.ProcessEnv = process.env): string {
+  return join(millRoot(env), DAEMON_PORTFILE);
+}
+
+export async function ensureMillRoot(
+  env: NodeJS.ProcessEnv = process.env,
+): Promise<string> {
+  const root = millRoot(env);
+  await mkdir(root, { recursive: true });
+  await mkdir(join(root, PROJECTS_DIRNAME), { recursive: true });
+  return root;
+}
+
+export async function ensureProjectStateDir(
+  projectId: string,
+  env: NodeJS.ProcessEnv = process.env,
+): Promise<string> {
+  const dir = projectStateDir(projectId, env);
+  await mkdir(dir, { recursive: true });
+  return dir;
+}
 
 // `root` here is the project root (the directory containing `.mill/`).
 // Run artifacts live under `.mill/runs/<runId>/` so the whole state tree

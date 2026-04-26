@@ -9,4 +9,6 @@ export * from "./profile.js";
 export * from "./ledger.js";
 export * from "./decisions.js";
 export * from "./stitch.js";
+export * from "./migrate.js";
+export * from "./event-bus.js";
 export { SqliteStateStore, openStore } from "./store.js";

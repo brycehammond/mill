@@ -162,7 +162,7 @@ export async function deliver(args: DeliverArgs): Promise<StageResult> {
     // write failure must not fail the run, so it's its own try/catch.
     try {
       const requirement = await readFirstLine(ctx.paths.requirement);
-      await appendJournalEntry(ctx.root, {
+      await appendJournalEntry(ctx.stateDir, {
         runId: ctx.runId,
         mode: ctx.mode,
         isoDate: new Date(args.endedAt).toISOString(),

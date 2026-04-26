@@ -97,6 +97,14 @@ export interface RunClaudeArgs {
   forkSession?: boolean;
   env?: Record<string, string>;
   timeoutMs?: number;
+  // Iteration index for stages that loop (implement, review). When set,
+  // every cumulative cost/usage/session write to `stages` is mirrored to
+  // the per-iteration row in `stage_iterations` so display surfaces can
+  // expand the loop into iteration#N rows. Sum of per-iteration cost
+  // equals the cumulative `stages.cost_usd` by construction. Leave
+  // unset for non-iterating stages — they get one row in `stages` and
+  // no `stage_iterations` rows.
+  iteration?: number;
 }
 
 export interface RunClaudeResult {
@@ -149,6 +157,7 @@ export async function runClaude(args: RunClaudeArgs): Promise<RunClaudeResult> {
     forkSession,
     env: extraEnv,
     timeoutMs,
+    iteration,
   } = args;
   const slot = sessionSlot ?? stage;
 
@@ -302,6 +311,9 @@ export async function runClaude(args: RunClaudeArgs): Promise<RunClaudeResult> {
       // stage row's id keeps its meaning.
       if (slot === stage) {
         ctx.store.setStageSession(ctx.runId, stage, sid);
+        if (iteration !== undefined) {
+          ctx.store.setStageIterationSession(ctx.runId, stage, iteration, sid);
+        }
       }
       ctx.store.saveSession(ctx.runId, slot, sid, persistedCostUsd);
     } catch (err) {
@@ -375,6 +387,9 @@ export async function runClaude(args: RunClaudeArgs): Promise<RunClaudeResult> {
         try {
           ctx.store.addRunCost(ctx.runId, costDelta);
           ctx.store.addStageCost(ctx.runId, stage, costDelta);
+          if (iteration !== undefined) {
+            ctx.store.addStageIterationCost(ctx.runId, stage, iteration, costDelta);
+          }
         } catch (err) {
           ctx.logger.warn("failed to persist cost delta", { err: String(err) });
         }
@@ -391,6 +406,9 @@ export async function runClaude(args: RunClaudeArgs): Promise<RunClaudeResult> {
         try {
           ctx.store.addRunUsage(ctx.runId, turnUsage);
           ctx.store.addStageUsage(ctx.runId, stage, turnUsage);
+          if (iteration !== undefined) {
+            ctx.store.addStageIterationUsage(ctx.runId, stage, iteration, turnUsage);
+          }
         } catch (err) {
           ctx.logger.warn("failed to persist usage delta", { err: String(err) });
         }

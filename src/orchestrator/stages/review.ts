@@ -44,6 +44,7 @@ export interface ReviewOutput {
 export async function review(args: ReviewArgs): Promise<StageResult & { data: ReviewOutput }> {
   const { ctx, iteration } = args;
   ctx.store.startStage(ctx.runId, "review");
+  ctx.store.startStageIteration(ctx.runId, "review", iteration);
   try {
     const specBody = await readFile(ctx.paths.spec, "utf8");
     const designBody = ctx.kind === "ui"
@@ -91,7 +92,7 @@ export async function review(args: ReviewArgs): Promise<StageResult & { data: Re
     if (testsMode !== "off") {
       const run = ctx.store.getRun(ctx.runId);
       const testCmd = await resolveTestCommand({
-        root: ctx.root,
+        stateDir: ctx.stateDir,
         runTestCommand: run?.test_command ?? null,
       });
       if (testCmd) {
@@ -193,6 +194,11 @@ export async function review(args: ReviewArgs): Promise<StageResult & { data: Re
       artifact_path: ctx.paths.reviewsDir,
       error: errorMsg,
     });
+    ctx.store.finishStageIteration(ctx.runId, "review", iteration, {
+      status: allFailed ? "failed" : "completed",
+      artifact_path: ctx.paths.reviewsDir,
+      error: errorMsg,
+    });
 
     const data: ReviewOutput = {
       findings,
@@ -205,6 +211,10 @@ export async function review(args: ReviewArgs): Promise<StageResult & { data: Re
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     ctx.store.finishStage(ctx.runId, "review", {
+      status: "failed",
+      error: msg,
+    });
+    ctx.store.finishStageIteration(ctx.runId, "review", iteration, {
       status: "failed",
       error: msg,
     });

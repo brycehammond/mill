@@ -9,9 +9,8 @@
 //                   programmatically (e.g. `commands.test` for the
 //                   tests critic).
 
-import { readFile, writeFile, access } from "node:fs/promises";
-import { join } from "node:path";
-import { projectMillDir } from "./project.js";
+import { readFile, writeFile, access, mkdir } from "node:fs/promises";
+import { dirname, join } from "node:path";
 
 export interface ProfileCommands {
   test: string | null;
@@ -41,12 +40,12 @@ export interface ProfileData {
 const JSON_FILENAME = "profile.json";
 const MD_FILENAME = "profile.md";
 
-export function profileJsonPath(root: string): string {
-  return join(projectMillDir(root), JSON_FILENAME);
+export function profileJsonPath(stateDir: string): string {
+  return join(stateDir, JSON_FILENAME);
 }
 
-export function profileMdPath(root: string): string {
-  return join(projectMillDir(root), MD_FILENAME);
+export function profileMdPath(stateDir: string): string {
+  return join(stateDir, MD_FILENAME);
 }
 
 async function fileExists(p: string): Promise<boolean> {
@@ -58,12 +57,12 @@ async function fileExists(p: string): Promise<boolean> {
   }
 }
 
-export async function profileExists(root: string): Promise<boolean> {
-  return fileExists(profileJsonPath(root));
+export async function profileExists(stateDir: string): Promise<boolean> {
+  return fileExists(profileJsonPath(stateDir));
 }
 
-export async function readProfile(root: string): Promise<ProfileData | null> {
-  const p = profileJsonPath(root);
+export async function readProfile(stateDir: string): Promise<ProfileData | null> {
+  const p = profileJsonPath(stateDir);
   if (!(await fileExists(p))) return null;
   try {
     const raw = await readFile(p, "utf8");
@@ -91,8 +90,8 @@ export async function readProfile(root: string): Promise<ProfileData | null> {
 // Read just the prompt-injectable summary. Empty string if no profile.
 // Prefer `profile.md` on disk (user may have hand-edited it) and fall
 // back to the embedded markdown from the JSON.
-export async function readProfileSummary(root: string): Promise<string> {
-  const mdPath = profileMdPath(root);
+export async function readProfileSummary(stateDir: string): Promise<string> {
+  const mdPath = profileMdPath(stateDir);
   if (await fileExists(mdPath)) {
     try {
       const body = await readFile(mdPath, "utf8");
@@ -101,7 +100,7 @@ export async function readProfileSummary(root: string): Promise<string> {
       // fall through
     }
   }
-  const data = await readProfile(root);
+  const data = await readProfile(stateDir);
   return data?.markdown?.trim() ?? "";
 }
 
@@ -112,23 +111,24 @@ export async function readProfileSummary(root: string): Promise<string> {
 // The run-scoped field lets new-mode builds — which don't have a project
 // profile — still gate review on real test output.
 export async function resolveTestCommand(args: {
-  root: string;
+  stateDir: string;
   runTestCommand: string | null | undefined;
 }): Promise<string | null> {
   const run = typeof args.runTestCommand === "string" ? args.runTestCommand.trim() : "";
   if (run) return run;
-  const profile = await readProfile(args.root);
+  const profile = await readProfile(args.stateDir);
   return profile?.commands.test || null;
 }
 
 export async function writeProfile(
-  root: string,
+  stateDir: string,
   data: ProfileData,
 ): Promise<void> {
+  await mkdir(stateDir, { recursive: true });
   await writeFile(
-    profileJsonPath(root),
+    profileJsonPath(stateDir),
     JSON.stringify(data, null, 2) + "\n",
     "utf8",
   );
-  await writeFile(profileMdPath(root), data.markdown.trim() + "\n", "utf8");
+  await writeFile(profileMdPath(stateDir), data.markdown.trim() + "\n", "utf8");
 }

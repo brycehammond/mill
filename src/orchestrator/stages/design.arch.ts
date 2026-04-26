@@ -16,9 +16,9 @@ export async function designArchitecture(
   const promptName = ctx.mode === "edit" ? "design-arch-edit" : "design-arch";
   const systemPrompt = await loadPrompt(promptName);
   const specBody = await readFile(ctx.paths.spec, "utf8");
-  const journal = await readJournalTail(ctx.root, 20);
-  const decisionsBlock = await readDecisionsTail(ctx.root, 10);
-  const profile = await readProfileSummary(ctx.root);
+  const journal = await readJournalTail(ctx.stateDir, 20);
+  const decisionsBlock = await readDecisionsTail(ctx.stateDir, 10);
+  const profile = await readProfileSummary(ctx.stateDir);
   const profileBlock = profile ? `## Repo profile\n\n${profile}\n` : "";
   const ledgerBlock =
     ctx.mode === "edit" ? renderLedgerHint(ctx.store, { limit: 5 }) : "";

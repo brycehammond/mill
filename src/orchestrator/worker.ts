@@ -13,7 +13,7 @@ import { runPipeline } from "./pipeline.js";
 
 async function main() {
   const config = loadConfig();
-  const store = openStore(config.root);
+  const store = openStore(config.dbPath);
 
   const active = new Map<string, Promise<unknown>>();
   const activeControllers = new Set<AbortController>();

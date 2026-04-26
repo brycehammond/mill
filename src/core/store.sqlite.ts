@@ -4,25 +4,41 @@ import { mkdirSync } from "node:fs";
 import type {
   Clarifications,
   CriticName,
+  DisplayStageRow,
   EventRow,
   FindingRow,
+  ProjectRow,
   RunMode,
   RunRow,
   RunStatus,
   Severity,
+  StageIterationRow,
   StageName,
   StageRow,
   StateStore,
   TokenUsage,
 } from "./types.js";
 import { findingFingerprint } from "./types.js";
+import { publishRunEvent } from "./event-bus.js";
 
 // Single writer; orchestrator is the only process calling mutating methods.
 // WAL mode so the (future) web UI can read concurrently without blocking.
 
 const SCHEMA = `
+CREATE TABLE IF NOT EXISTS projects (
+  id TEXT PRIMARY KEY,
+  name TEXT NOT NULL,
+  root_path TEXT NOT NULL UNIQUE,
+  added_at INTEGER NOT NULL,
+  removed_at INTEGER,
+  monthly_budget_usd REAL,
+  default_concurrency INTEGER
+);
+CREATE INDEX IF NOT EXISTS projects_name ON projects (name);
+
 CREATE TABLE IF NOT EXISTS runs (
   id TEXT PRIMARY KEY,
+  project_id TEXT REFERENCES projects(id),
   status TEXT NOT NULL,
   kind TEXT,
   mode TEXT NOT NULL DEFAULT 'new',
@@ -57,6 +73,25 @@ CREATE TABLE IF NOT EXISTS stages (
   error TEXT,
   PRIMARY KEY (run_id, name)
 );
+
+CREATE TABLE IF NOT EXISTS stage_iterations (
+  run_id TEXT NOT NULL,
+  stage_name TEXT NOT NULL,
+  iteration INTEGER NOT NULL,
+  status TEXT NOT NULL,
+  started_at INTEGER,
+  finished_at INTEGER,
+  cost_usd REAL NOT NULL DEFAULT 0,
+  input_tokens INTEGER NOT NULL DEFAULT 0,
+  cache_creation_tokens INTEGER NOT NULL DEFAULT 0,
+  cache_read_tokens INTEGER NOT NULL DEFAULT 0,
+  output_tokens INTEGER NOT NULL DEFAULT 0,
+  session_id TEXT,
+  artifact_path TEXT,
+  error TEXT,
+  PRIMARY KEY (run_id, stage_name, iteration)
+);
+CREATE INDEX IF NOT EXISTS stage_iter_run ON stage_iterations (run_id, started_at);
 
 CREATE TABLE IF NOT EXISTS events (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -123,11 +158,14 @@ export class SqliteStateStore implements StateStore {
     this.db.exec(SCHEMA);
     this.migrateColumns();
     this.backfillFingerprints();
-    // Post-migration indexes: the fingerprint column may have just
-    // been added; creating the index here (not in SCHEMA) avoids a
-    // "no such column" error on pre-migration databases.
+    // Post-migration indexes: the fingerprint and project_id columns
+    // may have just been added; creating the index here (not in SCHEMA)
+    // avoids a "no such column" error on pre-migration databases.
     this.db.exec(
       `CREATE INDEX IF NOT EXISTS findings_fp ON findings (fingerprint);`,
+    );
+    this.db.exec(
+      `CREATE INDEX IF NOT EXISTS runs_project ON runs (project_id, created_at);`,
     );
   }
 
@@ -142,6 +180,10 @@ export class SqliteStateStore implements StateStore {
       ["runs", "total_output_tokens", "INTEGER NOT NULL DEFAULT 0"],
       ["runs", "mode", "TEXT NOT NULL DEFAULT 'new'"],
       ["runs", "test_command", "TEXT"],
+      // project_id is added by ALTER on legacy DBs; new DBs already have
+      // it from SCHEMA. The FK reference is only enforced for rows that
+      // set the column; null is allowed for legacy rows pre-migration.
+      ["runs", "project_id", "TEXT REFERENCES projects(id)"],
       ["stages", "input_tokens", "INTEGER NOT NULL DEFAULT 0"],
       ["stages", "cache_creation_tokens", "INTEGER NOT NULL DEFAULT 0"],
       ["stages", "cache_read_tokens", "INTEGER NOT NULL DEFAULT 0"],
@@ -203,14 +245,16 @@ export class SqliteStateStore implements StateStore {
     requirement_path: string;
     spec_path?: string | null;
     mode?: RunMode;
+    project_id?: string | null;
   }): void {
     this.db
       .prepare(
-        `INSERT INTO runs (id, status, kind, mode, created_at, requirement_path, spec_path, total_cost_usd)
-         VALUES (?, ?, ?, ?, ?, ?, ?, 0)`,
+        `INSERT INTO runs (id, project_id, status, kind, mode, created_at, requirement_path, spec_path, total_cost_usd)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0)`,
       )
       .run(
         row.id,
+        row.project_id ?? null,
         row.status,
         row.kind,
         row.mode ?? "new",
@@ -218,6 +262,12 @@ export class SqliteStateStore implements StateStore {
         row.requirement_path,
         row.spec_path ?? null,
       );
+  }
+
+  setRunProjectId(id: string, projectId: string): void {
+    this.db
+      .prepare(`UPDATE runs SET project_id = ? WHERE id = ?`)
+      .run(projectId, id);
   }
 
   getRun(id: string): RunRow | null {
@@ -265,16 +315,107 @@ export class SqliteStateStore implements StateStore {
       .run(input, cc, cr, out, id);
   }
 
-  listRuns(opts: { status?: RunStatus; limit?: number } = {}): RunRow[] {
+  listRuns(
+    opts: { status?: RunStatus; limit?: number; projectId?: string } = {},
+  ): RunRow[] {
     const limit = opts.limit ?? 50;
+    const where: string[] = [];
+    const args: unknown[] = [];
     if (opts.status) {
-      return this.db
-        .prepare(`SELECT * FROM runs WHERE status = ? ORDER BY created_at DESC LIMIT ?`)
-        .all(opts.status, limit) as RunRow[];
+      where.push("status = ?");
+      args.push(opts.status);
     }
+    if (opts.projectId) {
+      where.push("project_id = ?");
+      args.push(opts.projectId);
+    }
+    const whereSql = where.length > 0 ? `WHERE ${where.join(" AND ")}` : "";
     return this.db
-      .prepare(`SELECT * FROM runs ORDER BY created_at DESC LIMIT ?`)
-      .all(limit) as RunRow[];
+      .prepare(
+        `SELECT * FROM runs ${whereSql} ORDER BY created_at DESC LIMIT ?`,
+      )
+      .all(...args, limit) as RunRow[];
+  }
+
+  // ---- projects ----
+
+  addProject(row: {
+    id: string;
+    name: string;
+    root_path: string;
+    added_at?: number;
+    monthly_budget_usd?: number | null;
+    default_concurrency?: number | null;
+  }): ProjectRow {
+    const addedAt = row.added_at ?? Date.now();
+    this.db
+      .prepare(
+        `INSERT INTO projects (id, name, root_path, added_at, monthly_budget_usd, default_concurrency)
+         VALUES (?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        row.id,
+        row.name,
+        row.root_path,
+        addedAt,
+        row.monthly_budget_usd ?? null,
+        row.default_concurrency ?? null,
+      );
+    const got = this.getProject(row.id);
+    if (!got) {
+      throw new Error(`addProject: insert succeeded but row not found for id=${row.id}`);
+    }
+    return got;
+  }
+
+  getProject(id: string): ProjectRow | null {
+    const r = this.db
+      .prepare(`SELECT * FROM projects WHERE id = ?`)
+      .get(id) as ProjectRow | undefined;
+    return r ?? null;
+  }
+
+  getProjectByPath(rootPath: string): ProjectRow | null {
+    const r = this.db
+      .prepare(`SELECT * FROM projects WHERE root_path = ?`)
+      .get(rootPath) as ProjectRow | undefined;
+    return r ?? null;
+  }
+
+  getProjectByName(name: string): ProjectRow | null {
+    // Names are not unique by schema, but the CLI's `--project <name>`
+    // resolves the most-recently-added active project for friendliness.
+    const r = this.db
+      .prepare(
+        `SELECT * FROM projects WHERE name = ? AND removed_at IS NULL ORDER BY added_at DESC LIMIT 1`,
+      )
+      .get(name) as ProjectRow | undefined;
+    return r ?? null;
+  }
+
+  listProjects(opts: { includeRemoved?: boolean } = {}): ProjectRow[] {
+    const sql = opts.includeRemoved
+      ? `SELECT * FROM projects ORDER BY added_at DESC`
+      : `SELECT * FROM projects WHERE removed_at IS NULL ORDER BY added_at DESC`;
+    return this.db.prepare(sql).all() as ProjectRow[];
+  }
+
+  removeProject(id: string): void {
+    this.db
+      .prepare(`UPDATE projects SET removed_at = ? WHERE id = ?`)
+      .run(Date.now(), id);
+  }
+
+  updateProjectBudget(id: string, monthlyBudgetUsd: number | null): void {
+    this.db
+      .prepare(`UPDATE projects SET monthly_budget_usd = ? WHERE id = ?`)
+      .run(monthlyBudgetUsd, id);
+  }
+
+  updateProjectConcurrency(id: string, defaultConcurrency: number | null): void {
+    this.db
+      .prepare(`UPDATE projects SET default_concurrency = ? WHERE id = ?`)
+      .run(defaultConcurrency, id);
   }
 
   startStage(runId: string, name: StageName): void {
@@ -369,12 +510,246 @@ export class SqliteStateStore implements StateStore {
       .all(runId) as StageRow[];
   }
 
-  appendEvent(runId: string, stage: StageName, kind: string, payload: unknown): void {
+  startStageIteration(runId: string, name: StageName, iteration: number): void {
+    const now = Date.now();
     this.db
+      .prepare(
+        `INSERT INTO stage_iterations (run_id, stage_name, iteration, status, started_at, cost_usd)
+         VALUES (?, ?, ?, 'running', ?, 0)
+         ON CONFLICT(run_id, stage_name, iteration) DO UPDATE SET
+           status = 'running',
+           started_at = excluded.started_at,
+           finished_at = NULL,
+           error = NULL`,
+      )
+      .run(runId, name, iteration, now);
+  }
+
+  finishStageIteration(
+    runId: string,
+    name: StageName,
+    iteration: number,
+    patch: Partial<Omit<StageIterationRow, "run_id" | "stage_name" | "iteration">>,
+  ): void {
+    const existing = this.getStageIteration(runId, name, iteration);
+    if (!existing) {
+      this.db
+        .prepare(
+          `INSERT INTO stage_iterations (run_id, stage_name, iteration, status, cost_usd) VALUES (?, ?, ?, 'pending', 0)`,
+        )
+        .run(runId, name, iteration);
+    }
+    const fields: string[] = [];
+    const vals: unknown[] = [];
+    for (const [k, v] of Object.entries(patch)) {
+      fields.push(`${k} = ?`);
+      vals.push(v ?? null);
+    }
+    if (!fields.some((f) => f.startsWith("finished_at"))) {
+      fields.push("finished_at = ?");
+      vals.push(Date.now());
+    }
+    this.db
+      .prepare(
+        `UPDATE stage_iterations SET ${fields.join(", ")} WHERE run_id = ? AND stage_name = ? AND iteration = ?`,
+      )
+      .run(...vals, runId, name, iteration);
+  }
+
+  addStageIterationCost(
+    runId: string,
+    name: StageName,
+    iteration: number,
+    delta: number,
+  ): void {
+    if (!Number.isFinite(delta) || delta === 0) return;
+    this.ensureStageIteration(runId, name, iteration);
+    this.db
+      .prepare(
+        `UPDATE stage_iterations SET cost_usd = cost_usd + ?
+         WHERE run_id = ? AND stage_name = ? AND iteration = ?`,
+      )
+      .run(delta, runId, name, iteration);
+  }
+
+  addStageIterationUsage(
+    runId: string,
+    name: StageName,
+    iteration: number,
+    usage: TokenUsage,
+  ): void {
+    const input = toTokenDelta(usage.input);
+    const cc = toTokenDelta(usage.cache_creation);
+    const cr = toTokenDelta(usage.cache_read);
+    const out = toTokenDelta(usage.output);
+    if (input === 0 && cc === 0 && cr === 0 && out === 0) return;
+    this.ensureStageIteration(runId, name, iteration);
+    this.db
+      .prepare(
+        `UPDATE stage_iterations SET
+           input_tokens = input_tokens + ?,
+           cache_creation_tokens = cache_creation_tokens + ?,
+           cache_read_tokens = cache_read_tokens + ?,
+           output_tokens = output_tokens + ?
+         WHERE run_id = ? AND stage_name = ? AND iteration = ?`,
+      )
+      .run(input, cc, cr, out, runId, name, iteration);
+  }
+
+  setStageIterationSession(
+    runId: string,
+    name: StageName,
+    iteration: number,
+    sessionId: string,
+  ): void {
+    if (!sessionId) return;
+    this.ensureStageIteration(runId, name, iteration);
+    this.db
+      .prepare(
+        `UPDATE stage_iterations SET session_id = ?
+         WHERE run_id = ? AND stage_name = ? AND iteration = ?`,
+      )
+      .run(sessionId, runId, name, iteration);
+  }
+
+  getStageIteration(
+    runId: string,
+    name: StageName,
+    iteration: number,
+  ): StageIterationRow | null {
+    const r = this.db
+      .prepare(
+        `SELECT * FROM stage_iterations WHERE run_id = ? AND stage_name = ? AND iteration = ?`,
+      )
+      .get(runId, name, iteration) as StageIterationRow | undefined;
+    return r ?? null;
+  }
+
+  listStageIterations(runId: string, name?: StageName): StageIterationRow[] {
+    if (name) {
+      return this.db
+        .prepare(
+          `SELECT * FROM stage_iterations WHERE run_id = ? AND stage_name = ? ORDER BY iteration`,
+        )
+        .all(runId, name) as StageIterationRow[];
+    }
+    return this.db
+      .prepare(
+        `SELECT * FROM stage_iterations WHERE run_id = ? ORDER BY stage_name, iteration`,
+      )
+      .all(runId) as StageIterationRow[];
+  }
+
+  // INSERT-OR-IGNORE the row before delta updates so the very first
+  // cost/usage delta from runClaude doesn't silently no-op against an
+  // empty table when the stage driver's `startStageIteration` hasn't
+  // landed yet (it does today, but defense in depth — same shape as
+  // finishStage's existing-row INSERT).
+  private ensureStageIteration(
+    runId: string,
+    name: StageName,
+    iteration: number,
+  ): void {
+    this.db
+      .prepare(
+        `INSERT OR IGNORE INTO stage_iterations
+           (run_id, stage_name, iteration, status, cost_usd)
+         VALUES (?, ?, ?, 'running', 0)`,
+      )
+      .run(runId, name, iteration);
+  }
+
+  listDisplayStages(runId: string): DisplayStageRow[] {
+    const stages = this.listStages(runId);
+    const iters = this.listStageIterations(runId);
+    const itersByStage = new Map<StageName, StageIterationRow[]>();
+    for (const it of iters) {
+      const arr = itersByStage.get(it.stage_name as StageName) ?? [];
+      arr.push(it);
+      itersByStage.set(it.stage_name as StageName, arr);
+    }
+    const out: DisplayStageRow[] = [];
+    for (const s of stages) {
+      const stageIters = itersByStage.get(s.name) ?? [];
+      // Always expand to per-iteration rows when the sibling table has
+      // data — even a single iteration. This keeps the live ticker
+      // honest about iteration boundaries (each implement / review row
+      // gets its own ▸/✓ pair); the suffix `#1` is suppressed when
+      // there's only one iteration so the table stays tidy.
+      if (stageIters.length === 0) {
+        out.push({
+          run_id: s.run_id,
+          name: s.name,
+          displayName: s.name,
+          iteration: null,
+          status: s.status,
+          started_at: s.started_at,
+          finished_at: s.finished_at,
+          cost_usd: s.cost_usd,
+          input_tokens: s.input_tokens,
+          cache_creation_tokens: s.cache_creation_tokens,
+          cache_read_tokens: s.cache_read_tokens,
+          output_tokens: s.output_tokens,
+          session_id: s.session_id,
+          artifact_path: s.artifact_path,
+          error: s.error,
+        });
+        continue;
+      }
+      const showSuffix = stageIters.length > 1;
+      for (const it of stageIters) {
+        out.push({
+          run_id: it.run_id,
+          name: s.name,
+          displayName: showSuffix ? `${s.name} #${it.iteration}` : s.name,
+          iteration: it.iteration,
+          status: it.status,
+          started_at: it.started_at,
+          finished_at: it.finished_at,
+          cost_usd: it.cost_usd,
+          input_tokens: it.input_tokens,
+          cache_creation_tokens: it.cache_creation_tokens,
+          cache_read_tokens: it.cache_read_tokens,
+          output_tokens: it.output_tokens,
+          session_id: it.session_id,
+          artifact_path: it.artifact_path,
+          error: it.error,
+        });
+      }
+    }
+    out.sort((a, b) => {
+      const sa = a.started_at ?? Infinity;
+      const sb = b.started_at ?? Infinity;
+      if (sa !== sb) return sa - sb;
+      // Same started_at (rare; possible for never-started rows) — keep
+      // iteration order within a stage and stage order otherwise.
+      if (a.name !== b.name) return 0;
+      return (a.iteration ?? 0) - (b.iteration ?? 0);
+    });
+    return out;
+  }
+
+  appendEvent(runId: string, stage: StageName, kind: string, payload: unknown): void {
+    const ts = Date.now();
+    const payloadJson = JSON.stringify(payload ?? null);
+    const info = this.db
       .prepare(
         `INSERT INTO events (run_id, stage, ts, kind, payload_json) VALUES (?, ?, ?, ?, ?)`,
       )
-      .run(runId, stage, Date.now(), kind, JSON.stringify(payload ?? null));
+      .run(runId, stage, ts, kind, payloadJson);
+    // Fanout to in-process subscribers (SSE) only after the INSERT
+    // succeeds — a thrown prepare/run keeps the bus untouched. The id
+    // is the autoincrement assigned by SQLite, surfaced as
+    // lastInsertRowid (number for our schema). Build the row inline
+    // rather than re-reading; we have every field already.
+    publishRunEvent({
+      id: Number(info.lastInsertRowid),
+      run_id: runId,
+      stage,
+      ts,
+      kind,
+      payload_json: payloadJson,
+    });
   }
 
   tailEvents(runId: string, afterId = 0, limit = 200): EventRow[] {

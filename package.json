@@ -12,12 +12,15 @@
   },
   "files": [
     "bin",
-    "dist"
+    "dist",
+    "dist/web"
   ],
   "scripts": {
     "mill": "tsx src/cli.ts",
     "worker": "tsx src/orchestrator/worker.ts",
-    "build": "tsc -p . && cp -r src/prompts dist/prompts",
+    "daemon": "tsx src/daemon/index.ts",
+    "build": "tsc -p . && cp -r src/prompts dist/prompts && npm run build:web",
+    "build:web": "cd web && npm install --no-fund --no-audit --silent && npm run build",
     "test": "tsx --test 'src/**/*.test.ts'",
     "typecheck": "tsc --noEmit",
     "clean": "rm -rf dist",
@@ -30,7 +33,9 @@
     "typescript": "^5.7.2"
   },
   "dependencies": {
+    "@hono/node-server": "^2.0.0",
     "better-sqlite3": "^11.7.0",
+    "hono": "^4.12.15",
     "zod": "^3.24.1",
     "zod-to-json-schema": "^3.24.1"
   }

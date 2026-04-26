@@ -53,7 +53,7 @@ export async function implement(args: ImplementArgs): Promise<StageResult> {
     // Profile is only injected on the first iteration — the resumed
     // session already has it in history. Cheap either way, since
     // cache-read dominates.
-    const profile = iteration === 1 ? await readProfileSummary(ctx.root) : "";
+    const profile = iteration === 1 ? await readProfileSummary(ctx.stateDir) : "";
     const ledger =
       iteration === 1 && ctx.mode === "edit"
         ? renderLedgerHint(ctx.store, { limit: 5 })
@@ -63,7 +63,7 @@ export async function implement(args: ImplementArgs): Promise<StageResult> {
     const timeBudgetMin = Math.round(timeoutMs / 60_000);
     const run = ctx.store.getRun(ctx.runId);
     const testCommand = await resolveTestCommand({
-      root: ctx.root,
+      stateDir: ctx.stateDir,
       runTestCommand: run?.test_command ?? null,
     });
     const prompt = buildPrompt({

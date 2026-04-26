@@ -9,9 +9,8 @@
 //   - ledger      — what keeps getting flagged (recurring findings)
 //   - decisions.md — what we decided and why (resolved design debates)
 
-import { readFile, appendFile, writeFile, access } from "node:fs/promises";
-import { join } from "node:path";
-import { projectMillDir } from "./project.js";
+import { readFile, appendFile, writeFile, access, mkdir } from "node:fs/promises";
+import { dirname, join } from "node:path";
 
 export interface DecisionEntry {
   isoDate: string;
@@ -26,8 +25,8 @@ export interface DecisionEntry {
 
 const DELIMITER = "\n---\n";
 
-export function decisionsPath(root: string): string {
-  return join(projectMillDir(root), "decisions.md");
+export function decisionsPath(stateDir: string): string {
+  return join(stateDir, "decisions.md");
 }
 
 async function fileExists(p: string): Promise<boolean> {
@@ -39,8 +38,8 @@ async function fileExists(p: string): Promise<boolean> {
   }
 }
 
-export async function readDecisions(root: string): Promise<string> {
-  const p = decisionsPath(root);
+export async function readDecisions(stateDir: string): Promise<string> {
+  const p = decisionsPath(stateDir);
   if (!(await fileExists(p))) return "";
   return readFile(p, "utf8");
 }
@@ -49,10 +48,10 @@ export async function readDecisions(root: string): Promise<string> {
 // if none exist yet. Prefixed with a header so spec/design prompts can
 // include it verbatim.
 export async function readDecisionsTail(
-  root: string,
+  stateDir: string,
   n = 10,
 ): Promise<string> {
-  const raw = await readDecisions(root);
+  const raw = await readDecisions(stateDir);
   if (!raw.trim()) return "";
   const stanzas = raw.split(DELIMITER).map((s) => s.trim()).filter(Boolean);
   const tail = stanzas.slice(-n);
@@ -61,12 +60,13 @@ export async function readDecisionsTail(
 }
 
 export async function appendDecisionEntries(
-  root: string,
+  stateDir: string,
   entries: DecisionEntry[],
 ): Promise<void> {
   if (entries.length === 0) return;
-  const p = decisionsPath(root);
+  const p = decisionsPath(stateDir);
   const rendered = entries.map(formatEntry).map((s) => s.trim()).join(DELIMITER);
+  await mkdir(dirname(p), { recursive: true });
   const exists = await fileExists(p);
   if (!exists) {
     await writeFile(p, rendered + "\n", "utf8");

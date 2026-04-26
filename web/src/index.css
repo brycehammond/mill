@@ -1,0 +1,38 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  font-family:
+    ui-sans-serif,
+    system-ui,
+    -apple-system,
+    "Segoe UI",
+    Roboto,
+    "Helvetica Neue",
+    Arial,
+    sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* Inline keyframes — Tailwind's animate-pulse pulses opacity, but we
+   want a steadier breathing dot on the "live" indicator so the user
+   reads it as continuous, not blinking. */
+@keyframes mill-breathe {
+  0%,
+  100% {
+    opacity: 0.4;
+  }
+  50% {
+    opacity: 1;
+  }
+}
+.mill-breathe {
+  animation: mill-breathe 1.6s ease-in-out infinite;
+}

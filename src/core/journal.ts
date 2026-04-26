@@ -1,13 +1,13 @@
 // Per-project journal of mill activity. One stanza per completed run,
 // appended by the deliver stage. Spec and design stages read the tail
 // and inject it into their prompts so successive runs build on prior
-// context. Stored as markdown at `.mill/journal.md`; entries are
+// context. Stored as markdown at `<stateDir>/journal.md`; entries are
 // separated by `\n---\n` so they can be tailed by splitting on that
-// delimiter.
+// delimiter. `stateDir` is the central per-project state directory
+// (`~/.mill/projects/<project-id>/`) — callers pass `ctx.stateDir`.
 
-import { readFile, appendFile, writeFile, access } from "node:fs/promises";
-import { join } from "node:path";
-import { projectMillDir } from "./project.js";
+import { readFile, appendFile, writeFile, access, mkdir } from "node:fs/promises";
+import { dirname, join } from "node:path";
 import type { RunMode } from "./types.js";
 
 export interface JournalEntry {
@@ -22,8 +22,8 @@ export interface JournalEntry {
 
 const DELIMITER = "\n---\n";
 
-export function journalPath(root: string): string {
-  return join(projectMillDir(root), "journal.md");
+export function journalPath(stateDir: string): string {
+  return join(stateDir, "journal.md");
 }
 
 async function fileExists(p: string): Promise<boolean> {
@@ -35,8 +35,8 @@ async function fileExists(p: string): Promise<boolean> {
   }
 }
 
-export async function readJournal(root: string): Promise<string> {
-  const p = journalPath(root);
+export async function readJournal(stateDir: string): Promise<string> {
+  const p = journalPath(stateDir);
   if (!(await fileExists(p))) return "";
   return readFile(p, "utf8");
 }
@@ -44,8 +44,11 @@ export async function readJournal(root: string): Promise<string> {
 // Returns the tail of the journal as a prompt-ready block, or "" if
 // the journal does not yet exist. The block is prefixed with a header
 // so spec/design prompts can include it verbatim.
-export async function readJournalTail(root: string, n = 20): Promise<string> {
-  const raw = await readJournal(root);
+export async function readJournalTail(
+  stateDir: string,
+  n = 20,
+): Promise<string> {
+  const raw = await readJournal(stateDir);
   if (!raw.trim()) return "";
   const stanzas = raw.split(DELIMITER).map((s) => s.trim()).filter(Boolean);
   const tail = stanzas.slice(-n);
@@ -54,11 +57,12 @@ export async function readJournalTail(root: string, n = 20): Promise<string> {
 }
 
 export async function appendJournalEntry(
-  root: string,
+  stateDir: string,
   entry: JournalEntry,
 ): Promise<void> {
-  const p = journalPath(root);
+  const p = journalPath(stateDir);
   const stanza = formatEntry(entry);
+  await mkdir(dirname(p), { recursive: true });
   const exists = await fileExists(p);
   if (!exists) {
     await writeFile(p, stanza.trim() + "\n", "utf8");
